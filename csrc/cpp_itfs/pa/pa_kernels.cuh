@@ -591,7 +591,7 @@ _paged_attention_kernel(const int* block_table_seq,
 
     __syncthreads();
     // disable rtz conversion due to its impact on accuracy.
-    constexpr bool LOGITS_RTZ_CONVERSION = false;
+    constexpr bool LOGITS_RTZ_CONVERSION = true;
     // write logits to shared mem
     if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kAuto)
     {
