@@ -777,6 +777,26 @@ __inline__ __device__ Tout scaled_convert(const Tin& x, const float scale)
                 TORCH_CHECK(false, "Unsupported input type of kv cache: ", SRC_DTYPE);   \
             }                                                                            \
         }                                                                                \
+        else if(KV_DTYPE == "fp4" || KV_DTYPE == "fp4_e2m1")                              \
+        {                                                                                \
+            /* FP4 (MXFP4 E2M1): 4-bit floating point, stored as packed uint8 */         \
+            if(SRC_DTYPE == at::ScalarType::Float)                                       \
+            {                                                                            \
+                FN(float, uint8_t, vllm::Fp8KVCacheDataType::kFp4E2M1);                  \
+            }                                                                            \
+            else if(SRC_DTYPE == at::ScalarType::Half)                                   \
+            {                                                                            \
+                FN(ck_tile::fp16_t, uint8_t, vllm::Fp8KVCacheDataType::kFp4E2M1);        \
+            }                                                                            \
+            else if(SRC_DTYPE == at::ScalarType::BFloat16)                               \
+            {                                                                            \
+                FN(ck_tile::bf16_t, uint8_t, vllm::Fp8KVCacheDataType::kFp4E2M1);        \
+            }                                                                            \
+            else                                                                         \
+            {                                                                            \
+                TORCH_CHECK(false, "Unsupported input type of kv cache: ", SRC_DTYPE);   \
+            }                                                                            \
+        }                                                                                \
         else                                                                             \
         {                                                                                \
             TORCH_CHECK(false, "Unsupported data type of kv cache: ", KV_DTYPE);         \

@@ -7,6 +7,7 @@
 #include <hip/hip_bf16.h>
 
 #include "dtype_fp8.cuh"
+#include "dtype_fp4.cuh"
 #include "quant_utils.cuh"
 
 #include <ck_tile/ops/fmha/block/block_masking.hpp>
@@ -27,6 +28,7 @@
 
 
 using floatx4   = __attribute__((__vector_size__(4 * sizeof(float)))) float;
+using floatx8   = __attribute__((__vector_size__(8 * sizeof(float)))) float;
 using float16x4 = __attribute__((__vector_size__(4 * sizeof(_Float16)))) _Float16;
 typedef float16x4 _Half4;
 using float16x2 = __attribute__((__vector_size__(2 * sizeof(_Float16)))) _Float16;
@@ -333,6 +335,156 @@ __device__ __forceinline__ _B16x8 convert_b8x8_custom(const _B8x8 input)
     return ret;
 }
 
+__device__ __forceinline__ float2 to_float_fp4x2(const uint8_t packed)
+{
+    constexpr float lut[16] = {
+        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+        -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
+    };
+    float2 ret;
+    ret.x = lut[packed & 0x0F];
+    ret.y = lut[(packed >> 4) & 0x0F];
+    return ret;
+}
+
+__device__ __forceinline__ float fp4_bitwise_decode(const uint8_t index)
+{
+    const uint32_t sign = (index >> 3) & 1;
+    const uint32_t exp = (index >> 1) & 3;
+    const uint32_t mant = index & 1;
+    
+    float base_val, offset_val;
+    switch(exp) {
+        case 0: base_val = 0.0f; offset_val = 0.5f; break;
+        case 1: base_val = 1.0f; offset_val = 0.5f; break;
+        case 2: base_val = 2.0f; offset_val = 1.0f; break;
+        default: base_val = 4.0f; offset_val = 2.0f; break;
+    }
+    
+    float val = base_val + offset_val * mant;
+    return sign ? -val : val;
+}
+
+__device__ __forceinline__ floatx8 to_float_fp4x8_scaled(const _B8x4& packed, const float scale)
+{
+    constexpr float lut[16] = {
+        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+        -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
+    };
+    
+    floatx8 ret;
+
+    const uint8_t p0 = packed[0], p1 = packed[1], p2 = packed[2], p3 = packed[3];
+    
+    ret[0] = lut[p0 & 0x0F] * scale;
+    ret[1] = lut[(p0 >> 4) & 0x0F] * scale;
+    ret[2] = lut[p1 & 0x0F] * scale;
+    ret[3] = lut[(p1 >> 4) & 0x0F] * scale;
+    ret[4] = lut[p2 & 0x0F] * scale;
+    ret[5] = lut[(p2 >> 4) & 0x0F] * scale;
+    ret[6] = lut[p3 & 0x0F] * scale;
+    ret[7] = lut[(p3 >> 4) & 0x0F] * scale;
+    
+    return ret;
+}
+
+constexpr float FP4_LUT_BASE[16] = {
+    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
+};
+
+template <typename T>
+__device__ __forceinline__ _B16x8 convert_fp4x8_to_b16x8_scaled(const _B8x4& packed, const float scale)
+{
+    const uint32_t data = *reinterpret_cast<const uint32_t*>(&packed);
+    
+    const uint32_t i0 = data & 0xF;
+    const uint32_t i1 = (data >> 4) & 0xF;
+    const uint32_t i2 = (data >> 8) & 0xF;
+    const uint32_t i3 = (data >> 12) & 0xF;
+    const uint32_t i4 = (data >> 16) & 0xF;
+    const uint32_t i5 = (data >> 20) & 0xF;
+    const uint32_t i6 = (data >> 24) & 0xF;
+    const uint32_t i7 = (data >> 28) & 0xF;
+    
+    floatx4 f4_0, f4_1;
+    f4_0[0] = FP4_LUT_BASE[i0] * scale;
+    f4_0[1] = FP4_LUT_BASE[i1] * scale;
+    f4_0[2] = FP4_LUT_BASE[i2] * scale;
+    f4_0[3] = FP4_LUT_BASE[i3] * scale;
+    
+    f4_1[0] = FP4_LUT_BASE[i4] * scale;
+    f4_1[1] = FP4_LUT_BASE[i5] * scale;
+    f4_1[2] = FP4_LUT_BASE[i6] * scale;
+    f4_1[3] = FP4_LUT_BASE[i7] * scale;
+    
+    _B16x8 ret;
+    ret.xy[0] = from_floatx4_rtz<T>(f4_0);
+    ret.xy[1] = from_floatx4_rtz<T>(f4_1);
+    
+    return ret;
+}
+
+template <typename T>
+__device__ __forceinline__ _B16x8 convert_fp4x8_to_b16x8_prescaled(const _B8x4& packed, const float* prescaled_lut)
+{
+    const uint32_t data = *reinterpret_cast<const uint32_t*>(&packed);
+    
+    floatx4 f4_0, f4_1;
+    f4_0[0] = prescaled_lut[data & 0xF];
+    f4_0[1] = prescaled_lut[(data >> 4) & 0xF];
+    f4_0[2] = prescaled_lut[(data >> 8) & 0xF];
+    f4_0[3] = prescaled_lut[(data >> 12) & 0xF];
+    
+    f4_1[0] = prescaled_lut[(data >> 16) & 0xF];
+    f4_1[1] = prescaled_lut[(data >> 20) & 0xF];
+    f4_1[2] = prescaled_lut[(data >> 24) & 0xF];
+    f4_1[3] = prescaled_lut[(data >> 28) & 0xF];
+    
+    _B16x8 ret;
+    ret.xy[0] = from_floatx4_rtz<T>(f4_0);
+    ret.xy[1] = from_floatx4_rtz<T>(f4_1);
+    
+    return ret;
+}
+
+__device__ __forceinline__ float to_float_fp4_unpacked(const uint8_t index)
+{
+    constexpr float lut[16] = {
+        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+        -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
+    };
+    return lut[index & 0x0F];
+}
+
+__device__ __forceinline__ floatx8 to_float_fp4x8_unpacked_scaled(const _B8x8& indices, const float scale)
+{
+    floatx8 ret;
+    #pragma unroll
+    for(int i = 0; i < 8; i++)
+    {
+        ret[i] = to_float_fp4_unpacked(indices[i]) * scale;
+    }
+    return ret;
+}
+
+template <typename T>
+__device__ __forceinline__ _B16x8 convert_fp4x8_unpacked_to_b16x8_scaled(const _B8x8& indices, const float scale)
+{
+    floatx8 f8 = to_float_fp4x8_unpacked_scaled(indices, scale);
+    _B16x8 ret;
+
+    floatx4 f4_0;
+    f4_0[0] = f8[0]; f4_0[1] = f8[1]; f4_0[2] = f8[2]; f4_0[3] = f8[3];
+    ret.xy[0] = from_floatx4_rtz<T>(f4_0);
+
+    floatx4 f4_1;
+    f4_1[0] = f8[4]; f4_1[1] = f8[5]; f4_1[2] = f8[6]; f4_1[3] = f8[7];
+    ret.xy[1] = from_floatx4_rtz<T>(f4_1);
+    
+    return ret;
+}
+
 template <typename scalar_t,
           typename cache_t,
           vllm::Fp8KVCacheDataType KV_DTYPE,
@@ -388,18 +540,21 @@ __device__ void _paged_attention_kernel(
     // for QK mfma16x16, layout is QHead/Tokenx16 across every 16 lanes, 16 Bytes
     // HeadElements in each lane, 4x16B HeadElements across 4 rows of warp
     constexpr int ROWS_PER_WARP = WARP_SIZE / 16; // rows refers to 16 lanes; refer dpp terminology
+    
+    // FP4 packed format: 2 FP4 values per byte, so 16 bytes = 32 head elements
+    // For FP4: we need different constants to handle the packed format
+    constexpr int FP4_PACK_FACTOR = (KV_DTYPE == vllm::Fp8KVCacheDataType::kFp4E2M1) ? 2 : 1;
+    
     constexpr int CONTIGUOUS_KV_ELEMS_16B_LOAD =
-        16 / sizeof(cache_t); // 8 for 16 bit cache type, 16 for 8 bit types
+        (16 / sizeof(cache_t)) * FP4_PACK_FACTOR;
     constexpr int QKHE_PER_FETCH =
         CONTIGUOUS_KV_ELEMS_16B_LOAD *
-        ROWS_PER_WARP; // each fetch across a warp fetches these many elements
+        ROWS_PER_WARP; // 64 for FP8, 128 for packed FP4
     constexpr int QK_SIZE_RATIO =
-        sizeof(scalar_t) / sizeof(cache_t);              // 1 for 16bit types, 2 for 8bit types
-    constexpr int QKHELOOP = HEAD_SIZE / QKHE_PER_FETCH; // 4xQKHE_16B across warp
+        (sizeof(scalar_t) / sizeof(cache_t)) * FP4_PACK_FACTOR; // 2 for FP8, 4 for packed FP4
+    constexpr int QKHELOOP = HEAD_SIZE / QKHE_PER_FETCH; // 2 for FP8, 1 for packed FP4
 
-    _B16x8 Qlocal[QKHELOOP][QK_SIZE_RATIO]; // note that 16 contiguous elements of Q should
-                                            // be fetched per lane for 8 bit cache types :
-                                            // QK_SIZE_RATIO changes for this
+    _B16x8 Qlocal[QKHELOOP][QK_SIZE_RATIO]; // [2][2] for FP8, [1][4] for packed FP4
 
     constexpr int CONTIGUOUS_SCALAR_ELEMS_16B = 16 / sizeof(scalar_t);
 
@@ -515,8 +670,9 @@ __device__ void _paged_attention_kernel(
         for(int qkhe_depth = 0; qkhe_depth < QKHELOOP; qkhe_depth++)
         {
             const int head_elem           = row_head_elem + qkhe_depth * QKHE_PER_FETCH;
-            const int offset1             = head_elem / KX;
-            const int offset2             = head_elem % KX;
+            const int head_elem_bytes     = head_elem / FP4_PACK_FACTOR;  // Convert to byte offset for FP4
+            const int offset1             = head_elem_bytes / KX;
+            const int offset2             = head_elem_bytes % KX;
             const cache_t* k_fetch_ptr    = k_ptr3 + offset1 * KX + offset2;
             const _B16x8* k_fetch_ptr_16B = reinterpret_cast<const _B16x8*>(k_fetch_ptr);
             if constexpr(NT_KV_LOAD)
@@ -590,7 +746,8 @@ __device__ void _paged_attention_kernel(
                 const int vlds_col_idx = laneid % n_thread_per_block;
                 const int vhead_elem =
                     vhe_depth * NWARPS * 16 + vlds_col_idx * CONTIGUOUS_KV_ELEMS_16B_LOAD;
-                const cache_t* v_ptr2 = v_ptr + vhead_elem;
+                const int vhead_elem_bytes = vhead_elem / FP4_PACK_FACTOR;
+                const cache_t* v_ptr2 = v_ptr + vhead_elem_bytes;
 
                 const int64_t vblock_number =
                     static_cast<int64_t>(vphysical_block_number[vtoken_depth][vblock_depth]);
@@ -604,7 +761,8 @@ __device__ void _paged_attention_kernel(
 
     // calculate post qk mfma scale
     float scale2 = scale;
-    if constexpr(KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto)
+    if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kFp8E4M3 ||
+                 KV_DTYPE == vllm::Fp8KVCacheDataType::kFp8E5M2)
     {
         // multiply by k_scale if fp8 kv cache
         scale2 *= *k_scale_ptr;
@@ -637,7 +795,8 @@ __device__ void _paged_attention_kernel(
 #endif
                 }
             }
-            else
+            else if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kFp8E4M3 ||
+                              KV_DTYPE == vllm::Fp8KVCacheDataType::kFp8E5M2)
             { // kv cache dtype fp8
                 auto Ktmp       = Klocal[token_depth][qkhe_depth];
                 _B8x16 Ktmp8x16 = *reinterpret_cast<_B8x16*>(&Ktmp);
@@ -645,6 +804,38 @@ __device__ void _paged_attention_kernel(
                 {
                     _B8x8 Ktmp8x8    = Ktmp8x16.xy[qkratio];
                     _B16x8 Klocaltmp = convert_b8x8_custom<scalar_t>(Ktmp8x8);
+#if defined(__gfx950__)
+                    dout[token_depth] = gcn_mfma16x16x32_instr<scalar_t, 0, 0, 0>(
+                        Klocaltmp,
+                        Qlocal[qkhe_depth][qkratio],
+                        dout[token_depth]);
+#else
+                    for(int i = 0; i < 2; i++)
+                    {
+                        dout[token_depth] = gcn_mfma16x16x16_instr<scalar_t, 0, 0, 0>(
+                            Klocaltmp.xy[i], Qlocal[qkhe_depth][qkratio].xy[i], dout[token_depth]);
+                    }
+#endif
+                }
+            }
+            else if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kFp4E2M1)
+            {
+                auto Ktmp       = Klocal[token_depth][qkhe_depth];
+                const uint8_t* Kbytes = reinterpret_cast<const uint8_t*>(&Ktmp);
+                
+                const float fp4_scale = *k_scale_ptr;
+                
+                #pragma unroll
+                for(int qkratio = 0; qkratio < 4; qkratio++)
+                {
+                    const int byte_offset = qkratio * 4;
+                    _B8x4 Ktmp8x4;
+                    Ktmp8x4[0] = Kbytes[byte_offset + 0];
+                    Ktmp8x4[1] = Kbytes[byte_offset + 1];
+                    Ktmp8x4[2] = Kbytes[byte_offset + 2];
+                    Ktmp8x4[3] = Kbytes[byte_offset + 3];
+
+                    _B16x8 Klocaltmp = convert_fp4x8_to_b16x8_scaled<scalar_t>(Ktmp8x4, fp4_scale);
 #if defined(__gfx950__)
                     dout[token_depth] = gcn_mfma16x16x32_instr<scalar_t, 0, 0, 0>(
                         Klocaltmp,
@@ -874,10 +1065,12 @@ __device__ void _paged_attention_kernel(
                     }
 #endif
                 }
-                // KV cache fp8
+                // KV cache BF16/FP16
             }
-            else
+            else if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kFp8E4M3 ||
+                              KV_DTYPE == vllm::Fp8KVCacheDataType::kFp8E5M2)
             {
+                // KV cache FP8
                 for(int vfetch_depth = 0; vfetch_depth < VTLANELOOP; vfetch_depth++)
                 {
                     _B16x8 Vtmp = Vlocal[vtoken_depth][vhe_depth][vfetch_depth];
@@ -922,10 +1115,57 @@ __device__ void _paged_attention_kernel(
                     }
                 }
             }
+            else if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kFp4E2M1)
+            {
+
+                const float fp4_v_scale = *v_scale_ptr;
+                
+                for(int vfetch_depth = 0; vfetch_depth < VTLANELOOP; vfetch_depth++)
+                {
+                    _B16x8 Vtmp = Vlocal[vtoken_depth][vhe_depth][vfetch_depth];
+
+                    const uint8_t* Vbytes = reinterpret_cast<const uint8_t*>(&Vtmp);
+
+                    #pragma unroll
+                    for(int j = 0; j < 4; j++)
+                    {
+                        const int byte_offset = j * 4;
+                        _B8x4 Vtmp8x4;
+                        Vtmp8x4[0] = Vbytes[byte_offset + 0];
+                        Vtmp8x4[1] = Vbytes[byte_offset + 1];
+                        Vtmp8x4[2] = Vbytes[byte_offset + 2];
+                        Vtmp8x4[3] = Vbytes[byte_offset + 3];
+
+                        _B16x8 Vlocaltmp = convert_fp4x8_to_b16x8_scaled<scalar_t>(Vtmp8x4, fp4_v_scale);
+#if defined(__gfx950__)
+                        _B16x8 tmp_in;
+
+                        const int base_offset = rowid * 8 + j * 2;  // 4 iterations * 2 = 8
+                        tmp_in.xy[0] = shared_logits[vtoken_depth][(base_offset + 0) / ROWS_PER_WARP][lane16id][(base_offset + 0) % ROWS_PER_WARP];
+                        tmp_in.xy[1] = shared_logits[vtoken_depth][(base_offset + 1) / ROWS_PER_WARP][lane16id][(base_offset + 1) % ROWS_PER_WARP];
+                        tmp_out = gcn_mfma16x16x32_instr<scalar_t, 0, 0, 0>(
+                            Vlocaltmp,
+                            tmp_in,
+                            tmp_out);
+#else
+                        #pragma unroll
+                        for(int i = 0; i < 2; i++)
+                        {
+                            const int offset = rowid * 8 + j * 2 + i;
+                            tmp_out = gcn_mfma16x16x16_instr<scalar_t, 0, 0, 0>(
+                                Vlocaltmp.xy[i],
+                                shared_logits[vtoken_depth][offset / ROWS_PER_WARP][lane16id][offset % ROWS_PER_WARP],
+                                tmp_out);
+                        }
+#endif
+                    }
+                }
+            }
             __syncthreads();
         }
-        // apply post Softmax V mfma v_scale
-        if constexpr(KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto)
+
+        if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kFp8E4M3 ||
+                     KV_DTYPE == vllm::Fp8KVCacheDataType::kFp8E5M2)
         {
             tmp_out *= *v_scale_ptr;
         }
