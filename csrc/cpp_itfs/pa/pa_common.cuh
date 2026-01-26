@@ -344,6 +344,94 @@ __device__ __forceinline__ _B16x8 convert_b8x8_custom(const _B8x8 input)
     return ret;
 }
 
+// FP4 conversion: 8 unpacked FP4 bytes (1 FP4/byte in lower 4 bits) -> 8 BF16/FP16
+// Each byte contains 1 FP4 value; we pack pairs and use hardware conversion
+template <typename T>
+__device__ __forceinline__ _B16x8 convert_b8x8_fp4(const _B8x8 input)
+{
+#if defined(__gfx950__)
+    // Use union to access _B8x8 (uint2) as bytes
+    union
+    {
+        _B8x8 b8x8;
+        uint8_t bytes[8];
+    } tmp;
+    tmp.b8x8 = input;
+    
+    _B16x8 ret;
+    // Input: 8 bytes, each containing 1 FP4 value in lower 4 bits
+    // Process pairs: pack 2 unpacked FP4 -> 1 packed byte, then convert
+    
+    if constexpr(std::is_same<T, __hip_bfloat16>::value)
+    {
+        // Use direct BF16 hardware conversion
+        // __builtin_amdgcn_cvt_scalef32_pk_bf16_fp4 returns vector of 2 __bf16
+        using bf16x2_raw_t = __bf16 __attribute__((ext_vector_type(2)));
+        
+        for (int i = 0; i < 2; i++) {
+            // Pack 4 consecutive unpacked FP4 values into 2 packed bytes
+            uint8_t packed0 = (tmp.bytes[i*4 + 0] & 0x0F) | ((tmp.bytes[i*4 + 1] & 0x0F) << 4);
+            uint8_t packed1 = (tmp.bytes[i*4 + 2] & 0x0F) | ((tmp.bytes[i*4 + 3] & 0x0F) << 4);
+            
+            // Convert packed FP4x2 directly to BF16x2
+            bf16x2_raw_t bf0 = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp4(packed0, 1.0f, 0);  // 2 BF16
+            bf16x2_raw_t bf1 = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp4(packed1, 1.0f, 0);  // 2 BF16
+            
+            // Use union to extract uint16_t values from __bf16 vector
+            union { bf16x2_raw_t vec; uint16_t u16[2]; } cvt0, cvt1;
+            cvt0.vec = bf0;
+            cvt1.vec = bf1;
+            ret.xy[i][0] = cvt0.u16[0];
+            ret.xy[i][1] = cvt0.u16[1];
+            ret.xy[i][2] = cvt1.u16[0];
+            ret.xy[i][3] = cvt1.u16[1];
+        }
+    }
+    else if constexpr(std::is_same<T, _Float16>::value)
+    {
+        // Use direct FP16 hardware conversion
+        using fp16x2_raw_t = _Float16 __attribute__((ext_vector_type(2)));
+        
+        for (int i = 0; i < 2; i++) {
+            uint8_t packed0 = (tmp.bytes[i*4 + 0] & 0x0F) | ((tmp.bytes[i*4 + 1] & 0x0F) << 4);
+            uint8_t packed1 = (tmp.bytes[i*4 + 2] & 0x0F) | ((tmp.bytes[i*4 + 3] & 0x0F) << 4);
+            
+            fp16x2_raw_t fp0 = __builtin_amdgcn_cvt_scalef32_pk_f16_fp4(packed0, 1.0f, 0);  // 2 FP16
+            fp16x2_raw_t fp1 = __builtin_amdgcn_cvt_scalef32_pk_f16_fp4(packed1, 1.0f, 0);  // 2 FP16
+            
+            union { fp16x2_raw_t vec; uint16_t u16[2]; } cvt0, cvt1;
+            cvt0.vec = fp0;
+            cvt1.vec = fp1;
+            ret.xy[i][0] = cvt0.u16[0];
+            ret.xy[i][1] = cvt0.u16[1];
+            ret.xy[i][2] = cvt1.u16[0];
+            ret.xy[i][3] = cvt1.u16[1];
+        }
+    }
+    else
+    {
+        static_assert(std::is_same<T, __hip_bfloat16>::value || std::is_same<T, _Float16>::value,
+                      "FP4 conversion only supports BF16 or FP16");
+    }
+    return ret;
+#else
+    // FP4 not supported on this architecture - return zeros
+    return _B16x8{};
+#endif
+}
+
+// Unified conversion dispatcher based on KV_DTYPE
+template <typename T, vllm::Fp8KVCacheDataType KV_DTYPE>
+__device__ __forceinline__ _B16x8 convert_b8x8_kv(const _B8x8 input)
+{
+    if constexpr (KV_DTYPE == vllm::Fp8KVCacheDataType::kFp4E2M1) {
+        return convert_b8x8_fp4<T>(input);
+    } else {
+        // FP8 (E4M3 or E5M2)
+        return convert_b8x8_custom<T>(input);
+    }
+}
+
 typedef union u64_cvt {
   half f16x4[4];
   int16_t b16x4[4];

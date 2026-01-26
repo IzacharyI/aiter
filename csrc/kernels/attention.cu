@@ -400,6 +400,50 @@ __device__ __forceinline__ _B16x8 convert_b8x8_custom(const _B8x8 input) {
   //ret.xy[1] = from_floatx4<T>(tmpf8.f32x4[1]);
   return ret;
 }
+
+// FP4 conversion: 8 unpacked FP4 bytes (1 FP4/byte in lower 4 bits) -> 8 BF16/FP16
+// Each byte contains 1 FP4 value; we pack pairs and use hardware conversion
+template <typename T>
+__device__ __forceinline__ _B16x8 convert_b8x8_fp4(const _B8x8 input) {
+#if defined(__gfx950__)
+  _B16x8 ret;
+  // Input: 8 bytes, each containing 1 FP4 value in lower 4 bits
+  // Process pairs: pack 2 unpacked FP4 -> 1 packed byte, then convert
+  for (int i = 0; i < 2; i++) {
+    // Pack 4 consecutive unpacked FP4 values into 2 packed bytes
+    uint8_t packed0 = (input[i*4 + 0] & 0x0F) | ((input[i*4 + 1] & 0x0F) << 4);
+    uint8_t packed1 = (input[i*4 + 2] & 0x0F) | ((input[i*4 + 3] & 0x0F) << 4);
+    
+    // Convert packed FP4x2 to float2 (no scale here, scale applied later)
+    auto f0 = __builtin_amdgcn_cvt_pk_f32_fp4(packed0, 0);  // 2 floats
+    auto f1 = __builtin_amdgcn_cvt_pk_f32_fp4(packed1, 0);  // 2 floats
+    
+    floatx4 fvals;
+    fvals[0] = f0[0];
+    fvals[1] = f0[1];
+    fvals[2] = f1[0];
+    fvals[3] = f1[1];
+    
+    ret.xy[i] = from_floatx4_rtz<T>(fvals);
+  }
+  return ret;
+#else
+  // FP4 not supported on this architecture
+  return _B16x8{};
+#endif
+}
+
+// Unified conversion dispatcher based on KV_DTYPE
+template <typename T, vllm::Fp8KVCacheDataType KV_DTYPE>
+__device__ __forceinline__ _B16x8 convert_b8x8_kv(const _B8x8 input) {
+  if constexpr (KV_DTYPE == vllm::Fp8KVCacheDataType::kFp4E2M1) {
+    return convert_b8x8_fp4<T>(input);
+  } else {
+    // FP8 (E4M3 or E5M2)
+    return convert_b8x8_custom<T>(input);
+  }
+}
+
 ///////////////////////////////////////
 // grid (num_seqs, num_partitions,num_heads/gqa_ratio)
 // block (partition size)
@@ -654,12 +698,12 @@ __global__ __launch_bounds__(NUM_THREADS,5) void paged_attention_ll4mi_QKV_mfma1
               }
 #endif
             }
-        } else { //kv cache dtype fp8
+        } else { //kv cache dtype fp8/fp4
             auto Ktmp = Klocal[token_depth][qkhe_depth];
             _B8x16 Ktmp8x16 = *reinterpret_cast<_B8x16*>(&Ktmp);
             for (int qkratio = 0; qkratio < QK_SIZE_RATIO; qkratio++) {
                 _B8x8 Ktmp8x8 = Ktmp8x16.xy[qkratio];
-                _B16x8 Klocaltmp = convert_b8x8_custom<scalar_t>(Ktmp8x8);
+                _B16x8 Klocaltmp = convert_b8x8_kv<scalar_t, KV_DTYPE>(Ktmp8x8);
 #if defined(__gfx950__)
                 dout[token_depth] = gcn_mfma16x16x32_instr<scalar_t, 0, 0, 0>(
                     Klocaltmp,
@@ -895,13 +939,13 @@ __global__ __launch_bounds__(NUM_THREADS,5) void paged_attention_ll4mi_QKV_mfma1
               }
 #endif //__gfx950__
           }
-        } else {
+        } else { // fp8/fp4 kv cache
           for (int vfetch_depth = 0; vfetch_depth < VTLANELOOP; vfetch_depth++) {
               _B16x8 Vtmp = Vlocal[vtoken_depth][vhe_depth][vfetch_depth];
               _B8x16 Vtmp8x16 = *reinterpret_cast<_B8x16*>(&Vtmp);
               for (int j=0; j<2; j++) {
                _B8x8 Vtmp8x8 = Vtmp8x16.xy[j]; 
-               _B16x8 Vlocaltmp = convert_b8x8_custom<scalar_t>(Vtmp8x8);
+               _B16x8 Vlocaltmp = convert_b8x8_kv<scalar_t, KV_DTYPE>(Vtmp8x8);
 #if defined(__gfx950__)
                 _B16x8 tmp_in;
                 for(int i = 0; i < 2; i++)
@@ -1318,7 +1362,7 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_kernel(
       /*Klocal[x] = scaled_convert_b8x8_custom<scalar_t>(Klocalb8[x], k_scale); \*/
 #define QK_mfma(x) \
     if constexpr (KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto) { \
-      Klocal[x] = convert_b8x8_custom<scalar_t>(Klocalb8[x]); \
+      Klocal[x] = convert_b8x8_kv<scalar_t, KV_DTYPE>(Klocalb8[x]); \
     } \
     for (int h = 0; h < QHLOOP; h++) { \
       dout[h] = gcn_mfma_instr<scalar_t, 4, x, 0>(Qlocal[h].xy[0], \
@@ -1702,7 +1746,7 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_kernel(
         /*Vlocal[vh][x] = scaled_convert_b8x8_custom<scalar_t>(Vlocalb8[vh][x], v_scale);\*/
   #define SV_mfma(x) \
     if constexpr (KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto) {\
-        Vlocal[vh][x] = convert_b8x8_custom<scalar_t>(Vlocalb8[vh][x]);\
+        Vlocal[vh][x] = convert_b8x8_kv<scalar_t, KV_DTYPE>(Vlocalb8[vh][x]);\
     }\
     for (int qh = 0; qh < QHLOOP; qh++) { \
         acc[qh] = gcn_mfma_instr<scalar_t, 4, 2*x, 0>(logits[qh], Vlocal[vh][x].xy[0], \
@@ -2474,6 +2518,22 @@ void paged_attention(
     } else {
       TORCH_CHECK(false, "Unsupported data type: ", query.dtype());
     }
+  } else if (kv_cache_dtype == "fp4" || kv_cache_dtype == "fp4_e2m1") {
+#if defined(__gfx950__)
+    // FP4: 2 values packed per byte (uint8_t), uses kFp4E2M1 for conversion
+    // Requires gfx950+ hardware (MI355x) for FP4 intrinsics
+    if (query.dtype() == at::ScalarType::Half) {
+      CALL_CUSTOM_LAUNCHER_BLK_HEAD(_Float16, uint8_t,
+                                    vllm::Fp8KVCacheDataType::kFp4E2M1);
+    } else if (query.dtype() == at::ScalarType::BFloat16) {
+      CALL_CUSTOM_LAUNCHER_BLK_HEAD(__hip_bfloat16, uint8_t,
+                                    vllm::Fp8KVCacheDataType::kFp4E2M1);
+    } else {
+      TORCH_CHECK(false, "Unsupported data type: ", query.dtype());
+    }
+#else
+    TORCH_CHECK(false, "FP4 KV cache requires gfx950+ architecture (MI355x). Not supported on this hardware.");
+#endif
   } else {
     TORCH_CHECK(false, "Unsupported KV cache dtype: ", kv_cache_dtype);
   }

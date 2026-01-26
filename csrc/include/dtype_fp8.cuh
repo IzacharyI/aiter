@@ -31,6 +31,7 @@ enum class Fp8KVCacheDataType
     kAuto    = 0,
     kFp8E4M3 = 1,
     kFp8E5M2 = 2,
+    kFp4E2M1 = 3,  // FP4 E2M1 (MXFP4) format, supported on gfx950+
 };
 
 enum class Fp8QuantMethod
@@ -64,5 +65,10 @@ struct Vec<uint8_t, 8>
 {
     using Type = uint64_t;
 };
+
+// FP4 packed type: 2 FP4 values packed in 1 byte (uint8_t)
+// For FP4, we use the same underlying storage as FP8 (uint8_t)
+// but interpret it differently: each byte contains 2 FP4 values
+// Lower 4 bits = first value, Upper 4 bits = second value
 
 } // namespace vllm

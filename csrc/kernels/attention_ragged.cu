@@ -543,6 +543,28 @@ void paged_attention_ragged(
             TORCH_CHECK(false, "Unsupported data type: ", query.dtype());
         }
     }
+    else if(kv_cache_dtype == "fp4" || kv_cache_dtype == "fp4_e2m1")
+    {
+#if defined(__gfx950__)
+        // FP4: 2 values packed per byte (uint8_t), uses kFp4E2M1 for conversion
+        // Requires gfx950+ hardware (MI355x) for FP4 intrinsics
+        if(query.dtype() == at::ScalarType::Half)
+        {
+            CALL_CUSTOM_LAUNCHER_BLK_HEAD(_Float16, uint8_t, vllm::Fp8KVCacheDataType::kFp4E2M1);
+        }
+        else if(query.dtype() == at::ScalarType::BFloat16)
+        {
+            CALL_CUSTOM_LAUNCHER_BLK_HEAD(
+                __hip_bfloat16, uint8_t, vllm::Fp8KVCacheDataType::kFp4E2M1);
+        }
+        else
+        {
+            TORCH_CHECK(false, "Unsupported data type: ", query.dtype());
+        }
+#else
+        TORCH_CHECK(false, "FP4 KV cache requires gfx950+ architecture (MI355x). Not supported on this hardware.");
+#endif
+    }
     else
     {
         TORCH_CHECK(false, "Unsupported KV cache dtype: ", kv_cache_dtype);

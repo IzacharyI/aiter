@@ -98,6 +98,16 @@ def paged_attention_v1(
             kv_dtype = "uint8_t"
         else:
             raise ValueError(f"Unsupported data type: {query.dtype}")
+    elif kv_cache_dtype == "fp4" or kv_cache_dtype == "fp4_e2m1":
+        # FP4: 2 values packed per byte (uint8_t)
+        if query.dtype == torch.bfloat16:
+            dtype = "__hip_bfloat16"
+            kv_dtype = "uint8_t"
+        elif query.dtype == torch.float16:
+            dtype = "_Float16"
+            kv_dtype = "uint8_t"
+        else:
+            raise ValueError(f"Unsupported data type: {query.dtype}")
     else:
         raise ValueError(f"Unsupported kv_cache_dtype: {kv_cache_dtype}")
 

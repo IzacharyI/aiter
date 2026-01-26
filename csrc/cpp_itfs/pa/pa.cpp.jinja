@@ -54,6 +54,8 @@ FUNCTION_DEFINE
                                             {{kv_dtype}},
                                             {% if fp8_kv_dtype == 'auto' %}
                                             vllm::Fp8KVCacheDataType::kAuto,
+                                            {% elif fp8_kv_dtype == 'fp4' or fp8_kv_dtype == 'fp4_e2m1' %}
+                                            vllm::Fp8KVCacheDataType::kFp4E2M1,
                                             {% else %}
                                             vllm::Fp8KVCacheDataType::kFp8E4M3,
                                             {% endif %}                              

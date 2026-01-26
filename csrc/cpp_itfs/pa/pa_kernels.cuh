@@ -150,6 +150,7 @@ _paged_attention_kernel(const int* block_table_seq,
 
                     if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kAuto)
                     {
+                        // kAuto uses BF16 MFMA Q layout
                         const int offset1 =
                             lane16id /
                             4; // 16 contiguous chunks of head elems are spread across 4x4lanes
@@ -160,6 +161,7 @@ _paged_attention_kernel(const int* block_table_seq,
                     }
                     else
                     {
+                        // FP8/FP4: use Q layout with qkratio indexing
                         for(int i = 0; i < 2; i++)
                         {
                             const int head_elem = lane16id * 2 + i; // element id in _B16x4 terms
@@ -372,6 +374,37 @@ _paged_attention_kernel(const int* block_table_seq,
                                                       .xy[i],
                                             d_out[gqa_ratio_loop][mtp][token_depth]);
                                 }
+#endif
+                            }
+                        }
+                        else if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kFp4E2M1)
+                        {
+                            // FP4 KV cache: convert K from FP4 to BF16, use BF16 MFMA
+                            auto Ktmp       = Klocal[head_loop][token_depth][qkhe_depth];
+                            _B8x16 Ktmp8x16 = *reinterpret_cast<_B8x16*>(&Ktmp);
+                            for(int qkratio = 0; qkratio < QK_SIZE_RATIO; qkratio++)
+                            {
+                                _B8x8 Ktmp8x8_fp4 = Ktmp8x16.xy[qkratio];
+                                
+                                // Convert FP4 (8 bytes, 1 FP4/byte) to BF16 (8 BF16 values)
+                                _B16x8 Klocaltmp = convert_b8x8_fp4<scalar_t>(Ktmp8x8_fp4);
+#if defined(__gfx950__)
+                                d_out[gqa_ratio_loop][mtp][token_depth] =
+                                    gcn_mfma16x16x32_instr<scalar_t, 0, 0, 0>(
+                                        Klocaltmp,
+                                        Qlocal[gqa_ratio_loop][head_loop][mtp][qkhe_depth][qkratio],
+                                        d_out[gqa_ratio_loop][mtp][token_depth]);
+                                __builtin_amdgcn_sched_group_barrier(0x008, 1, 0); // MFMA
+#else
+                                for(int i = 0; i < 2; i++)
+                                {
+                                    d_out[gqa_ratio_loop][mtp][token_depth] =
+                                        gcn_mfma16x16x16_instr<scalar_t, 0, 0, 0>(
+                                            Klocaltmp.xy[i],
+                                            Qlocal[gqa_ratio_loop][head_loop][mtp][qkhe_depth][qkratio].xy[i],
+                                            d_out[gqa_ratio_loop][mtp][token_depth]);
+                                }
+                                __builtin_amdgcn_sched_group_barrier(0x008, 2, 0); // MFMA
 #endif
                             }
                         }
@@ -593,8 +626,10 @@ _paged_attention_kernel(const int* block_table_seq,
     // disable rtz conversion due to its impact on accuracy.
     constexpr bool LOGITS_RTZ_CONVERSION = false;
     // write logits to shared mem
-    if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kAuto)
+    if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kAuto ||
+                 KV_DTYPE == vllm::Fp8KVCacheDataType::kFp4E2M1)
     {
+        // FP4 uses BF16 MFMA, so store logits as BF16 (same as kAuto)
         for(int token_depth = 0; token_depth < TLOOP; token_depth++)
         {
             for(int mtp = 0; mtp < mtp_loop; mtp++)
@@ -772,8 +807,58 @@ _paged_attention_kernel(const int* block_table_seq,
 #endif
                         }
                     }
+                    else if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kFp4E2M1)
+                    {
+                        // FP4 V cache: use kAuto structure since logits are stored as BF16
+                        // EFFECTIVE_VTLANELOOP = 4 to match kAuto's VTLANELOOP
+                        constexpr int EFFECTIVE_VTLANELOOP = VTLANELOOP * ELEMS16_ELEMS8_RATIO;
+                        
+                        for(int vfetch_depth = 0; vfetch_depth < VTLANELOOP; vfetch_depth++)
+                        {
+                            _B16x8 Vtmp = Vlocal[vtoken_depth][vhe_depth][vfetch_depth];
+                            _B8x16 Vtmp8x16 = *reinterpret_cast<_B8x16*>(&Vtmp);
+                            for(int j = 0; j < ELEMS16_ELEMS8_RATIO; j++)
+                            {
+                                _B8x8 Vtmp8x8    = Vtmp8x16.xy[j];
+                                _B16x8 Vlocaltmp = convert_b8x8_fp4<scalar_t>(Vtmp8x8);
+                                
+                                // Combined vfetch to match kAuto's vfetch_depth range (0..3)
+                                const int combined_vfetch = vfetch_depth * ELEMS16_ELEMS8_RATIO + j;
+
+#if defined(__gfx950__)
+                                _B16x8 tmp_in;
+                                for(int i = 0; i < ELEMS8_ELEMS4_RATIO; i++)
+                                {
+                                    // Use kAuto's offset formula with EFFECTIVE_VTLANELOOP
+                                    const int offset = rowid * EFFECTIVE_VTLANELOOP * ELEMS8_ELEMS4_RATIO +
+                                                       combined_vfetch * ELEMS8_ELEMS4_RATIO + i;
+                                    const int offset1 = offset % ROWS_PER_WARP;
+                                    const int offset2 = offset / ROWS_PER_WARP;
+                                    tmp_in.xy[i] = shared_logits[gqa_ratio_loop][0][mtp][vtoken_depth]
+                                                                [offset2][lane16id][offset1];
+                                }
+                                tmp_out = gcn_mfma16x16x32_instr<scalar_t, 0, 0, 0>(
+                                    Vlocaltmp, tmp_in, tmp_out);
+#else
+                                for(int i = 0; i < ELEMS8_ELEMS4_RATIO; i++)
+                                {
+                                    const int offset = rowid * EFFECTIVE_VTLANELOOP * ELEMS8_ELEMS4_RATIO +
+                                                       combined_vfetch * ELEMS8_ELEMS4_RATIO + i;
+                                    const int offset1 = offset % ROWS_PER_WARP;
+                                    const int offset2 = offset / ROWS_PER_WARP;
+                                    tmp_out = gcn_mfma16x16x16_instr<scalar_t, 0, 0, 0>(
+                                        Vlocaltmp.xy[i],
+                                        shared_logits[gqa_ratio_loop][0][mtp][vtoken_depth][offset2]
+                                                     [lane16id][offset1],
+                                        tmp_out);
+                                }
+#endif
+                            }
+                        }
+                    }
                     else
                     {
+                        // FP8 V cache
                         for(int vfetch_depth = 0; vfetch_depth < VTLANELOOP; vfetch_depth++)
                         {
                             _B16x8 Vtmp = Vlocal[vtoken_depth][vhe_depth][vfetch_depth];
@@ -1317,6 +1402,7 @@ __inline__ __device__ void _paged_attention_kernel_EXPERIMENTAL(
 
                     if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kAuto)
                     {
+                        // kAuto uses BF16 MFMA Q layout
                         const int offset1 =
                             lane16id /
                             4; // 16 contiguous chunks of head elems are spread across 4x4lanes
@@ -1327,6 +1413,7 @@ __inline__ __device__ void _paged_attention_kernel_EXPERIMENTAL(
                     }
                     else
                     {
+                        // FP8/FP4: use Q layout with qkratio indexing
                         for(int i = 0; i < 2; i++)
                         {
                             const int head_elem = lane16id * 2 + i; // element id in _B16x4 terms
@@ -1564,6 +1651,38 @@ __inline__ __device__ void _paged_attention_kernel_EXPERIMENTAL(
                                 //             }
                                 //         break;
                                 //     }
+                            }
+                            else if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kFp4E2M1)
+                            { // kv cache dtype fp4: convert to BF16, use BF16 MFMA
+                                // Same structure as FP8 branch with internal qkratio loop
+                                auto Ktmp       = Kbuffer_reg[curr][head_loop][qkhe_depth];
+                                _B8x16 Ktmp8x16 = *reinterpret_cast<_B8x16*>(&Ktmp);
+                                for(int qkratio = 0; qkratio < QK_SIZE_RATIO; qkratio++)
+                                {
+                                    _B8x8 Ktmp8x8    = Ktmp8x16.xy[qkratio];
+                                    _B16x8 Klocaltmp = convert_b8x8_fp4<scalar_t>(Ktmp8x8);
+#if defined(__gfx950__)
+                                    d_out[gqa_ratio_loop][mtp][token_depth] =
+                                        gcn_mfma16x16x32_instr<scalar_t, 0, 0, 0>(
+                                            Klocaltmp,
+                                            Qlocal[gqa_ratio_loop][head_loop][mtp][qkhe_depth]
+                                                  [qkratio],
+                                            d_out[gqa_ratio_loop][mtp][token_depth]);
+                                    __builtin_amdgcn_sched_group_barrier(0x008, 1, 0); // MFMA
+#else
+                                    for(int i = 0; i < 2; i++)
+                                    {
+                                        d_out[gqa_ratio_loop][mtp][token_depth] =
+                                            gcn_mfma16x16x16_instr<scalar_t, 0, 0, 0>(
+                                                Klocaltmp.xy[i],
+                                                Qlocal[gqa_ratio_loop][head_loop][mtp][qkhe_depth]
+                                                      [qkratio]
+                                                          .xy[i],
+                                                d_out[gqa_ratio_loop][mtp][token_depth]);
+                                    }
+                                    __builtin_amdgcn_sched_group_barrier(0x008, 2, 0); // MFMA
+#endif
+                                }
                             }
                             else
                             { // kv cache dtype fp8
@@ -2103,8 +2222,56 @@ __inline__ __device__ void _paged_attention_kernel_EXPERIMENTAL(
 #endif
                         }
                     }
+                    else if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kFp4E2M1)
+                    {
+                        // FP4 V cache: convert to BF16, use BF16 MFMA
+                        // Use FP8's offset calculation since FP4 uses FP8's Q layout
+                        for(int vfetch_depth = 0; vfetch_depth < VTLANELOOP; vfetch_depth++)
+                        {
+                            _B16x8 Vtmp = Vlocal[vtoken_depth][vhe_depth][vfetch_depth];
+                            _B8x16 Vtmp8x16 = *reinterpret_cast<_B8x16*>(&Vtmp);
+                            for(int j = 0; j < ELEMS16_ELEMS8_RATIO; j++)
+                            {
+                                _B8x8 Vtmp8x8    = Vtmp8x16.xy[j];
+                                _B16x8 Vlocaltmp = convert_b8x8_fp4<scalar_t>(Vtmp8x8);
+
+                                // Use FP8's offset calculation: rowid * ELEMS16_ELEMS8_RATIO * ELEMS8_ELEMS4_RATIO
+                                const int offset =
+                                    rowid * ELEMS16_ELEMS8_RATIO * ELEMS8_ELEMS4_RATIO +
+                                    j * ELEMS8_ELEMS4_RATIO;
+
+#if defined(__gfx950__)
+                                _B16x8 tmp_in;
+                                for(int i = 0; i < ELEMS8_ELEMS4_RATIO; i++)
+                                {
+                                    const int off = offset + i;
+                                    const int offset1 = off % ROWS_PER_WARP;
+                                    const int offset2 = off / ROWS_PER_WARP;
+                                    tmp_in.xy[i] =
+                                        shared_logits[gqa_ratio_loop][0][mtp][vtoken_depth][offset2]
+                                                     [lane16id][offset1];
+                                }
+                                tmp_out = gcn_mfma16x16x32_instr<scalar_t, 0, 0, 0>(
+                                    Vlocaltmp, tmp_in, tmp_out);
+#else
+                                for(int i = 0; i < ELEMS8_ELEMS4_RATIO; i++)
+                                {
+                                    const int off = offset + i;
+                                    const int offset1 = off % ROWS_PER_WARP;
+                                    const int offset2 = off / ROWS_PER_WARP;
+                                    tmp_out = gcn_mfma16x16x16_instr<scalar_t, 0, 0, 0>(
+                                        Vlocaltmp.xy[i],
+                                        shared_logits[gqa_ratio_loop][0][mtp][vtoken_depth][offset2]
+                                                     [lane16id][offset1],
+                                        tmp_out);
+                                }
+#endif
+                            }
+                        }
+                    }
                     else
                     {
+                        // FP8 V cache
                         for(int vfetch_depth = 0; vfetch_depth < VTLANELOOP; vfetch_depth++)
                         {
                             _B16x8 Vtmp = Vlocal[vtoken_depth][vhe_depth][vfetch_depth];
