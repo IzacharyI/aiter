@@ -706,6 +706,197 @@ __inline__ __device__ uint32_t scaled_vec_conversion<uint32_t, float4>(const flo
 }
 #endif // ENABLE_FP8
 
+// ============================================================================
+// FP4 (E2M1 / MXFP4) dequantization functions
+// 
+// PACKED format: 2 FP4 values per byte (lower 4 bits = first value, upper 4 bits = second value)
+// This matches Python side packing: k_packed = k[..., ::2] | (k[..., 1::2] << 4)
+//
+// Hardware intrinsics available on gfx950+ (MI355x):
+//   __builtin_amdgcn_cvt_scalef32_pk_bf16_fp4(src, scale, index) - for packed format
+//   __builtin_amdgcn_cvt_scalef32_pk_f16_fp4(src, scale, index)
+//   __builtin_amdgcn_cvt_scalef32_pk_f32_fp4(src, scale, index)
+//
+// These intrinsics directly convert packed FP4x2 format to output types.
+// ============================================================================
+
+#if !defined(__gfx950__)
+#define FP4_NOT_SUPPORTED_MSG "FP4 KV cache requires gfx950+ architecture (MI355x). Not supported on this hardware."
+#endif
+
+namespace fp4 {
+
+// FP4 E2M1 lookup table for dequantization
+__device__ __constant__ float fp4_lut[16] = {
+    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
+};
+
+// Helper: pack_fp4x2 not needed anymore since we receive packed data
+
+// Base template for FP4 scaled_vec_conversion (required for template specializations)
+template <typename Tout, typename Tin>
+__inline__ __device__ Tout scaled_vec_conversion(const Tin& x, float scale)
+{
+    // Default implementation returns zero - actual implementations below
+    return Tout{};
+}
+
+#if defined(__gfx950__)
+// FP4 hardware conversion functions - only available on gfx950+
+// Input is already PACKED: 1 byte contains 2 FP4 values (lower 4 bits, upper 4 bits)
+
+// fp4x2 packed (1 byte = 2 FP4 values) -> __nv_bfloat162
+template <>
+__inline__ __device__ __nv_bfloat162 
+scaled_vec_conversion<__nv_bfloat162, uint8_t>(const uint8_t& packed, float scale)
+{
+    // Hardware conversion: packed FP4x2 -> BF16x2 with scale
+    auto result = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp4(packed, scale, 0);
+    __nv_bfloat162 res;
+    res.x = __hip_bfloat16{result[0]};
+    res.y = __hip_bfloat16{result[1]};
+    return res;
+}
+
+// fp4x4 packed (2 bytes = 4 FP4 values) -> bf16_4_t
+template <>
+__inline__ __device__ bf16_4_t 
+scaled_vec_conversion<bf16_4_t, uint16_t>(const uint16_t& packed, float scale)
+{
+    bf16_4_t res;
+    // Convert each packed byte (2 FP4 values) to bf16x2
+    uint8_t lo = packed & 0xFF;         // First byte with 2 FP4 values
+    uint8_t hi = (packed >> 8) & 0xFF;  // Second byte with 2 FP4 values
+    res.x = scaled_vec_conversion<__nv_bfloat162, uint8_t>(lo, scale);
+    res.y = scaled_vec_conversion<__nv_bfloat162, uint8_t>(hi, scale);
+    return res;
+}
+
+// fp4x8 packed (4 bytes = 8 FP4 values) -> bf16_8_t
+template <>
+__inline__ __device__ bf16_8_t 
+scaled_vec_conversion<bf16_8_t, uint32_t>(const uint32_t& packed, float scale)
+{
+    bf16_4_t tmp1 = scaled_vec_conversion<bf16_4_t, uint16_t>((uint16_t)packed, scale);
+    bf16_4_t tmp2 = scaled_vec_conversion<bf16_4_t, uint16_t>((uint16_t)(packed >> 16U), scale);
+    bf16_8_t res;
+    res.x = tmp1.x;
+    res.y = tmp1.y;
+    res.z = tmp2.x;
+    res.w = tmp2.y;
+    return res;
+}
+
+#endif // defined(__gfx950__)
+
+#if defined(__gfx950__)
+// Float conversion functions for FP4 - only available on gfx950+
+
+// fp4x2 packed (1 byte = 2 FP4 values) -> float2
+template <>
+__inline__ __device__ float2 
+scaled_vec_conversion<float2, uint8_t>(const uint8_t& packed, float scale)
+{
+    auto result = __builtin_amdgcn_cvt_scalef32_pk_f32_fp4(packed, scale, 0);
+    float2 res;
+    res.x = result[0];
+    res.y = result[1];
+    return res;
+}
+
+// fp4x4 packed (2 bytes = 4 FP4 values) -> Float4_
+template <>
+__inline__ __device__ Float4_ 
+scaled_vec_conversion<Float4_, uint16_t>(const uint16_t& packed, float scale)
+{
+    Float4_ res;
+    uint8_t lo = packed & 0xFF;
+    uint8_t hi = (packed >> 8) & 0xFF;
+    res.x = scaled_vec_conversion<float2, uint8_t>(lo, scale);
+    res.y = scaled_vec_conversion<float2, uint8_t>(hi, scale);
+    return res;
+}
+
+// fp4x8 packed (4 bytes = 8 FP4 values) -> Float8_
+template <>
+__inline__ __device__ Float8_ 
+scaled_vec_conversion<Float8_, uint32_t>(const uint32_t& packed, float scale)
+{
+    Float4_ tmp1 = scaled_vec_conversion<Float4_, uint16_t>((uint16_t)packed, scale);
+    Float4_ tmp2 = scaled_vec_conversion<Float4_, uint16_t>((uint16_t)(packed >> 16U), scale);
+    Float8_ res;
+    res.x = tmp1.x;
+    res.y = tmp1.y;
+    res.z = tmp2.x;
+    res.w = tmp2.y;
+    return res;
+}
+
+// fp4x2 packed (1 byte = 2 FP4 values) -> half2 (returned as uint32_t)
+template <>
+__inline__ __device__ uint32_t 
+scaled_vec_conversion<uint32_t, uint16_t>(const uint16_t& a, float scale)
+{
+    // Pack 2 unpacked FP4 values into packed format
+    uint8_t lo = a & 0x0F;
+    uint8_t hi = (a >> 8) & 0x0F;
+    uint8_t packed = lo | (hi << 4);
+    
+    auto result = __builtin_amdgcn_cvt_scalef32_pk_f16_fp4(packed, scale, 0);
+    union {
+        __half2_raw h2r;
+        uint32_t ui32;
+    } tmp;
+    tmp.h2r.x.data = result[0];
+    tmp.h2r.y.data = result[1];
+    return tmp.ui32;
+}
+
+// fp4x2 packed (1 byte = 2 FP4 values) -> half2 (returned as uint32_t)
+template <>
+__inline__ __device__ uint32_t 
+scaled_vec_conversion<uint32_t, uint8_t>(const uint8_t& packed, float scale)
+{
+    auto result = __builtin_amdgcn_cvt_scalef32_pk_f16_fp4(packed, scale, 0);
+    union { _Float16 fp16[2]; uint32_t ui32; } tmp;
+    tmp.fp16[0] = result[0];
+    tmp.fp16[1] = result[1];
+    return tmp.ui32;
+}
+
+// fp4x4 packed (2 bytes = 4 FP4 values) -> uint2 (2 x half2)
+template <>
+__inline__ __device__ uint2 
+scaled_vec_conversion<uint2, uint16_t>(const uint16_t& packed, float scale)
+{
+    uint2 res;
+    uint8_t lo = packed & 0xFF;
+    uint8_t hi = (packed >> 8) & 0xFF;
+    res.x = scaled_vec_conversion<uint32_t, uint8_t>(lo, scale);
+    res.y = scaled_vec_conversion<uint32_t, uint8_t>(hi, scale);
+    return res;
+}
+
+// fp4x8 packed (4 bytes = 8 FP4 values) -> uint4 (4 x half2)
+template <>
+__inline__ __device__ uint4 
+scaled_vec_conversion<uint4, uint32_t>(const uint32_t& packed, float scale)
+{
+    uint4 res;
+    uint2 tmp1 = scaled_vec_conversion<uint2, uint16_t>((uint16_t)packed, scale);
+    uint2 tmp2 = scaled_vec_conversion<uint2, uint16_t>((uint16_t)(packed >> 16U), scale);
+    res.x = tmp1.x;
+    res.y = tmp1.y;
+    res.z = tmp2.x;
+    res.w = tmp2.y;
+    return res;
+}
+
+#endif // defined(__gfx950__) - Float/Half FP4 conversions
+
+} // namespace fp4
+
 template <typename Tout, typename Tin, Fp8KVCacheDataType kv_dt>
 __inline__ __device__ Tout convert(const Tin& x)
 {
@@ -726,6 +917,10 @@ __inline__ __device__ Tout scaled_convert(const Tin& x, const float scale)
     if constexpr(kv_dt == Fp8KVCacheDataType::kFp8E4M3)
     {
         return scaled_vec_conversion<Tout, Tin>(x, scale);
+    }
+    else if constexpr(kv_dt == Fp8KVCacheDataType::kFp4E2M1)
+    {
+        return fp4::scaled_vec_conversion<Tout, Tin>(x, scale);
     }
 #endif
     assert(false);
@@ -771,6 +966,26 @@ __inline__ __device__ Tout scaled_convert(const Tin& x, const float scale)
             else if(SRC_DTYPE == at::ScalarType::BFloat16)                               \
             {                                                                            \
                 FN(ck_tile::bf16_t, ck_tile::fp8_t, vllm::Fp8KVCacheDataType::kFp8E4M3); \
+            }                                                                            \
+            else                                                                         \
+            {                                                                            \
+                TORCH_CHECK(false, "Unsupported input type of kv cache: ", SRC_DTYPE);   \
+            }                                                                            \
+        }                                                                                \
+        else if(KV_DTYPE == "fp4" || KV_DTYPE == "fp4_e2m1")                             \
+        {                                                                                \
+            /* FP4: 2 values packed per byte, use uint8_t as cache_t */                  \
+            if(SRC_DTYPE == at::ScalarType::Float)                                       \
+            {                                                                            \
+                FN(float, uint8_t, vllm::Fp8KVCacheDataType::kFp4E2M1);                  \
+            }                                                                            \
+            else if(SRC_DTYPE == at::ScalarType::Half)                                   \
+            {                                                                            \
+                FN(ck_tile::fp16_t, uint8_t, vllm::Fp8KVCacheDataType::kFp4E2M1);        \
+            }                                                                            \
+            else if(SRC_DTYPE == at::ScalarType::BFloat16)                               \
+            {                                                                            \
+                FN(ck_tile::bf16_t, uint8_t, vllm::Fp8KVCacheDataType::kFp4E2M1);        \
             }                                                                            \
             else                                                                         \
             {                                                                            \

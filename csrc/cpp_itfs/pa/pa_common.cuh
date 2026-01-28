@@ -344,6 +344,72 @@ __device__ __forceinline__ _B16x8 convert_b8x8_custom(const _B8x8 input)
     return ret;
 }
 
+// FP4 dequant: 8 bytes packed -> 8 BF16/FP16
+// byte_offset: 0 or 4 to select which half to process
+template <typename T>
+__device__ __forceinline__ _B16x8 convert_b8x8_fp4(const _B8x8 input, int byte_offset = 0)
+{
+#if defined(__gfx950__)
+    union
+    {
+        uint2 u2;
+        uint8_t bytes[8];
+    } tmp;
+    tmp.u2 = input;
+    
+    _B16x8 ret;
+    
+    if constexpr(std::is_same<T, __hip_bfloat16>::value)
+    {
+        using bf16x2_raw_t = __bf16 __attribute__((ext_vector_type(2)));
+        
+        for (int i = 0; i < 4; i++) {
+            uint8_t packed_byte = tmp.bytes[byte_offset + i];
+            bf16x2_raw_t bf_pair = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp4(packed_byte, 1.0f, 0);
+            
+            union { bf16x2_raw_t vec; uint16_t u16[2]; } cvt;
+            cvt.vec = bf_pair;
+            
+            ret.xy[i/2][2*(i%2) + 0] = cvt.u16[0];
+            ret.xy[i/2][2*(i%2) + 1] = cvt.u16[1];
+        }
+    }
+    else if constexpr(std::is_same<T, _Float16>::value)
+    {
+        using fp16x2_raw_t = _Float16 __attribute__((ext_vector_type(2)));
+        
+        for (int i = 0; i < 4; i++) {
+            uint8_t packed_byte = tmp.bytes[byte_offset + i];
+            fp16x2_raw_t fp_pair = __builtin_amdgcn_cvt_scalef32_pk_f16_fp4(packed_byte, 1.0f, 0);
+            
+            union { fp16x2_raw_t vec; uint16_t u16[2]; } cvt;
+            cvt.vec = fp_pair;
+            ret.xy[i/2][2*(i%2) + 0] = cvt.u16[0];
+            ret.xy[i/2][2*(i%2) + 1] = cvt.u16[1];
+        }
+    }
+    else
+    {
+        static_assert(std::is_same<T, __hip_bfloat16>::value || std::is_same<T, _Float16>::value,
+                      "FP4 conversion only supports BF16 or FP16");
+    }
+    return ret;
+#else
+    return _B16x8{};
+#endif
+}
+
+// Unified KV dequant dispatcher
+template <typename T, vllm::Fp8KVCacheDataType KV_DTYPE>
+__device__ __forceinline__ _B16x8 convert_b8x8_kv(const _B8x8 input)
+{
+    if constexpr (KV_DTYPE == vllm::Fp8KVCacheDataType::kFp4E2M1) {
+        return convert_b8x8_fp4<T>(input);
+    } else {
+        return convert_b8x8_custom<T>(input);
+    }
+}
+
 typedef union u64_cvt {
   half f16x4[4];
   int16_t b16x4[4];
