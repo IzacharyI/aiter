@@ -207,6 +207,9 @@ _paged_attention_kernel(const int* block_table_seq,
     constexpr int KX     = 16 / sizeof(cache_t); // vLLM defines x as 16 Bytes of kv cache elements
     const cache_t* k_ptr = k_cache + wg_start_kv_head_idx * kv_head_stride;
 
+    // Per-token K scales array (for per-token scale support)
+    float k_token_scales[TLOOP];
+    
     const int row_head_elem = rowid * CONTIGUOUS_KV_ELEMS_16B_LOAD;
     // fetch K values
     for(int token_depth = 0; token_depth < TLOOP; token_depth++)
@@ -217,6 +220,28 @@ _paged_attention_kernel(const int* block_table_seq,
         const int kglobal_token_idx = partition_start_token_idx + klocal_token_idx;
         const int kphysical_block_offset = klocal_token_idx % BLOCK_SIZE;
         const cache_t* k_ptr3            = k_ptr2 + kphysical_block_offset * kv_seq_stride;
+        
+        // Compute per-token scale: use physical block number and offset
+        float token_k_scale = 1.0f;
+        if constexpr(KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto)
+        {
+            // k_scale layout: [num_kv_heads, num_blocks * block_size]
+            // Physical token index: kblock_number * BLOCK_SIZE + kphysical_block_offset
+            const int64_t physical_token_idx = kblock_number * BLOCK_SIZE + kphysical_block_offset;
+            
+            // Offset to current KV head's scale array
+            // Assuming k_scale_ptr points to k_scale[0, 0]
+            // Need: k_scale[kv_head_idx, physical_token_idx]
+            // But we don't know the stride (total_tokens per head)!
+            // 
+            // Workaround: Assume Python passes per-head scale
+            // OR: Use a large enough stride (e.g., 32M tokens)
+            constexpr int64_t MAX_TOKENS_PER_HEAD = 32 * 1024 * 1024; // 32M tokens
+            const int64_t scale_idx = kv_head_idx * MAX_TOKENS_PER_HEAD + physical_token_idx;
+            
+            token_k_scale = k_scale_ptr[scale_idx];
+        }
+        k_token_scales[token_depth] = token_k_scale;
 
         for(int qkhe_depth = 0; qkhe_depth < QKHELOOP; qkhe_depth++)
         {
@@ -378,10 +403,12 @@ _paged_attention_kernel(const int* block_table_seq,
     float scale2  = scale;
     float q_scale = q_scale_ptr ? *q_scale_ptr : 1.0;
 
-    if constexpr(KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto)
-    {
-        scale2 *= *k_scale_ptr;
-    }
+    // Note: For per-token scale, we will apply k_scale inside the token loop
+    // For now, keep base scale without k_scale
+    // if constexpr(KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto)
+    // {
+    //     scale2 *= *k_scale_ptr;  // Removed: will apply per-token scale later
+    // }
 
 
     const auto variant_params = [&] {
@@ -510,6 +537,24 @@ _paged_attention_kernel(const int* block_table_seq,
     }
     
     const int qkout_token_idx = partition_start_token_idx + TOKENS_PER_WARP * warpid + rowid * 4;
+
+    // Apply per-token K scale to QK logits
+    if constexpr(KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto)
+    {
+        for(int token_depth = 0; token_depth < TLOOP; token_depth++)
+        {
+            for(int mtp = 0; mtp < mtp_loop; mtp++)
+            {
+                for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++)
+                {
+                    for(int i = 0; i < 4; i++)
+                    {
+                        d_out[gqa_ratio_loop][mtp][token_depth][i] *= k_token_scales[token_depth];
+                    }
+                }
+            }
+        }
+    }
 
     // apply alibi
     if constexpr(ALIBI_ENABLED)

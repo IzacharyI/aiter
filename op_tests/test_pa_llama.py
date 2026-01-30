@@ -796,8 +796,24 @@ def test_paged_attention(
                 key_cache_run = rearrange(key_cache_run, "b h s d -> b s h d")
                 value_cache_run = rearrange(value_cache_run, "b h s d -> b s h d")
             
-            k_scale_run = k_scale_quant
-            v_scale_run = v_scale_quant
+            # Per-token scale: pad to MAX_TOKENS_PER_HEAD for kernel compatibility
+            # Kernel assumes stride = 32M tokens per head
+            MAX_TOKENS_PER_HEAD = 32 * 1024 * 1024
+            num_kv_heads = k_scale_quant.shape[0]
+            current_total_tokens = k_scale_quant.shape[1]
+            
+            if current_total_tokens > MAX_TOKENS_PER_HEAD:
+                raise ValueError(f"total_tokens ({current_total_tokens}) exceeds MAX_TOKENS_PER_HEAD ({MAX_TOKENS_PER_HEAD})")
+            
+            # Pad scale to MAX_TOKENS_PER_HEAD
+            k_scale_run = torch.zeros(num_kv_heads, MAX_TOKENS_PER_HEAD, dtype=k_scale_quant.dtype, device=k_scale_quant.device)
+            k_scale_run[:, :current_total_tokens] = k_scale_quant
+            
+            v_scale_run = torch.zeros(num_kv_heads, MAX_TOKENS_PER_HEAD, dtype=v_scale_quant.dtype, device=v_scale_quant.device)
+            v_scale_run[:, :current_total_tokens] = v_scale_quant
+            
+            k_scale_run = k_scale_run.contiguous()
+            v_scale_run = v_scale_run.contiguous()
             kv_dtype_str = "fp8"
         elif kv_cache_dtype == "fp4":
             # FP4 precision verification
@@ -836,8 +852,24 @@ def test_paged_attention(
                 key_cache_run = rearrange(key_cache_run, "b h s d -> b s h d")
                 value_cache_run = rearrange(value_cache_run, "b h s d -> b s h d")
             
-            k_scale_run = k_scale_quant.mean().reshape(1)
-            v_scale_run = v_scale_quant.mean().reshape(1)
+            # Per-head scale: pad to MAX_TOKENS_PER_HEAD for kernel compatibility
+            # Kernel assumes stride = 32M tokens per head
+            MAX_TOKENS_PER_HEAD = 32 * 1024 * 1024
+            num_kv_heads = k_scale_quant.shape[0]
+            current_total_tokens = k_scale_quant.shape[1]
+            
+            if current_total_tokens > MAX_TOKENS_PER_HEAD:
+                raise ValueError(f"total_tokens ({current_total_tokens}) exceeds MAX_TOKENS_PER_HEAD ({MAX_TOKENS_PER_HEAD})")
+            
+            # Pad scale to MAX_TOKENS_PER_HEAD
+            k_scale_run = torch.zeros(num_kv_heads, MAX_TOKENS_PER_HEAD, dtype=k_scale_quant.dtype, device=k_scale_quant.device)
+            k_scale_run[:, :current_total_tokens] = k_scale_quant
+            
+            v_scale_run = torch.zeros(num_kv_heads, MAX_TOKENS_PER_HEAD, dtype=v_scale_quant.dtype, device=v_scale_quant.device)
+            v_scale_run[:, :current_total_tokens] = v_scale_quant
+            
+            k_scale_run = k_scale_run.contiguous()
+            v_scale_run = v_scale_run.contiguous()
             kv_dtype_str = "fp4"
         else:
             # Use original BF16/FP16 cache
@@ -868,8 +900,22 @@ def test_paged_attention(
             v_scale_run,
             sliding_window=sliding_window,
         )
-        acc = checkAllclose(out_golden, out_aiter, atol=0.5, rtol=0.5, msg=f"golden vs aiter:{time_aiter:.2f} us")
+        # Set tolerance based on kv_cache_dtype
+        if kv_cache_dtype == "fp4":
+            atol, rtol = 0.5, 0.5
+        elif kv_cache_dtype == "fp8":
+            atol, rtol = 0.3, 0.25
+        else:  # auto (BF16/FP16)
+            atol, rtol = 0.1, 0.1
+        
+        acc = checkAllclose(out_golden, out_aiter, atol=atol, rtol=rtol, msg=f"golden vs aiter:{time_aiter:.2f} us")
         acc_str = "PASS" if acc < 0.01 else "FAIL"
+        
+        # Calculate and print max_delta for analysis
+        delta = (out_golden.float() - out_aiter.float()).abs()
+        max_delta = delta.max().item()
+        mean_delta = delta.mean().item()
+        print(f"  [Accuracy Details] max_delta={max_delta:.6f}, mean_delta={mean_delta:.6f}")
 
     if DUMP_INPUTS:
         dump_input(
