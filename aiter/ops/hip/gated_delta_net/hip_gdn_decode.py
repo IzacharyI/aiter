@@ -3,8 +3,11 @@ HIP/TUNED GDN decode kernel for sglang.
 
 Drop-in replacement for fused_sigmoid_gating_delta_rule_update (Triton)
 in decode mode. Uses [V, K] state layout with float4 vectorized access
-for optimal memory coalescing; transposes state on-the-fly from/to
-sglang's [K, V] convention (same strategy as FlyDSL).
+for optimal memory coalescing.
+
+Expects ssm_states to be kept in [V, K] layout permanently.  The sglang
+backend transposes once after extend ([K,V]→[V,K]) and before/after
+verify, so the decode path runs without any state transpose overhead.
 
 Kernel parameters are specialized for Qwen3.5:
   K_heads=16, V_heads=32, K=128, V=128, bf16.
@@ -55,6 +58,7 @@ def hip_fused_sigmoid_gating_delta_rule_update(
     cu_seqlens: Optional[torch.Tensor] = None,
     is_kda: bool = False,
 ):
+    """VK decode kernel — state must already be in [V,K] layout."""
     ext = _load_extension()
 
     B, T, H, K = q.shape
@@ -82,8 +86,7 @@ def hip_fused_sigmoid_gating_delta_rule_update(
     num_k_heads = H
     num_v_heads = HV
 
-    # Single C++ call: transpose [K,V]→[V,K] + VK kernel + transpose [V,K]→[K,V]
-    ext.hip_gdn_decode_vk_auto_inplace(
+    ext.hip_gdn_decode_tuned_vk_inplace(
         q.contiguous(),
         k.contiguous(),
         v.contiguous(),
@@ -104,3 +107,19 @@ def hip_fused_sigmoid_gating_delta_rule_update(
     )
 
     return o
+
+
+def hip_state_transpose_inplace(
+    state: torch.Tensor,
+    indices: torch.Tensor,
+    batch_size: int,
+    num_v_heads: int,
+):
+    """In-place 128x128 state transpose [K,V] <-> [V,K] for selected pool slots."""
+    ext = _load_extension()
+    indices_int32 = (
+        indices.to(torch.int32)
+        if indices.dtype != torch.int32
+        else indices
+    )
+    ext.hip_state_transpose(state, indices_int32, batch_size, num_v_heads)
