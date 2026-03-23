@@ -293,17 +293,16 @@ void gdn_decode_kernel_hip(
 }
 
 // ============================================================
-// ASM kernel: Split V-loop to free q_reg between phases
-// Phase A: dot products (needs q + k + state)
-// Phase B: state update (needs k + state only, q is dead)
-// V iterations are independent (each vi owns distinct state rows),
-// so splitting is correct.
+// (removed: gdn_decode_kernel_asm — inferior to iasm variant)
 // ============================================================
+
+// ============================================================
+// PLACEHOLDER_ASM_REMOVED
+// ============================================================
+#if 0
 template <int NUM_V_BLOCKS, bool USE_QK_L2NORM>
 __global__
-__launch_bounds__(BLOCK_THREADS, 3)
-__attribute__((amdgpu_waves_per_eu(3, 5)))
-void gdn_decode_kernel_asm(
+void gdn_decode_kernel_asm_REMOVED(
     const __hip_bfloat16* __restrict__ query,
     const __hip_bfloat16* __restrict__ key,
     const __hip_bfloat16* __restrict__ value,
@@ -477,6 +476,7 @@ void gdn_decode_kernel_asm(
         }
     }
 }
+#endif // removed gdn_decode_kernel_asm
 
 // ============================================================
 // TUNED kernel: Maximized ILP through restructured loops
@@ -707,7 +707,7 @@ void gdn_decode_kernel_tuned(
 // ============================================================
 // IASM kernel: TUNED + inline ASM for reduce/shuffle
 // ============================================================
-template <int NUM_V_BLOCKS, bool USE_QK_L2NORM>
+template <int NUM_V_BLOCKS, bool USE_QK_L2NORM, int NKH, int NVH>
 __global__
 __launch_bounds__(BLOCK_THREADS, 3)
 __attribute__((amdgpu_waves_per_eu(3, 5)))
@@ -737,9 +737,9 @@ void gdn_decode_kernel_iasm(
     const int b_hv_vb = blockIdx.x;
     const int v_block_id = b_hv_vb % NUM_V_BLOCKS;
     const int b_hv = b_hv_vb / NUM_V_BLOCKS;
-    const int batch_idx = b_hv / NUM_V_HEADS;
-    const int hv_idx = b_hv % NUM_V_HEADS;
-    const int hk_idx = hv_idx / (NUM_V_HEADS / NUM_K_HEADS);
+    const int batch_idx = b_hv / NVH;
+    const int hv_idx = b_hv % NVH;
+    const int hk_idx = hv_idx / (NVH / NKH);
 
     if (batch_idx >= batch_size) return;
     const int pool_idx = indices[batch_idx];
@@ -755,7 +755,7 @@ void gdn_decode_kernel_iasm(
 
     float S[V_ITERS][K_ITERS][VEC_K];
     const int shs = HEAD_V_DIM * HEAD_K_DIM;
-    float* sb = state + (int64_t)pool_idx * NUM_V_HEADS * shs + hv_idx * shs;
+    float* sb = state + (int64_t)pool_idx * NVH * shs + hv_idx * shs;
 
     #pragma unroll
     for (int vi = 0; vi < V_ITERS; vi++) {
@@ -773,15 +773,15 @@ void gdn_decode_kernel_iasm(
     float k_reg[K_ITERS][VEC_K];
 
     for (int sq = 0; sq < seq_length; sq++) {
-        const int ab = batch_idx * seq_length * NUM_V_HEADS + sq * NUM_V_HEADS + hv_idx;
+        const int ab = batch_idx * seq_length * NVH + sq * NVH + hv_idx;
         float x = __bfloat162float(a_input[ab]) + r_dt_bias;
         float sp = (x <= 20.0f) ? __logf(1.0f + __expf(x)) : x;
         float exp_g = __expf(-__expf(r_A_log) * sp);
         float beta = __frcp_rn(1.0f + __expf(-__bfloat162float(b_input[ab])));
 
-        const auto* qb = query + (int64_t)(batch_idx * seq_length + sq) * NUM_K_HEADS * HEAD_K_DIM + hk_idx * HEAD_K_DIM;
-        const auto* kb = key + (int64_t)(batch_idx * seq_length + sq) * NUM_K_HEADS * HEAD_K_DIM + hk_idx * HEAD_K_DIM;
-        const auto* vb = value + (int64_t)(batch_idx * seq_length + sq) * NUM_V_HEADS * HEAD_V_DIM + hv_idx * HEAD_V_DIM;
+        const auto* qb = query + (int64_t)(batch_idx * seq_length + sq) * NKH * HEAD_K_DIM + hk_idx * HEAD_K_DIM;
+        const auto* kb = key + (int64_t)(batch_idx * seq_length + sq) * NKH * HEAD_K_DIM + hk_idx * HEAD_K_DIM;
+        const auto* vb = value + (int64_t)(batch_idx * seq_length + sq) * NVH * HEAD_V_DIM + hv_idx * HEAD_V_DIM;
 
         #pragma unroll
         for (int ki = 0; ki < K_ITERS; ki++) {
@@ -813,7 +813,6 @@ void gdn_decode_kernel_iasm(
                         sq_q += q_reg[ki][j] * q_reg[ki][j];
                         sq_k += k_reg[ki][j] * k_reg[ki][j];
                     }
-                // ASM 2-way interleaved reduce for L2 norm
                 reduce_2way_asm(sq_q, sq_k, xor1, xor2, xor4);
                 float qs = scale * __frsqrt_rn(sq_q + 1e-6f);
                 float ks = __frsqrt_rn(sq_k + 1e-6f);
@@ -913,7 +912,7 @@ void gdn_decode_kernel_iasm(
             res_hq[vi] = res_hq[vi] + vn[vi] * dot_kq;
 
         if (k_tid == 0) {
-            const int64_t out_base = (int64_t)(batch_idx * seq_length + sq) * NUM_V_HEADS * HEAD_V_DIM
+            const int64_t out_base = (int64_t)(batch_idx * seq_length + sq) * NVH * HEAD_V_DIM
                                      + hv_idx * HEAD_V_DIM + global_v_base;
             #pragma unroll
             for (int vi = 0; vi < V_ITERS; vi++)
@@ -982,37 +981,6 @@ void launch_gdn_decode(
     }
 }
 
-void launch_gdn_decode_asm(
-    const void* query, const void* key, const void* value,
-    const void* a_input, const void* b_input, const void* dt_bias,
-    const void* A_log, const void* indices,
-    void* state, void* output,
-    int batch_size, int seq_length,
-    int num_v_blocks, bool use_qk_l2norm, float scale,
-    hipStream_t stream
-) {
-    dim3 grid(batch_size * NUM_V_HEADS * num_v_blocks);
-    dim3 block(BLOCK_THREADS);
-    auto q = reinterpret_cast<const __hip_bfloat16*>(query);
-    auto k = reinterpret_cast<const __hip_bfloat16*>(key);
-    auto v = reinterpret_cast<const __hip_bfloat16*>(value);
-    auto a = reinterpret_cast<const __hip_bfloat16*>(a_input);
-    auto b = reinterpret_cast<const __hip_bfloat16*>(b_input);
-    auto dt = reinterpret_cast<const __hip_bfloat16*>(dt_bias);
-    auto al = reinterpret_cast<const float*>(A_log);
-    auto idx = reinterpret_cast<const int*>(indices);
-    auto st = reinterpret_cast<float*>(state);
-    auto o = reinterpret_cast<__hip_bfloat16*>(output);
-
-    if (num_v_blocks == 1) {
-        if (use_qk_l2norm) LAUNCH(gdn_decode_kernel_asm, 1, true);
-        else               LAUNCH(gdn_decode_kernel_asm, 1, false);
-    } else {
-        if (use_qk_l2norm) LAUNCH(gdn_decode_kernel_asm, 2, true);
-        else               LAUNCH(gdn_decode_kernel_asm, 2, false);
-    }
-}
-
 void launch_gdn_decode_tuned(
     const void* query, const void* key, const void* value,
     const void* a_input, const void* b_input, const void* dt_bias,
@@ -1044,6 +1012,33 @@ void launch_gdn_decode_tuned(
     }
 }
 
+} // close extern "C" for template dispatch
+
+template <int NKH, int NVH>
+static void dispatch_iasm(
+    const __hip_bfloat16* q, const __hip_bfloat16* k, const __hip_bfloat16* v,
+    const __hip_bfloat16* a, const __hip_bfloat16* b, const __hip_bfloat16* dt,
+    const float* al, const int* idx, float* st, __hip_bfloat16* o,
+    int batch_size, int seq_length, int num_v_blocks, bool use_qk_l2norm,
+    float scale, hipStream_t stream
+) {
+    dim3 grid(batch_size * NVH * num_v_blocks);
+    dim3 block(BLOCK_THREADS);
+    #define LAUNCH_IASM(NVB, L2) \
+        hipLaunchKernelGGL((gdn_decode_kernel_iasm<NVB, L2, NKH, NVH>), \
+            dim3(grid), dim3(block), 0, stream, \
+            q, k, v, a, b, dt, al, idx, st, o, batch_size, seq_length, scale)
+    if (num_v_blocks == 1) {
+        if (use_qk_l2norm) LAUNCH_IASM(1, true);
+        else               LAUNCH_IASM(1, false);
+    } else {
+        if (use_qk_l2norm) LAUNCH_IASM(2, true);
+        else               LAUNCH_IASM(2, false);
+    }
+    #undef LAUNCH_IASM
+}
+
+extern "C"
 void launch_gdn_decode_iasm(
     const void* query, const void* key, const void* value,
     const void* a_input, const void* b_input, const void* dt_bias,
@@ -1051,10 +1046,9 @@ void launch_gdn_decode_iasm(
     void* state, void* output,
     int batch_size, int seq_length,
     int num_v_blocks, bool use_qk_l2norm, float scale,
+    int num_k_heads, int num_v_heads,
     hipStream_t stream
 ) {
-    dim3 grid(batch_size * NUM_V_HEADS * num_v_blocks);
-    dim3 block(BLOCK_THREADS);
     auto q = reinterpret_cast<const __hip_bfloat16*>(query);
     auto k = reinterpret_cast<const __hip_bfloat16*>(key);
     auto v = reinterpret_cast<const __hip_bfloat16*>(value);
@@ -1066,18 +1060,17 @@ void launch_gdn_decode_iasm(
     auto st = reinterpret_cast<float*>(state);
     auto o = reinterpret_cast<__hip_bfloat16*>(output);
 
-    if (num_v_blocks == 1) {
-        if (use_qk_l2norm) LAUNCH(gdn_decode_kernel_iasm, 1, true);
-        else               LAUNCH(gdn_decode_kernel_iasm, 1, false);
-    } else {
-        if (use_qk_l2norm) LAUNCH(gdn_decode_kernel_iasm, 2, true);
-        else               LAUNCH(gdn_decode_kernel_iasm, 2, false);
-    }
+    if (num_k_heads == 16 && num_v_heads == 32)
+        dispatch_iasm<16,32>(q,k,v,a,b,dt,al,idx,st,o,batch_size,seq_length,num_v_blocks,use_qk_l2norm,scale,stream);
+    else if (num_k_heads == 2 && num_v_heads == 4)
+        dispatch_iasm<2,4>(q,k,v,a,b,dt,al,idx,st,o,batch_size,seq_length,num_v_blocks,use_qk_l2norm,scale,stream);
+    else if (num_k_heads == 4 && num_v_heads == 8)
+        dispatch_iasm<4,8>(q,k,v,a,b,dt,al,idx,st,o,batch_size,seq_length,num_v_blocks,use_qk_l2norm,scale,stream);
+    else if (num_k_heads == 8 && num_v_heads == 16)
+        dispatch_iasm<8,16>(q,k,v,a,b,dt,al,idx,st,o,batch_size,seq_length,num_v_blocks,use_qk_l2norm,scale,stream);
 }
 
 #undef LAUNCH
-
-} // extern "C"
 
 // ============================================================
 // Sglang-compatible TUNED kernel: state layout [pool, HV, K, V]
@@ -1360,7 +1353,7 @@ void gdn_decode_kernel_tuned_vk(
     const __hip_bfloat16* __restrict__ value,
     const __hip_bfloat16* __restrict__ a_input,
     const __hip_bfloat16* __restrict__ b_input,
-    const float* __restrict__          dt_bias,
+    const __hip_bfloat16* __restrict__ dt_bias,
     const float* __restrict__          A_log,
     const int* __restrict__            indices,
     float* __restrict__                state,
@@ -1410,7 +1403,7 @@ void gdn_decode_kernel_tuned_vk(
     }
 
     const float r_A_log = A_log[hv_idx];
-    const float r_dt_bias = dt_bias[hv_idx];
+    const float r_dt_bias = __bfloat162float(dt_bias[hv_idx]);
 
     float k_reg[K_ITERS][VEC_K];
 
@@ -1591,7 +1584,7 @@ void launch_gdn_decode_tuned_vk(
     auto v = reinterpret_cast<const __hip_bfloat16*>(value);
     auto a = reinterpret_cast<const __hip_bfloat16*>(a_input);
     auto b = reinterpret_cast<const __hip_bfloat16*>(b_input);
-    auto dt = reinterpret_cast<const float*>(dt_bias);
+    auto dt = reinterpret_cast<const __hip_bfloat16*>(dt_bias);
     auto al = reinterpret_cast<const float*>(A_log);
     auto idx = reinterpret_cast<const int*>(indices);
     auto st = reinterpret_cast<float*>(state);
