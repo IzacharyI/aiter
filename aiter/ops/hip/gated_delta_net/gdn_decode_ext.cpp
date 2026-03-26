@@ -13,6 +13,17 @@ void launch_gdn_decode_iasm(
     hipStream_t stream
 );
 
+void launch_gdn_decode_iasm_generic(
+    const void* query, const void* key, const void* value,
+    const void* a_input, const void* b_input, const void* dt_bias,
+    const void* A_log, const void* indices,
+    void* state, void* output,
+    int batch_size, int seq_length,
+    int num_v_blocks, bool use_qk_l2norm, float scale,
+    int num_k_heads, int num_v_heads,
+    hipStream_t stream
+);
+
 void launch_gdn_decode_tuned(
     const void* query, const void* key, const void* value,
     const void* a_input, const void* b_input, const void* dt_bias,
@@ -218,6 +229,25 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             num_v_blocks, use_qk_l2norm, scale,
             num_k_heads, num_v_heads, stream);
     }, "GDN decode ASM kernel (inline asm reduces, state [V,K], template-specialized heads)");
+    m.def("hip_gdn_decode_asm_generic_inplace", [](
+        torch::Tensor query, torch::Tensor key, torch::Tensor value,
+        torch::Tensor a, torch::Tensor b, torch::Tensor dt_bias,
+        torch::Tensor A_log, torch::Tensor indices,
+        torch::Tensor state, torch::Tensor output,
+        int batch_size, int seq_length,
+        int num_v_blocks, bool use_qk_l2norm, float scale,
+        int num_k_heads, int num_v_heads
+    ) {
+        auto stream = at::hip::getCurrentHIPStream().stream();
+        launch_gdn_decode_iasm_generic(
+            query.data_ptr(), key.data_ptr(), value.data_ptr(),
+            a.data_ptr(), b.data_ptr(), dt_bias.data_ptr(),
+            A_log.data_ptr(), indices.data_ptr(),
+            state.data_ptr(), output.data_ptr(),
+            batch_size, seq_length,
+            num_v_blocks, use_qk_l2norm, scale,
+            num_k_heads, num_v_heads, stream);
+    }, "GDN decode ASM generic fallback kernel (pre-extreme dispatch)");
     m.def("hip_gdn_decode_kv4_inplace", [](
         torch::Tensor query, torch::Tensor key, torch::Tensor value,
         torch::Tensor a, torch::Tensor b, torch::Tensor dt_bias,

@@ -142,6 +142,69 @@ __device__ __forceinline__ void shfl_idx_4way_asm(
     );
 }
 
+__device__ __forceinline__ void reduce_1way_asm(float& v0, int a1, int a2, int a4)
+{
+    float t0;
+    asm volatile(
+        "ds_bpermute_b32 %0, %2, %1\n"
+        "s_waitcnt lgkmcnt(0)\n" "v_add_f32 %1, %1, %0\n"
+        "ds_bpermute_b32 %0, %3, %1\n"
+        "s_waitcnt lgkmcnt(0)\n" "v_add_f32 %1, %1, %0\n"
+        "ds_bpermute_b32 %0, %4, %1\n"
+        "s_waitcnt lgkmcnt(0)\n" "v_add_f32 %1, %1, %0\n"
+        : "=&v"(t0), "+v"(v0)
+        : "v"(a1), "v"(a2), "v"(a4)
+    );
+}
+
+__device__ __forceinline__ void reduce_4way_asm(
+    float& v0, float& v1, float& v2, float& v3,
+    int a1, int a2, int a4)
+{
+    float t0, t1, t2, t3;
+    asm volatile(
+        "ds_bpermute_b32 %0, %8, %4\n"
+        "ds_bpermute_b32 %1, %8, %5\n"
+        "ds_bpermute_b32 %2, %8, %6\n"
+        "ds_bpermute_b32 %3, %8, %7\n"
+        "s_waitcnt lgkmcnt(3)\n" "v_add_f32 %4, %4, %0\n"
+        "s_waitcnt lgkmcnt(2)\n" "v_add_f32 %5, %5, %1\n"
+        "s_waitcnt lgkmcnt(1)\n" "v_add_f32 %6, %6, %2\n"
+        "s_waitcnt lgkmcnt(0)\n" "v_add_f32 %7, %7, %3\n"
+        "ds_bpermute_b32 %0, %9, %4\n"
+        "ds_bpermute_b32 %1, %9, %5\n"
+        "ds_bpermute_b32 %2, %9, %6\n"
+        "ds_bpermute_b32 %3, %9, %7\n"
+        "s_waitcnt lgkmcnt(3)\n" "v_add_f32 %4, %4, %0\n"
+        "s_waitcnt lgkmcnt(2)\n" "v_add_f32 %5, %5, %1\n"
+        "s_waitcnt lgkmcnt(1)\n" "v_add_f32 %6, %6, %2\n"
+        "s_waitcnt lgkmcnt(0)\n" "v_add_f32 %7, %7, %3\n"
+        "ds_bpermute_b32 %0, %10, %4\n"
+        "ds_bpermute_b32 %1, %10, %5\n"
+        "ds_bpermute_b32 %2, %10, %6\n"
+        "ds_bpermute_b32 %3, %10, %7\n"
+        "s_waitcnt lgkmcnt(3)\n" "v_add_f32 %4, %4, %0\n"
+        "s_waitcnt lgkmcnt(2)\n" "v_add_f32 %5, %5, %1\n"
+        "s_waitcnt lgkmcnt(1)\n" "v_add_f32 %6, %6, %2\n"
+        "s_waitcnt lgkmcnt(0)\n" "v_add_f32 %7, %7, %3\n"
+        : "=&v"(t0), "=&v"(t1), "=&v"(t2), "=&v"(t3),
+          "+v"(v0), "+v"(v1), "+v"(v2), "+v"(v3)
+        : "v"(a1), "v"(a2), "v"(a4)
+    );
+}
+
+__device__ __forceinline__ void shfl_idx_2way_asm(
+    float& d0, float& d1, float s0, float s1, int addr)
+{
+    asm volatile(
+        "ds_bpermute_b32 %0, %4, %2\n"
+        "ds_bpermute_b32 %1, %4, %3\n"
+        "s_waitcnt lgkmcnt(0)\n"
+        : "=v"(d0), "=v"(d1)
+        : "v"(s0), "v"(s1), "v"(addr)
+    );
+}
+
 // ============================================================
 // HIP kernel: q+k in registers, auto-dispatch regqk/hybrid
 // ============================================================
@@ -941,6 +1004,226 @@ void gdn_decode_kernel_iasm(
     }
 }
 
+template <int NKH, int NVH, int NUM_V_BLOCKS>
+__device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body(
+    const __hip_bfloat16* __restrict__ query,
+    const __hip_bfloat16* __restrict__ key,
+    const __hip_bfloat16* __restrict__ value,
+    const __hip_bfloat16* __restrict__ a_input,
+    const __hip_bfloat16* __restrict__ b_input,
+    const __hip_bfloat16* __restrict__ dt_bias,
+    const float* __restrict__          A_log,
+    const int* __restrict__            indices,
+    float* __restrict__                state,
+    __hip_bfloat16* __restrict__       output,
+    int batch_size, float scale
+) {
+    constexpr int TILE_V = HEAD_V_DIM / NUM_V_BLOCKS;
+    constexpr int WARP_GROUP_TILE_V = NUM_WARPS * WARP_V_THREADS;
+    constexpr int V_ITERS = TILE_V / WARP_GROUP_TILE_V;
+
+    const int tid = threadIdx.x;
+    const int lane_id = tid % WARP_SIZE;
+    const int warp_id = tid / WARP_SIZE;
+    const int k_tid = lane_id % WARP_K_THREADS;
+    const int v_tid = lane_id / WARP_K_THREADS;
+
+    const int b_hv_vb = blockIdx.x;
+    const int v_block_id = b_hv_vb % NUM_V_BLOCKS;
+    const int b_hv = b_hv_vb / NUM_V_BLOCKS;
+    const int batch_idx = b_hv / NVH;
+    const int hv_idx = b_hv % NVH;
+    const int hk_idx = hv_idx / (NVH / NKH);
+
+    if (batch_idx >= batch_size) return;
+    const int pool_idx = indices[batch_idx];
+    if (pool_idx < 0) return;
+
+    const int warp_k_vec_start = k_tid * VEC_K;
+    const int global_v_base = v_block_id * TILE_V + warp_id * WARP_V_THREADS + v_tid;
+    const int leader_addr = ((lane_id / WARP_K_THREADS) * WARP_K_THREADS) << 2;
+
+    const int xor1 = (lane_id ^ 1) << 2;
+    const int xor2 = (lane_id ^ 2) << 2;
+    const int xor4 = (lane_id ^ 4) << 2;
+
+    float S[V_ITERS][K_ITERS][VEC_K];
+    const int shs = HEAD_V_DIM * HEAD_K_DIM;
+    float* sb = state + (int64_t)pool_idx * NVH * shs + hv_idx * shs;
+
+    #pragma unroll
+    for (int vi = 0; vi < V_ITERS; vi++) {
+        int gv = global_v_base + vi * WARP_GROUP_TILE_V;
+        #pragma unroll
+        for (int ki = 0; ki < K_ITERS; ki++) {
+            float4 t = *reinterpret_cast<const float4*>(
+                sb + gv * HEAD_K_DIM + warp_k_vec_start + ki * WARP_TILE_K);
+            S[vi][ki][0] = t.x;
+            S[vi][ki][1] = t.y;
+            S[vi][ki][2] = t.z;
+            S[vi][ki][3] = t.w;
+        }
+    }
+
+    const int ab = batch_idx * NVH + hv_idx;
+    float x = __bfloat162float(a_input[ab]) + __bfloat162float(dt_bias[hv_idx]);
+    float sp = (x <= 20.0f) ? __logf(1.0f + __expf(x)) : x;
+    float exp_g = __expf(-__expf(A_log[hv_idx]) * sp);
+    float beta = __frcp_rn(1.0f + __expf(-__bfloat162float(b_input[ab])));
+
+    const auto* qb = query + (int64_t)batch_idx * NKH * HEAD_K_DIM + hk_idx * HEAD_K_DIM;
+    const auto* kb = key + (int64_t)batch_idx * NKH * HEAD_K_DIM + hk_idx * HEAD_K_DIM;
+    const auto* vb = value + (int64_t)batch_idx * NVH * HEAD_V_DIM + hv_idx * HEAD_V_DIM;
+
+    float sq_q = 0.0f;
+    float sq_k = 0.0f;
+    #pragma unroll
+    for (int ki = 0; ki < K_ITERS; ki++) {
+        int ko = warp_k_vec_start + ki * WARP_TILE_K;
+        #pragma unroll
+        for (int j = 0; j < VEC_K; j++) {
+            float qv = __bfloat162float(qb[ko + j]);
+            float kv = __bfloat162float(kb[ko + j]);
+            sq_q += qv * qv;
+            sq_k += kv * kv;
+        }
+    }
+    reduce_2way_asm(sq_q, sq_k, xor1, xor2, xor4);
+    const float qs = scale * __frsqrt_rn(sq_q + 1e-6f);
+    const float ks = __frsqrt_rn(sq_k + 1e-6f);
+
+    float dot_kq = 0.0f;
+    float res_hk[V_ITERS];
+    float res_hq[V_ITERS];
+    #pragma unroll
+    for (int vi = 0; vi < V_ITERS; vi++) {
+        res_hk[vi] = 0.0f;
+        res_hq[vi] = 0.0f;
+    }
+
+    #pragma unroll
+    for (int ki = 0; ki < K_ITERS; ki++) {
+        int ko = warp_k_vec_start + ki * WARP_TILE_K;
+        #pragma unroll
+        for (int j = 0; j < VEC_K; j++) {
+            float qv = __bfloat162float(qb[ko + j]) * qs;
+            float kv = __bfloat162float(kb[ko + j]) * ks;
+            dot_kq += kv * qv;
+            #pragma unroll
+            for (int vi = 0; vi < V_ITERS; vi++) {
+                res_hk[vi] += S[vi][ki][j] * kv;
+                res_hq[vi] += S[vi][ki][j] * qv;
+            }
+        }
+    }
+    reduce_1way_asm(dot_kq, xor1, xor2, xor4);
+
+    if constexpr (V_ITERS == 4) {
+        reduce_8way_asm(
+            res_hk[0], res_hk[1], res_hk[2], res_hk[3],
+            res_hq[0], res_hq[1], res_hq[2], res_hq[3],
+            xor1, xor2, xor4);
+    } else {
+        reduce_4way_asm(res_hk[0], res_hk[1], res_hq[0], res_hq[1], xor1, xor2, xor4);
+    }
+
+    #pragma unroll
+    for (int vi = 0; vi < V_ITERS; vi++) {
+        res_hk[vi] *= exp_g;
+        res_hq[vi] *= exp_g;
+    }
+
+    float vn[V_ITERS];
+    if constexpr (V_ITERS == 4) {
+        float tmp0 = (__bfloat162float(vb[global_v_base + 0 * WARP_GROUP_TILE_V]) - res_hk[0]) * beta;
+        float tmp1 = (__bfloat162float(vb[global_v_base + 1 * WARP_GROUP_TILE_V]) - res_hk[1]) * beta;
+        float tmp2 = (__bfloat162float(vb[global_v_base + 2 * WARP_GROUP_TILE_V]) - res_hk[2]) * beta;
+        float tmp3 = (__bfloat162float(vb[global_v_base + 3 * WARP_GROUP_TILE_V]) - res_hk[3]) * beta;
+        shfl_idx_4way_asm(vn[0], vn[1], vn[2], vn[3], tmp0, tmp1, tmp2, tmp3, leader_addr);
+    } else {
+        float tmp0 = (__bfloat162float(vb[global_v_base + 0 * WARP_GROUP_TILE_V]) - res_hk[0]) * beta;
+        float tmp1 = (__bfloat162float(vb[global_v_base + 1 * WARP_GROUP_TILE_V]) - res_hk[1]) * beta;
+        shfl_idx_2way_asm(vn[0], vn[1], tmp0, tmp1, leader_addr);
+    }
+
+    #pragma unroll
+    for (int vi = 0; vi < V_ITERS; vi++) {
+        res_hq[vi] = res_hq[vi] + vn[vi] * dot_kq;
+    }
+
+    if (k_tid == 0) {
+        const int64_t out_base = (int64_t)batch_idx * NVH * HEAD_V_DIM
+                               + hv_idx * HEAD_V_DIM + global_v_base;
+        #pragma unroll
+        for (int vi = 0; vi < V_ITERS; vi++) {
+            output[out_base + vi * WARP_GROUP_TILE_V] = __float2bfloat16(res_hq[vi]);
+        }
+    }
+
+    #pragma unroll
+    for (int ki = 0; ki < K_ITERS; ki++) {
+        int ko = warp_k_vec_start + ki * WARP_TILE_K;
+        #pragma unroll
+        for (int j = 0; j < VEC_K; j++) {
+            float kv = __bfloat162float(kb[ko + j]) * ks;
+            #pragma unroll
+            for (int vi = 0; vi < V_ITERS; vi++) {
+                S[vi][ki][j] = S[vi][ki][j] * exp_g + kv * vn[vi];
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int vi = 0; vi < V_ITERS; vi++) {
+        int gv = global_v_base + vi * WARP_GROUP_TILE_V;
+        #pragma unroll
+        for (int ki = 0; ki < K_ITERS; ki++) {
+            float4 t = {S[vi][ki][0], S[vi][ki][1], S[vi][ki][2], S[vi][ki][3]};
+            *reinterpret_cast<float4*>(sb + gv * HEAD_K_DIM + warp_k_vec_start + ki * WARP_TILE_K) = t;
+        }
+    }
+}
+
+__global__
+__launch_bounds__(BLOCK_THREADS, 4)
+__attribute__((amdgpu_waves_per_eu(4, 6)))
+void gdn_decode_kernel_iasm_tp8_sq1(
+    const __hip_bfloat16* __restrict__ query,
+    const __hip_bfloat16* __restrict__ key,
+    const __hip_bfloat16* __restrict__ value,
+    const __hip_bfloat16* __restrict__ a_input,
+    const __hip_bfloat16* __restrict__ b_input,
+    const __hip_bfloat16* __restrict__ dt_bias,
+    const float* __restrict__          A_log,
+    const int* __restrict__            indices,
+    float* __restrict__                state,
+    __hip_bfloat16* __restrict__       output,
+    int batch_size, float scale
+) {
+    gdn_decode_kernel_iasm_sq1_body<2, 4, 2>(
+        query, key, value, a_input, b_input, dt_bias, A_log, indices, state, output, batch_size, scale);
+}
+
+__global__
+__launch_bounds__(BLOCK_THREADS, 3)
+__attribute__((amdgpu_waves_per_eu(3, 5)))
+void gdn_decode_kernel_iasm_full_sq1(
+    const __hip_bfloat16* __restrict__ query,
+    const __hip_bfloat16* __restrict__ key,
+    const __hip_bfloat16* __restrict__ value,
+    const __hip_bfloat16* __restrict__ a_input,
+    const __hip_bfloat16* __restrict__ b_input,
+    const __hip_bfloat16* __restrict__ dt_bias,
+    const float* __restrict__          A_log,
+    const int* __restrict__            indices,
+    float* __restrict__                state,
+    __hip_bfloat16* __restrict__       output,
+    int batch_size, float scale
+) {
+    gdn_decode_kernel_iasm_sq1_body<16, 32, 1>(
+        query, key, value, a_input, b_input, dt_bias, A_log, indices, state, output, batch_size, scale);
+}
+
 // ============================================================
 // Launchers
 // ============================================================
@@ -1015,7 +1298,7 @@ void launch_gdn_decode_tuned(
 } // close extern "C" for template dispatch
 
 template <int NKH, int NVH>
-static void dispatch_iasm(
+static void dispatch_iasm_generic(
     const __hip_bfloat16* q, const __hip_bfloat16* k, const __hip_bfloat16* v,
     const __hip_bfloat16* a, const __hip_bfloat16* b, const __hip_bfloat16* dt,
     const float* al, const int* idx, float* st, __hip_bfloat16* o,
@@ -1036,6 +1319,38 @@ static void dispatch_iasm(
         else               LAUNCH_IASM(2, false);
     }
     #undef LAUNCH_IASM
+}
+
+extern "C"
+void launch_gdn_decode_iasm_generic(
+    const void* query, const void* key, const void* value,
+    const void* a_input, const void* b_input, const void* dt_bias,
+    const void* A_log, const void* indices,
+    void* state, void* output,
+    int batch_size, int seq_length,
+    int num_v_blocks, bool use_qk_l2norm, float scale,
+    int num_k_heads, int num_v_heads,
+    hipStream_t stream
+) {
+    auto q = reinterpret_cast<const __hip_bfloat16*>(query);
+    auto k = reinterpret_cast<const __hip_bfloat16*>(key);
+    auto v = reinterpret_cast<const __hip_bfloat16*>(value);
+    auto a = reinterpret_cast<const __hip_bfloat16*>(a_input);
+    auto b = reinterpret_cast<const __hip_bfloat16*>(b_input);
+    auto dt = reinterpret_cast<const __hip_bfloat16*>(dt_bias);
+    auto al = reinterpret_cast<const float*>(A_log);
+    auto idx = reinterpret_cast<const int*>(indices);
+    auto st = reinterpret_cast<float*>(state);
+    auto o = reinterpret_cast<__hip_bfloat16*>(output);
+
+    if (num_k_heads == 16 && num_v_heads == 32)
+        dispatch_iasm_generic<16,32>(q,k,v,a,b,dt,al,idx,st,o,batch_size,seq_length,num_v_blocks,use_qk_l2norm,scale,stream);
+    else if (num_k_heads == 2 && num_v_heads == 4)
+        dispatch_iasm_generic<2,4>(q,k,v,a,b,dt,al,idx,st,o,batch_size,seq_length,num_v_blocks,use_qk_l2norm,scale,stream);
+    else if (num_k_heads == 4 && num_v_heads == 8)
+        dispatch_iasm_generic<4,8>(q,k,v,a,b,dt,al,idx,st,o,batch_size,seq_length,num_v_blocks,use_qk_l2norm,scale,stream);
+    else if (num_k_heads == 8 && num_v_heads == 16)
+        dispatch_iasm_generic<8,16>(q,k,v,a,b,dt,al,idx,st,o,batch_size,seq_length,num_v_blocks,use_qk_l2norm,scale,stream);
 }
 
 extern "C"
@@ -1060,14 +1375,27 @@ void launch_gdn_decode_iasm(
     auto st = reinterpret_cast<float*>(state);
     auto o = reinterpret_cast<__hip_bfloat16*>(output);
 
-    if (num_k_heads == 16 && num_v_heads == 32)
-        dispatch_iasm<16,32>(q,k,v,a,b,dt,al,idx,st,o,batch_size,seq_length,num_v_blocks,use_qk_l2norm,scale,stream);
-    else if (num_k_heads == 2 && num_v_heads == 4)
-        dispatch_iasm<2,4>(q,k,v,a,b,dt,al,idx,st,o,batch_size,seq_length,num_v_blocks,use_qk_l2norm,scale,stream);
-    else if (num_k_heads == 4 && num_v_heads == 8)
-        dispatch_iasm<4,8>(q,k,v,a,b,dt,al,idx,st,o,batch_size,seq_length,num_v_blocks,use_qk_l2norm,scale,stream);
-    else if (num_k_heads == 8 && num_v_heads == 16)
-        dispatch_iasm<8,16>(q,k,v,a,b,dt,al,idx,st,o,batch_size,seq_length,num_v_blocks,use_qk_l2norm,scale,stream);
+    if (seq_length == 1 && num_v_blocks == 1 && use_qk_l2norm) {
+        if (num_k_heads == 2 && num_v_heads == 4 && batch_size <= 16) {
+            dim3 grid(batch_size * 4 * 2);
+            dim3 block(BLOCK_THREADS);
+            hipLaunchKernelGGL(gdn_decode_kernel_iasm_tp8_sq1, dim3(grid), dim3(block), 0, stream,
+                q, k, v, a, b, dt, al, idx, st, o, batch_size, scale);
+            return;
+        }
+        if (num_k_heads == 16 && num_v_heads == 32) {
+            dim3 grid(batch_size * 32);
+            dim3 block(BLOCK_THREADS);
+            hipLaunchKernelGGL(gdn_decode_kernel_iasm_full_sq1, dim3(grid), dim3(block), 0, stream,
+                q, k, v, a, b, dt, al, idx, st, o, batch_size, scale);
+            return;
+        }
+    }
+
+    launch_gdn_decode_iasm_generic(
+        query, key, value, a_input, b_input, dt_bias, A_log, indices,
+        state, output, batch_size, seq_length, num_v_blocks, use_qk_l2norm,
+        scale, num_k_heads, num_v_heads, stream);
 }
 
 #undef LAUNCH

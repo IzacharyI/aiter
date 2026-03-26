@@ -3,17 +3,13 @@
 #
 # KV Cache Layout Comparison Benchmark
 #
-# Fair comparison at the same block_size:
+# Comparison at the same block_size:
 #   R) paged_attention_ragged + V 4D + BF16 KV (SGLang actual decode path)
 #   A) paged_attention_rocm   + V 4D + FP8 KV  (vLLM v0.x layout, baseline)
 #   B) paged_attention_rocm   + V 5D + FP8 KV  (preshuffle layout)
 #   C) pa_fwd_asm             + V 5D + FP8 KV  (preshuffle + ASM, non-persistent)
 #   D) pa_persistent_fwd     + V 5D + FP8 KV  (preshuffle + ASM, persistent)
 #
-# NOTE: Test R uses BF16 KV because paged_attention_ragged does not yet
-#       support FP8 KV.  SGLang converts FP8 → BF16 before calling it
-#       (see TODO in aiter_backend.py).  So R reflects the real SGLang path
-#       (including the 2x KV bandwidth penalty vs FP8 tests).
 #
 # speedup(A/R) = FP8 rocm vs BF16 ragged (real SGLang gap)
 # speedup(B/A) = pure V layout gain within the same kernel
