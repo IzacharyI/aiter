@@ -1219,6 +1219,26 @@ void gdn_decode_kernel_iasm_tp8_sq1(
 __global__
 __launch_bounds__(BLOCK_THREADS, 3)
 __attribute__((amdgpu_waves_per_eu(3, 5)))
+void gdn_decode_kernel_iasm_tp8_sq1_nvb1(
+    const __hip_bfloat16* __restrict__ query,
+    const __hip_bfloat16* __restrict__ key,
+    const __hip_bfloat16* __restrict__ value,
+    const __hip_bfloat16* __restrict__ a_input,
+    const __hip_bfloat16* __restrict__ b_input,
+    const __hip_bfloat16* __restrict__ dt_bias,
+    const float* __restrict__          A_log,
+    const int* __restrict__            indices,
+    float* __restrict__                state,
+    __hip_bfloat16* __restrict__       output,
+    int batch_size, float scale
+) {
+    gdn_decode_kernel_iasm_sq1_body<2, 4, 1>(
+        query, key, value, a_input, b_input, dt_bias, A_log, indices, state, output, batch_size, scale);
+}
+
+__global__
+__launch_bounds__(BLOCK_THREADS, 3)
+__attribute__((amdgpu_waves_per_eu(3, 5)))
 void gdn_decode_kernel_iasm_full_sq1(
     const __hip_bfloat16* __restrict__ query,
     const __hip_bfloat16* __restrict__ key,
@@ -1388,11 +1408,18 @@ void launch_gdn_decode_iasm(
     auto o = reinterpret_cast<__hip_bfloat16*>(output);
 
     if (seq_length == 1 && num_v_blocks == 1 && use_qk_l2norm) {
-        if (num_k_heads == 2 && num_v_heads == 4 && batch_size <= 16) {
-            dim3 grid(batch_size * 4 * 2);
-            dim3 block(BLOCK_THREADS);
-            hipLaunchKernelGGL(gdn_decode_kernel_iasm_tp8_sq1, dim3(grid), dim3(block), 0, stream,
-                q, k, v, a, b, dt, al, idx, st, o, batch_size, scale);
+        if (num_k_heads == 2 && num_v_heads == 4) {
+            if (batch_size <= 16) {
+                dim3 grid(batch_size * 4 * 2);
+                dim3 block(BLOCK_THREADS);
+                hipLaunchKernelGGL(gdn_decode_kernel_iasm_tp8_sq1, dim3(grid), dim3(block), 0, stream,
+                    q, k, v, a, b, dt, al, idx, st, o, batch_size, scale);
+            } else {
+                dim3 grid(batch_size * 4);
+                dim3 block(BLOCK_THREADS);
+                hipLaunchKernelGGL(gdn_decode_kernel_iasm_tp8_sq1_nvb1, dim3(grid), dim3(block), 0, stream,
+                    q, k, v, a, b, dt, al, idx, st, o, batch_size, scale);
+            }
             return;
         }
         if (num_k_heads == 16 && num_v_heads == 32) {
