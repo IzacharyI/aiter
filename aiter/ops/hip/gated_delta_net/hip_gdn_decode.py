@@ -1,13 +1,13 @@
 """
-HIP/TUNED GDN decode kernel for sglang.
+HIP/ASM GDN decode kernel for sglang.
 
 Drop-in replacement for fused_sigmoid_gating_delta_rule_update (Triton)
-in decode mode. Uses [V, K] state layout with float4 vectorized access
-for optimal memory coalescing.
+in decode mode.  Uses inline-assembly optimized kernel with template-
+specialised head dispatch (TP=8 and Full-Heads paths).
 
-Expects ssm_states to be kept in [V, K] layout permanently.  The sglang
-backend transposes once after extend ([K,V]→[V,K]) and before/after
-verify, so the decode path runs without any state transpose overhead.
+State layout: expects [pool, HV, V, K] (VK layout).  The sglang
+backend (commit da96f57) transposes once after extend ([K,V]→[V,K])
+so the decode path runs without any per-step transpose overhead.
 
 Kernel parameters are specialized for Qwen3.5:
   K_heads=16, V_heads=32, K=128, V=128, bf16.
@@ -58,7 +58,7 @@ def hip_fused_sigmoid_gating_delta_rule_update(
     cu_seqlens: Optional[torch.Tensor] = None,
     is_kda: bool = False,
 ):
-    """VK decode kernel — state must already be in [V,K] layout."""
+    """VK decode kernel (inline-ASM) — state must already be in [V,K] layout."""
     ext = _load_extension()
 
     B, T, H, K = q.shape
@@ -72,7 +72,7 @@ def hip_fused_sigmoid_gating_delta_rule_update(
 
     o = torch.empty_like(v)
 
-    dt_bias_f32 = dt_bias.float() if dt_bias.dtype != torch.float32 else dt_bias
+    dt_bias_bf16 = dt_bias.to(torch.bfloat16) if dt_bias.dtype != torch.bfloat16 else dt_bias
 
     indices_int32 = (
         initial_state_indices.to(torch.int32)
@@ -82,24 +82,23 @@ def hip_fused_sigmoid_gating_delta_rule_update(
 
     batch_size = N
     seq_length = 1 if cu_seqlens is not None else T
-
     num_k_heads = H
     num_v_heads = HV
 
-    ext.hip_gdn_decode_tuned_vk_inplace(
+    ext.hip_gdn_decode_asm_inplace(
         q.contiguous(),
         k.contiguous(),
         v.contiguous(),
         a.contiguous(),
         b.contiguous(),
-        dt_bias_f32,
+        dt_bias_bf16,
         A_log.contiguous(),
         indices_int32,
         initial_state_source,
         o,
         batch_size,
         seq_length,
-        1,  # num_v_blocks
+        1,  # num_v_blocks (auto-selected by launcher)
         use_qk_l2norm_in_kernel,
         scale,
         num_k_heads,

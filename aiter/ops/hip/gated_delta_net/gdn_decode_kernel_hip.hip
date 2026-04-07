@@ -148,6 +148,7 @@ __device__ __forceinline__ void shfl_idx_4way_asm(
     );
 }
 
+
 __device__ __forceinline__ void reduce_1way_asm(float& v0, int a1, int a2, int a4)
 {
     float t0;
@@ -1016,6 +1017,179 @@ void gdn_decode_kernel_iasm(
     }
 }
 
+// ============================================================
+// Streaming version: reads state per-ki to reduce VGPR from 64 to ~16
+// Trades register pressure for a second state read in update phase
+// Target: VGPR ~100, waves/EU 5 (vs 126/4 in original)
+// ============================================================
+template <int NKH, int NVH>
+__device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body_streaming(
+    const __hip_bfloat16* __restrict__ query,
+    const __hip_bfloat16* __restrict__ key,
+    const __hip_bfloat16* __restrict__ value,
+    const __hip_bfloat16* __restrict__ a_input,
+    const __hip_bfloat16* __restrict__ b_input,
+    const __hip_bfloat16* __restrict__ dt_bias,
+    const float* __restrict__          A_log,
+    const int* __restrict__            indices,
+    float* __restrict__                state,
+    __hip_bfloat16* __restrict__       output,
+    int batch_size, float scale
+) {
+    constexpr int TILE_V = HEAD_V_DIM;
+    constexpr int WARP_GROUP_TILE_V = NUM_WARPS * WARP_V_THREADS;
+    constexpr int V_ITERS = TILE_V / WARP_GROUP_TILE_V;
+
+    const int tid = threadIdx.x;
+    const int lane_id = tid % WARP_SIZE;
+    const int warp_id = tid / WARP_SIZE;
+    const int k_tid = lane_id % WARP_K_THREADS;
+    const int v_tid = lane_id / WARP_K_THREADS;
+
+    const int b_hv = blockIdx.x;
+    const int batch_idx = b_hv / NVH;
+    const int hv_idx = b_hv % NVH;
+    const int hk_idx = hv_idx / (NVH / NKH);
+
+    if (batch_idx >= batch_size) return;
+    const int pool_idx = indices[batch_idx];
+    if (pool_idx < 0) return;
+
+    const int warp_k_vec_start = k_tid * VEC_K;
+    const int global_v_base = warp_id * WARP_V_THREADS + v_tid;
+    const int leader_addr = ((lane_id / WARP_K_THREADS) * WARP_K_THREADS) << 2;
+
+    const int xor1 = (lane_id ^ 1) << 2;
+    const int xor2 = (lane_id ^ 2) << 2;
+    const int xor4 = (lane_id ^ 4) << 2;
+
+    const int shs = HEAD_V_DIM * HEAD_K_DIM;
+    float* sb = state + (int64_t)pool_idx * NVH * shs + hv_idx * shs;
+
+    const int ab = batch_idx * NVH + hv_idx;
+    float x = __bfloat162float(a_input[ab]) + __bfloat162float(dt_bias[hv_idx]);
+    float sp = (x <= 20.0f) ? __logf(1.0f + __expf(x)) : x;
+    float exp_g = __expf(-__expf(A_log[hv_idx]) * sp);
+    float beta = __frcp_rn(1.0f + __expf(-__bfloat162float(b_input[ab])));
+
+    const auto* qb = query + (int64_t)batch_idx * NKH * HEAD_K_DIM + hk_idx * HEAD_K_DIM;
+    const auto* kb = key + (int64_t)batch_idx * NKH * HEAD_K_DIM + hk_idx * HEAD_K_DIM;
+    const auto* vb = value + (int64_t)batch_idx * NVH * HEAD_V_DIM + hv_idx * HEAD_V_DIM;
+
+    float sq_q = 0.0f;
+    float sq_k = 0.0f;
+    #pragma unroll
+    for (int ki = 0; ki < K_ITERS; ki++) {
+        int ko = warp_k_vec_start + ki * WARP_TILE_K;
+        #pragma unroll
+        for (int j = 0; j < VEC_K; j++) {
+            float qv = __bfloat162float(qb[ko + j]);
+            float kv = __bfloat162float(kb[ko + j]);
+            sq_q += qv * qv;
+            sq_k += kv * kv;
+        }
+    }
+    reduce_2way_asm(sq_q, sq_k, xor1, xor2, xor4);
+    const float qs = scale * __frsqrt_rn(sq_q + 1e-6f);
+    const float ks = __frsqrt_rn(sq_k + 1e-6f);
+
+    float dot_kq = 0.0f;
+    float res_hk[V_ITERS];
+    float res_hq[V_ITERS];
+    #pragma unroll
+    for (int vi = 0; vi < V_ITERS; vi++) {
+        res_hk[vi] = 0.0f;
+        res_hq[vi] = 0.0f;
+    }
+
+    // Forward pass: stream S per-ki instead of holding all S[4][4][4]
+    #pragma unroll
+    for (int ki = 0; ki < K_ITERS; ki++) {
+        int ko = warp_k_vec_start + ki * WARP_TILE_K;
+        // Load S slice for this ki: S_slice[V_ITERS][VEC_K] = 16 floats
+        float S_slice[V_ITERS][VEC_K];
+        #pragma unroll
+        for (int vi = 0; vi < V_ITERS; vi++) {
+            int gv = global_v_base + vi * WARP_GROUP_TILE_V;
+            float4 t = *reinterpret_cast<const float4*>(
+                sb + gv * HEAD_K_DIM + warp_k_vec_start + ki * WARP_TILE_K);
+            S_slice[vi][0] = t.x;
+            S_slice[vi][1] = t.y;
+            S_slice[vi][2] = t.z;
+            S_slice[vi][3] = t.w;
+        }
+        #pragma unroll
+        for (int j = 0; j < VEC_K; j++) {
+            float qv = __bfloat162float(qb[ko + j]) * qs;
+            float kv = __bfloat162float(kb[ko + j]) * ks;
+            dot_kq += kv * qv;
+            #pragma unroll
+            for (int vi = 0; vi < V_ITERS; vi++) {
+                res_hk[vi] += S_slice[vi][j] * kv;
+                res_hq[vi] += S_slice[vi][j] * qv;
+            }
+        }
+    }
+    reduce_1way_asm(dot_kq, xor1, xor2, xor4);
+
+    reduce_8way_asm(
+        res_hk[0], res_hk[1], res_hk[2], res_hk[3],
+        res_hq[0], res_hq[1], res_hq[2], res_hq[3],
+        xor1, xor2, xor4);
+
+    #pragma unroll
+    for (int vi = 0; vi < V_ITERS; vi++) {
+        res_hk[vi] *= exp_g;
+        res_hq[vi] *= exp_g;
+    }
+
+    float vn[V_ITERS];
+    {
+        float tmp0 = (__bfloat162float(vb[global_v_base + 0 * WARP_GROUP_TILE_V]) - res_hk[0]) * beta;
+        float tmp1 = (__bfloat162float(vb[global_v_base + 1 * WARP_GROUP_TILE_V]) - res_hk[1]) * beta;
+        float tmp2 = (__bfloat162float(vb[global_v_base + 2 * WARP_GROUP_TILE_V]) - res_hk[2]) * beta;
+        float tmp3 = (__bfloat162float(vb[global_v_base + 3 * WARP_GROUP_TILE_V]) - res_hk[3]) * beta;
+        shfl_idx_4way_asm(vn[0], vn[1], vn[2], vn[3], tmp0, tmp1, tmp2, tmp3, leader_addr);
+    }
+
+    #pragma unroll
+    for (int vi = 0; vi < V_ITERS; vi++) {
+        res_hq[vi] = res_hq[vi] + vn[vi] * dot_kq;
+    }
+
+    if (k_tid == 0) {
+        const int64_t out_base = (int64_t)batch_idx * NVH * HEAD_V_DIM
+                               + hv_idx * HEAD_V_DIM + global_v_base;
+        #pragma unroll
+        for (int vi = 0; vi < V_ITERS; vi++) {
+            output[out_base + vi * WARP_GROUP_TILE_V] = __float2bfloat16(res_hq[vi]);
+        }
+    }
+
+    // State update: re-read, update, write back per-ki (L1/L2 cached)
+    #pragma unroll
+    for (int ki = 0; ki < K_ITERS; ki++) {
+        int ko = warp_k_vec_start + ki * WARP_TILE_K;
+        #pragma unroll
+        for (int vi = 0; vi < V_ITERS; vi++) {
+            int gv = global_v_base + vi * WARP_GROUP_TILE_V;
+            float4 t = *reinterpret_cast<const float4*>(
+                sb + gv * HEAD_K_DIM + warp_k_vec_start + ki * WARP_TILE_K);
+            #pragma unroll
+            for (int j = 0; j < VEC_K; j++) {
+                float kv = __bfloat162float(kb[ko + j]) * ks;
+                float s_old = (j == 0) ? t.x : (j == 1) ? t.y : (j == 2) ? t.z : t.w;
+                float s_new = s_old * exp_g + kv * vn[vi];
+                if (j == 0) t.x = s_new;
+                else if (j == 1) t.y = s_new;
+                else if (j == 2) t.z = s_new;
+                else t.w = s_new;
+            }
+            *reinterpret_cast<float4*>(sb + gv * HEAD_K_DIM + warp_k_vec_start + ki * WARP_TILE_K) = t;
+        }
+    }
+}
+
 template <int NKH, int NVH, int NUM_V_BLOCKS>
 __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body(
     const __hip_bfloat16* __restrict__ query,
@@ -1236,6 +1410,99 @@ void gdn_decode_kernel_iasm_tp8_sq1_nvb1(
         query, key, value, a_input, b_input, dt_bias, A_log, indices, state, output, batch_size, scale);
 }
 
+// Streaming version: lower VGPR (~100 vs ~126), higher occupancy (5 vs 4 waves/EU)
+// Trades register pressure for a second state read (L1/L2 cached)
+__global__
+__launch_bounds__(BLOCK_THREADS, 4)
+__attribute__((amdgpu_waves_per_eu(4, 6)))
+void gdn_decode_kernel_iasm_tp8_sq1_nvb1_streaming(
+    const __hip_bfloat16* __restrict__ query,
+    const __hip_bfloat16* __restrict__ key,
+    const __hip_bfloat16* __restrict__ value,
+    const __hip_bfloat16* __restrict__ a_input,
+    const __hip_bfloat16* __restrict__ b_input,
+    const __hip_bfloat16* __restrict__ dt_bias,
+    const float* __restrict__          A_log,
+    const int* __restrict__            indices,
+    float* __restrict__                state,
+    __hip_bfloat16* __restrict__       output,
+    int batch_size, float scale
+) {
+    gdn_decode_kernel_iasm_sq1_body_streaming<2, 4>(
+        query, key, value, a_input, b_input, dt_bias, A_log, indices, state, output, batch_size, scale);
+}
+
+// ── NKH=2, NVH=8 specialized kernels (Qwen3.5 TP=8, 64 V-heads) ──
+
+__global__
+__launch_bounds__(BLOCK_THREADS, 4)
+__attribute__((amdgpu_waves_per_eu(4, 6)))
+void gdn_decode_kernel_iasm_tp8_nvh8_sq1(
+    const __hip_bfloat16* __restrict__ query,
+    const __hip_bfloat16* __restrict__ key,
+    const __hip_bfloat16* __restrict__ value,
+    const __hip_bfloat16* __restrict__ a_input,
+    const __hip_bfloat16* __restrict__ b_input,
+    const __hip_bfloat16* __restrict__ dt_bias,
+    const float* __restrict__          A_log,
+    const int* __restrict__            indices,
+    float* __restrict__                state,
+    __hip_bfloat16* __restrict__       output,
+    int batch_size, float scale
+) {
+    gdn_decode_kernel_iasm_sq1_body<2, 8, 2>(
+        query, key, value, a_input, b_input, dt_bias, A_log, indices, state, output, batch_size, scale);
+}
+
+// NVB=1 launch_bounds sweep variants
+#define DEFINE_NVH8_NVB1_VARIANT(NAME, LB_WAVES, WPE_MIN, WPE_MAX) \
+__global__ \
+__launch_bounds__(BLOCK_THREADS, LB_WAVES) \
+__attribute__((amdgpu_waves_per_eu(WPE_MIN, WPE_MAX))) \
+void NAME( \
+    const __hip_bfloat16* __restrict__ query, \
+    const __hip_bfloat16* __restrict__ key, \
+    const __hip_bfloat16* __restrict__ value, \
+    const __hip_bfloat16* __restrict__ a_input, \
+    const __hip_bfloat16* __restrict__ b_input, \
+    const __hip_bfloat16* __restrict__ dt_bias, \
+    const float* __restrict__          A_log, \
+    const int* __restrict__            indices, \
+    float* __restrict__                state, \
+    __hip_bfloat16* __restrict__       output, \
+    int batch_size, float scale \
+) { \
+    gdn_decode_kernel_iasm_sq1_body<2, 8, 1>( \
+        query, key, value, a_input, b_input, dt_bias, A_log, indices, state, output, batch_size, scale); \
+}
+
+DEFINE_NVH8_NVB1_VARIANT(gdn_decode_kernel_iasm_tp8_nvh8_sq1_nvb1,       3, 3, 5)  // baseline
+DEFINE_NVH8_NVB1_VARIANT(gdn_decode_kernel_iasm_tp8_nvh8_sq1_nvb1_lb2,   2, 2, 4)  // max registers
+DEFINE_NVH8_NVB1_VARIANT(gdn_decode_kernel_iasm_tp8_nvh8_sq1_nvb1_lb4,   4, 4, 6)  // high occupancy
+DEFINE_NVH8_NVB1_VARIANT(gdn_decode_kernel_iasm_tp8_nvh8_sq1_nvb1_lb2w2, 2, 2, 3)  // ultra-low occupancy
+
+#undef DEFINE_NVH8_NVB1_VARIANT
+
+__global__
+__launch_bounds__(BLOCK_THREADS, 4)
+__attribute__((amdgpu_waves_per_eu(4, 6)))
+void gdn_decode_kernel_iasm_tp8_nvh8_sq1_nvb1_streaming(
+    const __hip_bfloat16* __restrict__ query,
+    const __hip_bfloat16* __restrict__ key,
+    const __hip_bfloat16* __restrict__ value,
+    const __hip_bfloat16* __restrict__ a_input,
+    const __hip_bfloat16* __restrict__ b_input,
+    const __hip_bfloat16* __restrict__ dt_bias,
+    const float* __restrict__          A_log,
+    const int* __restrict__            indices,
+    float* __restrict__                state,
+    __hip_bfloat16* __restrict__       output,
+    int batch_size, float scale
+) {
+    gdn_decode_kernel_iasm_sq1_body_streaming<2, 8>(
+        query, key, value, a_input, b_input, dt_bias, A_log, indices, state, output, batch_size, scale);
+}
+
 __global__
 __launch_bounds__(BLOCK_THREADS, 3)
 __attribute__((amdgpu_waves_per_eu(3, 5)))
@@ -1381,6 +1648,8 @@ void launch_gdn_decode_iasm_generic(
         dispatch_iasm_generic<2,4>(q,k,v,a,b,dt,al,idx,st,o,batch_size,seq_length,num_v_blocks,use_qk_l2norm,scale,stream);
     else if (num_k_heads == 4 && num_v_heads == 8)
         dispatch_iasm_generic<4,8>(q,k,v,a,b,dt,al,idx,st,o,batch_size,seq_length,num_v_blocks,use_qk_l2norm,scale,stream);
+    else if (num_k_heads == 2 && num_v_heads == 8)
+        dispatch_iasm_generic<2,8>(q,k,v,a,b,dt,al,idx,st,o,batch_size,seq_length,num_v_blocks,use_qk_l2norm,scale,stream);
     else if (num_k_heads == 8 && num_v_heads == 16)
         dispatch_iasm_generic<8,16>(q,k,v,a,b,dt,al,idx,st,o,batch_size,seq_length,num_v_blocks,use_qk_l2norm,scale,stream);
 }
@@ -1409,15 +1678,35 @@ void launch_gdn_decode_iasm(
 
     if (seq_length == 1 && num_v_blocks == 1 && use_qk_l2norm) {
         if (num_k_heads == 2 && num_v_heads == 4) {
+            // NVB dispatch threshold: tested 16, 24, 32
+            // - NVB=2 (92 VGPR, 5 waves/EU): grid = BS * HV * 2, better for small BS
+            // - NVB=1 (126 VGPR, 4 waves/EU): grid = BS * HV, better for large BS
+            // BS=32 with NVB=2 is 35% slower than NVB=1 (18.7µs vs 13.9µs)
+            // Optimal threshold: 16 (BS<=16 -> NVB=2, BS>=32 -> NVB=1)
             if (batch_size <= 16) {
                 dim3 grid(batch_size * 4 * 2);
                 dim3 block(BLOCK_THREADS);
                 hipLaunchKernelGGL(gdn_decode_kernel_iasm_tp8_sq1, dim3(grid), dim3(block), 0, stream,
                     q, k, v, a, b, dt, al, idx, st, o, batch_size, scale);
             } else {
+                // BS>=32: use NVB=1 kernel
                 dim3 grid(batch_size * 4);
                 dim3 block(BLOCK_THREADS);
                 hipLaunchKernelGGL(gdn_decode_kernel_iasm_tp8_sq1_nvb1, dim3(grid), dim3(block), 0, stream,
+                    q, k, v, a, b, dt, al, idx, st, o, batch_size, scale);
+            }
+            return;
+        }
+        if (num_k_heads == 2 && num_v_heads == 8) {
+            if (batch_size <= 4) {
+                dim3 grid(batch_size * 8 * 2);
+                dim3 block(BLOCK_THREADS);
+                hipLaunchKernelGGL(gdn_decode_kernel_iasm_tp8_nvh8_sq1, dim3(grid), dim3(block), 0, stream,
+                    q, k, v, a, b, dt, al, idx, st, o, batch_size, scale);
+            } else {
+                dim3 grid(batch_size * 8);
+                dim3 block(BLOCK_THREADS);
+                hipLaunchKernelGGL(gdn_decode_kernel_iasm_tp8_nvh8_sq1_nvb1_lb4, dim3(grid), dim3(block), 0, stream,
                     q, k, v, a, b, dt, al, idx, st, o, batch_size, scale);
             }
             return;
@@ -1438,6 +1727,92 @@ void launch_gdn_decode_iasm(
 }
 
 #undef LAUNCH
+
+// ============================================================
+// NKH=2 NVH=8 per-variant launchers (for benchmark A/B testing)
+// ============================================================
+extern "C"
+void launch_gdn_decode_iasm_nvh8_nvb2(
+    const void* query, const void* key, const void* value,
+    const void* a_input, const void* b_input, const void* dt_bias,
+    const void* A_log, const void* indices,
+    void* state, void* output,
+    int batch_size, float scale,
+    hipStream_t stream
+) {
+    dim3 grid(batch_size * 8 * 2);
+    dim3 block(BLOCK_THREADS);
+    hipLaunchKernelGGL(gdn_decode_kernel_iasm_tp8_nvh8_sq1, dim3(grid), dim3(block), 0, stream,
+        reinterpret_cast<const __hip_bfloat16*>(query),
+        reinterpret_cast<const __hip_bfloat16*>(key),
+        reinterpret_cast<const __hip_bfloat16*>(value),
+        reinterpret_cast<const __hip_bfloat16*>(a_input),
+        reinterpret_cast<const __hip_bfloat16*>(b_input),
+        reinterpret_cast<const __hip_bfloat16*>(dt_bias),
+        reinterpret_cast<const float*>(A_log),
+        reinterpret_cast<const int*>(indices),
+        reinterpret_cast<float*>(state),
+        reinterpret_cast<__hip_bfloat16*>(output),
+        batch_size, scale);
+}
+
+#define DEFINE_NVH8_NVB1_LAUNCHER(FNAME, KNAME) \
+extern "C" \
+void FNAME( \
+    const void* query, const void* key, const void* value, \
+    const void* a_input, const void* b_input, const void* dt_bias, \
+    const void* A_log, const void* indices, \
+    void* state, void* output, \
+    int batch_size, float scale, \
+    hipStream_t stream \
+) { \
+    dim3 grid(batch_size * 8); \
+    dim3 block(BLOCK_THREADS); \
+    hipLaunchKernelGGL(KNAME, dim3(grid), dim3(block), 0, stream, \
+        reinterpret_cast<const __hip_bfloat16*>(query), \
+        reinterpret_cast<const __hip_bfloat16*>(key), \
+        reinterpret_cast<const __hip_bfloat16*>(value), \
+        reinterpret_cast<const __hip_bfloat16*>(a_input), \
+        reinterpret_cast<const __hip_bfloat16*>(b_input), \
+        reinterpret_cast<const __hip_bfloat16*>(dt_bias), \
+        reinterpret_cast<const float*>(A_log), \
+        reinterpret_cast<const int*>(indices), \
+        reinterpret_cast<float*>(state), \
+        reinterpret_cast<__hip_bfloat16*>(output), \
+        batch_size, scale); \
+}
+
+DEFINE_NVH8_NVB1_LAUNCHER(launch_gdn_decode_iasm_nvh8_nvb1,       gdn_decode_kernel_iasm_tp8_nvh8_sq1_nvb1)
+DEFINE_NVH8_NVB1_LAUNCHER(launch_gdn_decode_iasm_nvh8_nvb1_lb2,   gdn_decode_kernel_iasm_tp8_nvh8_sq1_nvb1_lb2)
+DEFINE_NVH8_NVB1_LAUNCHER(launch_gdn_decode_iasm_nvh8_nvb1_lb4,   gdn_decode_kernel_iasm_tp8_nvh8_sq1_nvb1_lb4)
+DEFINE_NVH8_NVB1_LAUNCHER(launch_gdn_decode_iasm_nvh8_nvb1_lb2w2, gdn_decode_kernel_iasm_tp8_nvh8_sq1_nvb1_lb2w2)
+
+#undef DEFINE_NVH8_NVB1_LAUNCHER
+
+extern "C"
+void launch_gdn_decode_iasm_nvh8_streaming(
+    const void* query, const void* key, const void* value,
+    const void* a_input, const void* b_input, const void* dt_bias,
+    const void* A_log, const void* indices,
+    void* state, void* output,
+    int batch_size, float scale,
+    hipStream_t stream
+) {
+    dim3 grid(batch_size * 8);
+    dim3 block(BLOCK_THREADS);
+    hipLaunchKernelGGL(gdn_decode_kernel_iasm_tp8_nvh8_sq1_nvb1_streaming, dim3(grid), dim3(block), 0, stream,
+        reinterpret_cast<const __hip_bfloat16*>(query),
+        reinterpret_cast<const __hip_bfloat16*>(key),
+        reinterpret_cast<const __hip_bfloat16*>(value),
+        reinterpret_cast<const __hip_bfloat16*>(a_input),
+        reinterpret_cast<const __hip_bfloat16*>(b_input),
+        reinterpret_cast<const __hip_bfloat16*>(dt_bias),
+        reinterpret_cast<const float*>(A_log),
+        reinterpret_cast<const int*>(indices),
+        reinterpret_cast<float*>(state),
+        reinterpret_cast<__hip_bfloat16*>(output),
+        batch_size, scale);
+}
 
 // ============================================================
 // Sglang-compatible TUNED kernel: state layout [pool, HV, K, V]
