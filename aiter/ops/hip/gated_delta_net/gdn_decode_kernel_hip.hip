@@ -1034,6 +1034,7 @@ __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body_streaming(
     const int* __restrict__            indices,
     float* __restrict__                state,
     __hip_bfloat16* __restrict__       output,
+    const int* __restrict__            batch_perm,
     int batch_size, float scale
 ) {
     constexpr int TILE_V = HEAD_V_DIM;
@@ -1054,6 +1055,7 @@ __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body_streaming(
     if (batch_idx >= batch_size) return;
     const int pool_idx = indices[batch_idx];
     if (pool_idx < 0) return;
+    const int io_bid = batch_perm ? batch_perm[batch_idx] : batch_idx;
 
     const int warp_k_vec_start = k_tid * VEC_K;
     const int global_v_base = warp_id * WARP_V_THREADS + v_tid;
@@ -1066,15 +1068,15 @@ __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body_streaming(
     const int shs = HEAD_V_DIM * HEAD_K_DIM;
     float* sb = state + (int64_t)pool_idx * NVH * shs + hv_idx * shs;
 
-    const int ab = batch_idx * NVH + hv_idx;
+    const int ab = io_bid * NVH + hv_idx;
     float x = __bfloat162float(a_input[ab]) + __bfloat162float(dt_bias[hv_idx]);
     float sp = (x <= 20.0f) ? __logf(1.0f + __expf(x)) : x;
     float exp_g = __expf(-__expf(A_log[hv_idx]) * sp);
     float beta = __frcp_rn(1.0f + __expf(-__bfloat162float(b_input[ab])));
 
-    const auto* qb = query + (int64_t)batch_idx * NKH * HEAD_K_DIM + hk_idx * HEAD_K_DIM;
-    const auto* kb = key + (int64_t)batch_idx * NKH * HEAD_K_DIM + hk_idx * HEAD_K_DIM;
-    const auto* vb = value + (int64_t)batch_idx * NVH * HEAD_V_DIM + hv_idx * HEAD_V_DIM;
+    const auto* qb = query + (int64_t)io_bid * NKH * HEAD_K_DIM + hk_idx * HEAD_K_DIM;
+    const auto* kb = key + (int64_t)io_bid * NKH * HEAD_K_DIM + hk_idx * HEAD_K_DIM;
+    const auto* vb = value + (int64_t)io_bid * NVH * HEAD_V_DIM + hv_idx * HEAD_V_DIM;
 
     float sq_q = 0.0f;
     float sq_k = 0.0f;
@@ -1158,7 +1160,7 @@ __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body_streaming(
     }
 
     if (k_tid == 0) {
-        const int64_t out_base = (int64_t)batch_idx * NVH * HEAD_V_DIM
+        const int64_t out_base = (int64_t)io_bid * NVH * HEAD_V_DIM
                                + hv_idx * HEAD_V_DIM + global_v_base;
         #pragma unroll
         for (int vi = 0; vi < V_ITERS; vi++) {
@@ -1190,6 +1192,26 @@ __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body_streaming(
     }
 }
 
+// Forwarding overload for streaming body: existing callers → nullptr
+template <int NKH, int NVH>
+__device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body_streaming(
+    const __hip_bfloat16* __restrict__ query,
+    const __hip_bfloat16* __restrict__ key,
+    const __hip_bfloat16* __restrict__ value,
+    const __hip_bfloat16* __restrict__ a_input,
+    const __hip_bfloat16* __restrict__ b_input,
+    const __hip_bfloat16* __restrict__ dt_bias,
+    const float* __restrict__          A_log,
+    const int* __restrict__            indices,
+    float* __restrict__                state,
+    __hip_bfloat16* __restrict__       output,
+    int batch_size, float scale
+) {
+    gdn_decode_kernel_iasm_sq1_body_streaming<NKH, NVH>(
+        query, key, value, a_input, b_input, dt_bias, A_log, indices,
+        state, output, (const int*)nullptr, batch_size, scale);
+}
+
 template <int NKH, int NVH, int NUM_V_BLOCKS>
 __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body(
     const __hip_bfloat16* __restrict__ query,
@@ -1202,6 +1224,7 @@ __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body(
     const int* __restrict__            indices,
     float* __restrict__                state,
     __hip_bfloat16* __restrict__       output,
+    const int* __restrict__            batch_perm,
     int batch_size, float scale
 ) {
     constexpr int TILE_V = HEAD_V_DIM / NUM_V_BLOCKS;
@@ -1224,6 +1247,7 @@ __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body(
     if (batch_idx >= batch_size) return;
     const int pool_idx = indices[batch_idx];
     if (pool_idx < 0) return;
+    const int io_bid = batch_perm ? batch_perm[batch_idx] : batch_idx;
 
     const int warp_k_vec_start = k_tid * VEC_K;
     const int global_v_base = v_block_id * TILE_V + warp_id * WARP_V_THREADS + v_tid;
@@ -1251,15 +1275,15 @@ __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body(
         }
     }
 
-    const int ab = batch_idx * NVH + hv_idx;
+    const int ab = io_bid * NVH + hv_idx;
     float x = __bfloat162float(a_input[ab]) + __bfloat162float(dt_bias[hv_idx]);
     float sp = (x <= 20.0f) ? __logf(1.0f + __expf(x)) : x;
     float exp_g = __expf(-__expf(A_log[hv_idx]) * sp);
     float beta = __frcp_rn(1.0f + __expf(-__bfloat162float(b_input[ab])));
 
-    const auto* qb = query + (int64_t)batch_idx * NKH * HEAD_K_DIM + hk_idx * HEAD_K_DIM;
-    const auto* kb = key + (int64_t)batch_idx * NKH * HEAD_K_DIM + hk_idx * HEAD_K_DIM;
-    const auto* vb = value + (int64_t)batch_idx * NVH * HEAD_V_DIM + hv_idx * HEAD_V_DIM;
+    const auto* qb = query + (int64_t)io_bid * NKH * HEAD_K_DIM + hk_idx * HEAD_K_DIM;
+    const auto* kb = key + (int64_t)io_bid * NKH * HEAD_K_DIM + hk_idx * HEAD_K_DIM;
+    const auto* vb = value + (int64_t)io_bid * NVH * HEAD_V_DIM + hv_idx * HEAD_V_DIM;
 
     float sq_q = 0.0f;
     float sq_k = 0.0f;
@@ -1338,7 +1362,7 @@ __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body(
     }
 
     if (k_tid == 0) {
-        const int64_t out_base = (int64_t)batch_idx * NVH * HEAD_V_DIM
+        const int64_t out_base = (int64_t)io_bid * NVH * HEAD_V_DIM
                                + hv_idx * HEAD_V_DIM + global_v_base;
         #pragma unroll
         for (int vi = 0; vi < V_ITERS; vi++) {
@@ -1368,6 +1392,26 @@ __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body(
             *reinterpret_cast<float4*>(sb + gv * HEAD_K_DIM + warp_k_vec_start + ki * WARP_TILE_K) = t;
         }
     }
+}
+
+// Forwarding overload: existing callers pass no batch_perm → nullptr
+template <int NKH, int NVH, int NUM_V_BLOCKS>
+__device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body(
+    const __hip_bfloat16* __restrict__ query,
+    const __hip_bfloat16* __restrict__ key,
+    const __hip_bfloat16* __restrict__ value,
+    const __hip_bfloat16* __restrict__ a_input,
+    const __hip_bfloat16* __restrict__ b_input,
+    const __hip_bfloat16* __restrict__ dt_bias,
+    const float* __restrict__          A_log,
+    const int* __restrict__            indices,
+    float* __restrict__                state,
+    __hip_bfloat16* __restrict__       output,
+    int batch_size, float scale
+) {
+    gdn_decode_kernel_iasm_sq1_body<NKH, NVH, NUM_V_BLOCKS>(
+        query, key, value, a_input, b_input, dt_bias, A_log, indices,
+        state, output, (const int*)nullptr, batch_size, scale);
 }
 
 __global__
@@ -1482,6 +1526,52 @@ DEFINE_NVH8_NVB1_VARIANT(gdn_decode_kernel_iasm_tp8_nvh8_sq1_nvb1_lb4,   4, 4, 6
 DEFINE_NVH8_NVB1_VARIANT(gdn_decode_kernel_iasm_tp8_nvh8_sq1_nvb1_lb2w2, 2, 2, 3)  // ultra-low occupancy
 
 #undef DEFINE_NVH8_NVB1_VARIANT
+
+// ── Sorted variants: accept batch_perm for indirect I/O indexing ──
+// indices must be pre-sorted; batch_perm maps sorted position → original batch position
+__global__
+__launch_bounds__(BLOCK_THREADS, 4)
+__attribute__((amdgpu_waves_per_eu(4, 6)))
+void gdn_decode_kernel_iasm_tp8_nvh8_sq1_sorted(
+    const __hip_bfloat16* __restrict__ query,
+    const __hip_bfloat16* __restrict__ key,
+    const __hip_bfloat16* __restrict__ value,
+    const __hip_bfloat16* __restrict__ a_input,
+    const __hip_bfloat16* __restrict__ b_input,
+    const __hip_bfloat16* __restrict__ dt_bias,
+    const float* __restrict__          A_log,
+    const int* __restrict__            indices,
+    float* __restrict__                state,
+    __hip_bfloat16* __restrict__       output,
+    const int* __restrict__            batch_perm,
+    int batch_size, float scale
+) {
+    gdn_decode_kernel_iasm_sq1_body<2, 8, 2>(
+        query, key, value, a_input, b_input, dt_bias, A_log, indices,
+        state, output, batch_perm, batch_size, scale);
+}
+
+__global__
+__launch_bounds__(BLOCK_THREADS, 4)
+__attribute__((amdgpu_waves_per_eu(4, 6)))
+void gdn_decode_kernel_iasm_tp8_nvh8_sq1_nvb1_lb4_sorted(
+    const __hip_bfloat16* __restrict__ query,
+    const __hip_bfloat16* __restrict__ key,
+    const __hip_bfloat16* __restrict__ value,
+    const __hip_bfloat16* __restrict__ a_input,
+    const __hip_bfloat16* __restrict__ b_input,
+    const __hip_bfloat16* __restrict__ dt_bias,
+    const float* __restrict__          A_log,
+    const int* __restrict__            indices,
+    float* __restrict__                state,
+    __hip_bfloat16* __restrict__       output,
+    const int* __restrict__            batch_perm,
+    int batch_size, float scale
+) {
+    gdn_decode_kernel_iasm_sq1_body<2, 8, 1>(
+        query, key, value, a_input, b_input, dt_bias, A_log, indices,
+        state, output, batch_perm, batch_size, scale);
+}
 
 __global__
 __launch_bounds__(BLOCK_THREADS, 4)
@@ -1663,6 +1753,7 @@ void launch_gdn_decode_iasm(
     int batch_size, int seq_length,
     int num_v_blocks, bool use_qk_l2norm, float scale,
     int num_k_heads, int num_v_heads,
+    const int* batch_perm,
     hipStream_t stream
 ) {
     auto q = reinterpret_cast<const __hip_bfloat16*>(query);
@@ -1678,18 +1769,12 @@ void launch_gdn_decode_iasm(
 
     if (seq_length == 1 && num_v_blocks == 1 && use_qk_l2norm) {
         if (num_k_heads == 2 && num_v_heads == 4) {
-            // NVB dispatch threshold: tested 16, 24, 32
-            // - NVB=2 (92 VGPR, 5 waves/EU): grid = BS * HV * 2, better for small BS
-            // - NVB=1 (126 VGPR, 4 waves/EU): grid = BS * HV, better for large BS
-            // BS=32 with NVB=2 is 35% slower than NVB=1 (18.7µs vs 13.9µs)
-            // Optimal threshold: 16 (BS<=16 -> NVB=2, BS>=32 -> NVB=1)
             if (batch_size <= 16) {
                 dim3 grid(batch_size * 4 * 2);
                 dim3 block(BLOCK_THREADS);
                 hipLaunchKernelGGL(gdn_decode_kernel_iasm_tp8_sq1, dim3(grid), dim3(block), 0, stream,
                     q, k, v, a, b, dt, al, idx, st, o, batch_size, scale);
             } else {
-                // BS>=32: use NVB=1 kernel
                 dim3 grid(batch_size * 4);
                 dim3 block(BLOCK_THREADS);
                 hipLaunchKernelGGL(gdn_decode_kernel_iasm_tp8_sq1_nvb1, dim3(grid), dim3(block), 0, stream,
@@ -1698,16 +1783,31 @@ void launch_gdn_decode_iasm(
             return;
         }
         if (num_k_heads == 2 && num_v_heads == 8) {
-            if (batch_size <= 4) {
-                dim3 grid(batch_size * 8 * 2);
-                dim3 block(BLOCK_THREADS);
-                hipLaunchKernelGGL(gdn_decode_kernel_iasm_tp8_nvh8_sq1, dim3(grid), dim3(block), 0, stream,
-                    q, k, v, a, b, dt, al, idx, st, o, batch_size, scale);
+            if (batch_perm) {
+                // Sorted dispatch: indices pre-sorted, batch_perm for I/O indirection
+                if (batch_size <= 4) {
+                    dim3 grid(batch_size * 8 * 2);
+                    dim3 block(BLOCK_THREADS);
+                    hipLaunchKernelGGL(gdn_decode_kernel_iasm_tp8_nvh8_sq1_sorted, dim3(grid), dim3(block), 0, stream,
+                        q, k, v, a, b, dt, al, idx, st, o, batch_perm, batch_size, scale);
+                } else {
+                    dim3 grid(batch_size * 8);
+                    dim3 block(BLOCK_THREADS);
+                    hipLaunchKernelGGL(gdn_decode_kernel_iasm_tp8_nvh8_sq1_nvb1_lb4_sorted, dim3(grid), dim3(block), 0, stream,
+                        q, k, v, a, b, dt, al, idx, st, o, batch_perm, batch_size, scale);
+                }
             } else {
-                dim3 grid(batch_size * 8);
-                dim3 block(BLOCK_THREADS);
-                hipLaunchKernelGGL(gdn_decode_kernel_iasm_tp8_nvh8_sq1_nvb1_lb4, dim3(grid), dim3(block), 0, stream,
-                    q, k, v, a, b, dt, al, idx, st, o, batch_size, scale);
+                if (batch_size <= 4) {
+                    dim3 grid(batch_size * 8 * 2);
+                    dim3 block(BLOCK_THREADS);
+                    hipLaunchKernelGGL(gdn_decode_kernel_iasm_tp8_nvh8_sq1, dim3(grid), dim3(block), 0, stream,
+                        q, k, v, a, b, dt, al, idx, st, o, batch_size, scale);
+                } else {
+                    dim3 grid(batch_size * 8);
+                    dim3 block(BLOCK_THREADS);
+                    hipLaunchKernelGGL(gdn_decode_kernel_iasm_tp8_nvh8_sq1_nvb1_lb4, dim3(grid), dim3(block), 0, stream,
+                        q, k, v, a, b, dt, al, idx, st, o, batch_size, scale);
+                }
             }
             return;
         }
