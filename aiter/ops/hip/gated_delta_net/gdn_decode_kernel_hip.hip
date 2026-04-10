@@ -1213,8 +1213,8 @@ __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body_opt(
             float kv = __bfloat162float(kb[ko + j]);
             Q_cache[ki][j] = qv;
             K_cache[ki][j] = kv;
-            sq_q += qv * qv;
-            sq_k += kv * kv;
+            sq_q = __fmaf_rn(qv, qv, sq_q);  // FMA for sq accumulation
+            sq_k = __fmaf_rn(kv, kv, sq_k);
         }
     }
 
@@ -1257,17 +1257,18 @@ __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body_opt(
         res_hq[vi] = 0.0f;
     }
 
+    // Main dot product loop with FMA for better throughput
     #pragma unroll
     for (int ki = 0; ki < K_ITERS; ki++) {
         #pragma unroll
         for (int j = 0; j < VEC_K; j++) {
             float qv = Q_cache[ki][j];
             float kv = K_cache[ki][j];
-            dot_kq += kv * qv;
+            dot_kq = __fmaf_rn(kv, qv, dot_kq);
             #pragma unroll
             for (int vi = 0; vi < V_ITERS; vi++) {
-                res_hk[vi] += S[vi][ki][j] * kv;
-                res_hq[vi] += S[vi][ki][j] * qv;
+                res_hk[vi] = __fmaf_rn(S[vi][ki][j], kv, res_hk[vi]);
+                res_hq[vi] = __fmaf_rn(S[vi][ki][j], qv, res_hq[vi]);
             }
         }
     }
@@ -1311,7 +1312,7 @@ __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body_opt(
 
     #pragma unroll
     for (int vi = 0; vi < V_ITERS; vi++) {
-        res_hq[vi] = res_hq[vi] + vn[vi] * dot_kq;
+        res_hq[vi] = __fmaf_rn(vn[vi], dot_kq, res_hq[vi]);
     }
 
     // ── Phase 8: Write output ──
@@ -1325,6 +1326,7 @@ __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body_opt(
     }
 
     // ── Phase 9: Update and store state (using cached K values) ──
+    // h_new = h_old * g + k * vn (use FMA: kv * vn + S * exp_g)
     #pragma unroll
     for (int ki = 0; ki < K_ITERS; ki++) {
         #pragma unroll
@@ -1332,7 +1334,7 @@ __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body_opt(
             float kv = K_cache[ki][j];  // Already normalized
             #pragma unroll
             for (int vi = 0; vi < V_ITERS; vi++) {
-                S[vi][ki][j] = S[vi][ki][j] * exp_g + kv * vn[vi];
+                S[vi][ki][j] = __fmaf_rn(kv, vn[vi], S[vi][ki][j] * exp_g);
             }
         }
     }
