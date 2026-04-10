@@ -219,6 +219,1156 @@ __device__ __forceinline__ void shfl_idx_2way_asm(
 }
 
 // ============================================================
+// Fast math helpers using native AMD instructions
+// ============================================================
+__device__ __forceinline__ float fast_exp(float x) {
+    // v_exp2_f32 is native on AMD, faster than v_exp_f32
+    // exp(x) = exp2(x * log2(e)) = exp2(x * 1.4426950408889634)
+    constexpr float LOG2E = 1.4426950408889634f;
+    return exp2f(x * LOG2E);
+}
+
+__device__ __forceinline__ float fast_log1p(float x) {
+    return log1pf(x);
+}
+
+// Fused reduce: 3-level butterfly with minimal waitcnt
+__device__ __forceinline__ void reduce_1way_fast_asm(float& v, int a1, int a2, int a4) {
+    float t;
+    asm volatile(
+        // Level 1: xor with 1
+        "ds_bpermute_b32 %0, %2, %1\n"
+        "s_waitcnt lgkmcnt(0)\n"
+        "v_add_f32 %1, %1, %0\n"
+        // Level 2: xor with 2
+        "ds_bpermute_b32 %0, %3, %1\n"
+        "s_waitcnt lgkmcnt(0)\n"
+        "v_add_f32 %1, %1, %0\n"
+        // Level 3: xor with 4
+        "ds_bpermute_b32 %0, %4, %1\n"
+        "s_waitcnt lgkmcnt(0)\n"
+        "v_add_f32 %1, %1, %0\n"
+        : "=&v"(t), "+v"(v)
+        : "v"(a1), "v"(a2), "v"(a4)
+    );
+}
+
+// Ultra-fast exp2 using inline ASM (single v_exp_f32 instruction after scaling)
+__device__ __forceinline__ float asm_exp2(float x) {
+    float r;
+    asm volatile("v_exp_f32 %0, %1" : "=v"(r) : "v"(x));
+    return r;
+}
+
+// Ultra-fast log2 using inline ASM
+__device__ __forceinline__ float asm_log2(float x) {
+    float r;
+    asm volatile("v_log_f32 %0, %1" : "=v"(r) : "v"(x));
+    return r;
+}
+
+// Ultra-fast rsqrt using inline ASM
+__device__ __forceinline__ float asm_rsqrt(float x) {
+    float r;
+    asm volatile("v_rsq_f32 %0, %1" : "=v"(r) : "v"(x));
+    return r;
+}
+
+// Ultra-fast rcp using inline ASM
+__device__ __forceinline__ float asm_rcp(float x) {
+    float r;
+    asm volatile("v_rcp_f32 %0, %1" : "=v"(r) : "v"(x));
+    return r;
+}
+
+// Fast exp using exp2: exp(x) = 2^(x * log2(e))
+__device__ __forceinline__ float asm_fast_exp(float x) {
+    constexpr float LOG2E = 1.4426950408889634f;
+    return asm_exp2(x * LOG2E);
+}
+
+// Fast log1p: log(1+x) = log2(1+x) * log(2)
+__device__ __forceinline__ float asm_fast_log1p(float x) {
+    constexpr float LOG2 = 0.6931471805599453f;
+    return asm_log2(1.0f + x) * LOG2;
+}
+
+// ============================================================
+// Advanced ASM: Overlapped butterfly reduce
+// Issue all 3 levels of permute before waiting, then accumulate
+// ============================================================
+__device__ __forceinline__ void reduce_2way_overlapped_asm(
+    float& v0, float& v1, int a1, int a2, int a4)
+{
+    float t0_1, t1_1, t0_2, t1_2, t0_3, t1_3;
+    asm volatile(
+        // Level 1: issue both permutes
+        "ds_bpermute_b32 %0, %6, %4\n"
+        "ds_bpermute_b32 %1, %6, %5\n"
+        "s_waitcnt lgkmcnt(0)\n"
+        "v_add_f32 %4, %4, %0\n"
+        "v_add_f32 %5, %5, %1\n"
+        // Level 2
+        "ds_bpermute_b32 %2, %7, %4\n"
+        "ds_bpermute_b32 %3, %7, %5\n"
+        "s_waitcnt lgkmcnt(0)\n"
+        "v_add_f32 %4, %4, %2\n"
+        "v_add_f32 %5, %5, %3\n"
+        // Level 3
+        "ds_bpermute_b32 %0, %8, %4\n"
+        "ds_bpermute_b32 %1, %8, %5\n"
+        "s_waitcnt lgkmcnt(0)\n"
+        "v_add_f32 %4, %4, %0\n"
+        "v_add_f32 %5, %5, %1\n"
+        : "=&v"(t0_1), "=&v"(t1_1), "=&v"(t0_2), "=&v"(t1_2),
+          "+v"(v0), "+v"(v1)
+        : "v"(a1), "v"(a2), "v"(a4)
+    );
+}
+
+// ============================================================
+// Advanced ASM: Explicit global_load_dwordx4 with vmcnt control
+// ============================================================
+__device__ __forceinline__ void asm_global_load_dwordx4(float4& dst, const float* ptr) {
+    asm volatile(
+        "global_load_dwordx4 %0, %1, off\n"
+        : "=v"(dst)
+        : "v"(ptr)
+    );
+}
+
+// Wait for N global loads to complete (vmcnt counts down)
+__device__ __forceinline__ void asm_waitcnt_vmcnt(int n) {
+    if (n == 0) {
+        asm volatile("s_waitcnt vmcnt(0)\n" ::: "memory");
+    } else if (n == 1) {
+        asm volatile("s_waitcnt vmcnt(1)\n" ::: "memory");
+    } else if (n == 2) {
+        asm volatile("s_waitcnt vmcnt(2)\n" ::: "memory");
+    } else if (n == 3) {
+        asm volatile("s_waitcnt vmcnt(3)\n" ::: "memory");
+    }
+}
+
+// ============================================================
+// Advanced ASM: Fused multiply-accumulate (v_fmac_f32)
+// dst = dst + src0 * src1 (in-place accumulate)
+// ============================================================
+__device__ __forceinline__ void asm_fmac(float& dst, float src0, float src1) {
+    asm volatile(
+        "v_fmac_f32 %0, %1, %2\n"
+        : "+v"(dst)
+        : "v"(src0), "v"(src1)
+    );
+}
+
+// ============================================================
+// Advanced ASM: Dual-issue friendly compute
+// Interleave independent FMAs to maximize VALU throughput
+// ============================================================
+template<int N>
+__device__ __forceinline__ void asm_dot_interleaved(
+    float (&acc)[N], const float (&a)[N], const float (&b)[N])
+{
+    // Issue all FMAs without dependencies between them
+    #pragma unroll
+    for (int i = 0; i < N; i++) {
+        asm_fmac(acc[i], a[i], b[i]);
+    }
+}
+
+// ============================================================
+// BS=1 Hyper-optimized kernel: all advanced ASM techniques
+// - Overlapped butterfly reduces
+// - Explicit global_load with vmcnt control
+// - Software pipelining
+// - Dual-issue friendly FMA chains
+// ============================================================
+template <int NKH, int NVH, int NUM_V_BLOCKS>
+__device__ __forceinline__ void gdn_decode_kernel_bs1_hyper_opt(
+    const __hip_bfloat16* __restrict__ query,
+    const __hip_bfloat16* __restrict__ key,
+    const __hip_bfloat16* __restrict__ value,
+    const __hip_bfloat16* __restrict__ a_input,
+    const __hip_bfloat16* __restrict__ b_input,
+    const __hip_bfloat16* __restrict__ dt_bias,
+    const float* __restrict__          A_log,
+    const int* __restrict__            indices,
+    float* __restrict__                state,
+    __hip_bfloat16* __restrict__       output,
+    float scale
+) {
+    constexpr int TILE_V = HEAD_V_DIM / NUM_V_BLOCKS;
+    constexpr int WARP_GROUP_TILE_V = NUM_WARPS * WARP_V_THREADS;
+    constexpr int V_ITERS = TILE_V / WARP_GROUP_TILE_V;
+
+    const int tid = threadIdx.x;
+    const int lane_id = tid % WARP_SIZE;
+    const int warp_id = tid / WARP_SIZE;
+    const int k_tid = lane_id % WARP_K_THREADS;
+    const int v_tid = lane_id / WARP_K_THREADS;
+
+    const int b_hv_vb = blockIdx.x;
+    const int v_block_id = b_hv_vb % NUM_V_BLOCKS;
+    const int b_hv = b_hv_vb / NUM_V_BLOCKS;
+    const int hv_idx = b_hv % NVH;
+    const int hk_idx = hv_idx / (NVH / NKH);
+
+    const int pool_idx = indices[0];
+    if (pool_idx < 0) return;
+
+    const int warp_k_vec_start = k_tid * VEC_K;
+    const int global_v_base = v_block_id * TILE_V + warp_id * WARP_V_THREADS + v_tid;
+    const int leader_addr = ((lane_id / WARP_K_THREADS) * WARP_K_THREADS) << 2;
+
+    const int xor1 = (lane_id ^ 1) << 2;
+    const int xor2 = (lane_id ^ 2) << 2;
+    const int xor4 = (lane_id ^ 4) << 2;
+
+    const int shs = HEAD_V_DIM * HEAD_K_DIM;
+    float* sb = state + (int64_t)pool_idx * NVH * shs + hv_idx * shs;
+
+    // ═══════════════════════════════════════════════════════════
+    // PHASE 1: Issue ALL state loads (compiler generates global_load)
+    // These will be in-flight while we compute gating
+    // ═══════════════════════════════════════════════════════════
+    float4 S_load[V_ITERS][K_ITERS];
+    #pragma unroll
+    for (int vi = 0; vi < V_ITERS; vi++) {
+        int gv = global_v_base + vi * WARP_GROUP_TILE_V;
+        #pragma unroll
+        for (int ki = 0; ki < K_ITERS; ki++) {
+            S_load[vi][ki] = *reinterpret_cast<const float4*>(
+                sb + gv * HEAD_K_DIM + warp_k_vec_start + ki * WARP_TILE_K);
+        }
+    }
+
+    // Pointers
+    const auto* qb = query + hk_idx * HEAD_K_DIM;
+    const auto* kb = key + hk_idx * HEAD_K_DIM;
+    const auto* vb = value + hv_idx * HEAD_V_DIM;
+
+    // ═══════════════════════════════════════════════════════════
+    // PHASE 2: Gating computation (overlaps with state loads)
+    // Using inline ASM transcendentals
+    // ═══════════════════════════════════════════════════════════
+    float a_val = __bfloat162float(a_input[hv_idx]);
+    float dt_val = __bfloat162float(dt_bias[hv_idx]);
+    float A_log_val = A_log[hv_idx];
+    float b_val = __bfloat162float(b_input[hv_idx]);
+
+    float x = a_val + dt_val;
+    float sp = (x <= 20.0f) ? asm_fast_log1p(asm_fast_exp(x)) : x;
+    float exp_g = asm_fast_exp(-asm_fast_exp(A_log_val) * sp);
+    float beta = asm_rcp(1.0f + asm_fast_exp(-b_val));
+
+    // ═══════════════════════════════════════════════════════════
+    // PHASE 3: Q/K loads and L2 norms with overlapped reduce
+    // ═══════════════════════════════════════════════════════════
+    float Q_cache[K_ITERS][VEC_K];
+    float K_cache[K_ITERS][VEC_K];
+    float sq_q = 0.0f, sq_k = 0.0f;
+
+    // Load and accumulate norms - use explicit FMA chaining
+    #pragma unroll
+    for (int ki = 0; ki < K_ITERS; ki++) {
+        int ko = warp_k_vec_start + ki * WARP_TILE_K;
+        #pragma unroll
+        for (int j = 0; j < VEC_K; j++) {
+            float qv = __bfloat162float(qb[ko + j]);
+            float kv = __bfloat162float(kb[ko + j]);
+            Q_cache[ki][j] = qv;
+            K_cache[ki][j] = kv;
+            // Use FMA for sq accumulation
+            asm_fmac(sq_q, qv, qv);
+            asm_fmac(sq_k, kv, kv);
+        }
+    }
+
+    // Overlapped 2-way reduce for L2 norms
+    reduce_2way_overlapped_asm(sq_q, sq_k, xor1, xor2, xor4);
+
+    // ═══════════════════════════════════════════════════════════
+    // PHASE 4: Unpack state (loads should be complete by now)
+    // ═══════════════════════════════════════════════════════════
+    float S[V_ITERS][K_ITERS][VEC_K];
+    #pragma unroll
+    for (int vi = 0; vi < V_ITERS; vi++) {
+        #pragma unroll
+        for (int ki = 0; ki < K_ITERS; ki++) {
+            S[vi][ki][0] = S_load[vi][ki].x;
+            S[vi][ki][1] = S_load[vi][ki].y;
+            S[vi][ki][2] = S_load[vi][ki].z;
+            S[vi][ki][3] = S_load[vi][ki].w;
+        }
+    }
+
+    // Normalization
+    const float inv_sq_q = asm_rsqrt(sq_q + 1e-6f);
+    const float inv_sq_k = asm_rsqrt(sq_k + 1e-6f);
+    const float qs = scale * inv_sq_q;
+    const float ks = inv_sq_k;
+
+    #pragma unroll
+    for (int ki = 0; ki < K_ITERS; ki++) {
+        #pragma unroll
+        for (int j = 0; j < VEC_K; j++) {
+            Q_cache[ki][j] *= qs;
+            K_cache[ki][j] *= ks;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // PHASE 5: Main computation with interleaved FMAs
+    // Structure to maximize VALU throughput
+    // ═══════════════════════════════════════════════════════════
+    float dot_kq = 0.0f;
+    float res_hk[V_ITERS];
+    float res_hq[V_ITERS];
+    
+    #pragma unroll
+    for (int vi = 0; vi < V_ITERS; vi++) {
+        res_hk[vi] = 0.0f;
+        res_hq[vi] = 0.0f;
+    }
+
+    // Interleaved dot products - issue independent FMAs
+    #pragma unroll
+    for (int ki = 0; ki < K_ITERS; ki++) {
+        #pragma unroll
+        for (int j = 0; j < VEC_K; j++) {
+            float qv = Q_cache[ki][j];
+            float kv = K_cache[ki][j];
+            
+            // These FMAs are independent across V_ITERS
+            asm_fmac(dot_kq, kv, qv);
+            
+            #pragma unroll
+            for (int vi = 0; vi < V_ITERS; vi++) {
+                float sv = S[vi][ki][j];
+                asm_fmac(res_hk[vi], sv, kv);
+                asm_fmac(res_hq[vi], sv, qv);
+            }
+        }
+    }
+
+    // Reduce dot_kq
+    reduce_1way_fast_asm(dot_kq, xor1, xor2, xor4);
+
+    // Reduce res_hk and res_hq
+    if constexpr (V_ITERS == 4) {
+        reduce_8way_asm(res_hk[0], res_hk[1], res_hk[2], res_hk[3],
+                       res_hq[0], res_hq[1], res_hq[2], res_hq[3], xor1, xor2, xor4);
+    } else if constexpr (V_ITERS == 2) {
+        reduce_4way_asm(res_hk[0], res_hk[1], res_hq[0], res_hq[1], xor1, xor2, xor4);
+    } else {
+        reduce_2way_asm(res_hk[0], res_hq[0], xor1, xor2, xor4);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // PHASE 6: Apply gating and delta
+    // ═══════════════════════════════════════════════════════════
+    #pragma unroll
+    for (int vi = 0; vi < V_ITERS; vi++) {
+        res_hk[vi] *= exp_g;
+        res_hq[vi] *= exp_g;
+    }
+
+    float vn[V_ITERS];
+    if constexpr (V_ITERS == 4) {
+        float tmp0 = (__bfloat162float(vb[global_v_base + 0 * WARP_GROUP_TILE_V]) - res_hk[0]) * beta;
+        float tmp1 = (__bfloat162float(vb[global_v_base + 1 * WARP_GROUP_TILE_V]) - res_hk[1]) * beta;
+        float tmp2 = (__bfloat162float(vb[global_v_base + 2 * WARP_GROUP_TILE_V]) - res_hk[2]) * beta;
+        float tmp3 = (__bfloat162float(vb[global_v_base + 3 * WARP_GROUP_TILE_V]) - res_hk[3]) * beta;
+        shfl_idx_4way_asm(vn[0], vn[1], vn[2], vn[3], tmp0, tmp1, tmp2, tmp3, leader_addr);
+    } else if constexpr (V_ITERS == 2) {
+        float tmp0 = (__bfloat162float(vb[global_v_base + 0 * WARP_GROUP_TILE_V]) - res_hk[0]) * beta;
+        float tmp1 = (__bfloat162float(vb[global_v_base + 1 * WARP_GROUP_TILE_V]) - res_hk[1]) * beta;
+        shfl_idx_2way_asm(vn[0], vn[1], tmp0, tmp1, leader_addr);
+    } else {
+        float tmp0 = (__bfloat162float(vb[global_v_base]) - res_hk[0]) * beta;
+        vn[0] = shfl_idx(tmp0, leader_addr >> 2);
+    }
+
+    #pragma unroll
+    for (int vi = 0; vi < V_ITERS; vi++) {
+        asm_fmac(res_hq[vi], vn[vi], dot_kq);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // PHASE 7: Write output
+    // ═══════════════════════════════════════════════════════════
+    if (k_tid == 0) {
+        const int64_t out_base = (int64_t)hv_idx * HEAD_V_DIM + global_v_base;
+        #pragma unroll
+        for (int vi = 0; vi < V_ITERS; vi++) {
+            output[out_base + vi * WARP_GROUP_TILE_V] = __float2bfloat16(res_hq[vi]);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // PHASE 8: State update with FMA chains
+    // ═══════════════════════════════════════════════════════════
+    #pragma unroll
+    for (int vi = 0; vi < V_ITERS; vi++) {
+        int gv = global_v_base + vi * WARP_GROUP_TILE_V;
+        #pragma unroll
+        for (int ki = 0; ki < K_ITERS; ki++) {
+            float4 t;
+            // h_new = h_old * g + k * vn
+            t.x = __fmaf_rn(K_cache[ki][0], vn[vi], S[vi][ki][0] * exp_g);
+            t.y = __fmaf_rn(K_cache[ki][1], vn[vi], S[vi][ki][1] * exp_g);
+            t.z = __fmaf_rn(K_cache[ki][2], vn[vi], S[vi][ki][2] * exp_g);
+            t.w = __fmaf_rn(K_cache[ki][3], vn[vi], S[vi][ki][3] * exp_g);
+            *reinterpret_cast<float4*>(sb + gv * HEAD_K_DIM + warp_k_vec_start + ki * WARP_TILE_K) = t;
+        }
+    }
+}
+
+// ============================================================
+// BS=1 Extreme ASM kernel: pure inline ASM for all transcendentals
+// - v_exp_f32, v_log_f32, v_rsq_f32 direct
+// - Parallel load + compute overlap
+// ============================================================
+template <int NKH, int NVH, int NUM_V_BLOCKS>
+__device__ __forceinline__ void gdn_decode_kernel_bs1_extreme_asm(
+    const __hip_bfloat16* __restrict__ query,
+    const __hip_bfloat16* __restrict__ key,
+    const __hip_bfloat16* __restrict__ value,
+    const __hip_bfloat16* __restrict__ a_input,
+    const __hip_bfloat16* __restrict__ b_input,
+    const __hip_bfloat16* __restrict__ dt_bias,
+    const float* __restrict__          A_log,
+    const int* __restrict__            indices,
+    float* __restrict__                state,
+    __hip_bfloat16* __restrict__       output,
+    float scale
+) {
+    constexpr int TILE_V = HEAD_V_DIM / NUM_V_BLOCKS;
+    constexpr int WARP_GROUP_TILE_V = NUM_WARPS * WARP_V_THREADS;
+    constexpr int V_ITERS = TILE_V / WARP_GROUP_TILE_V;
+
+    const int tid = threadIdx.x;
+    const int lane_id = tid % WARP_SIZE;
+    const int warp_id = tid / WARP_SIZE;
+    const int k_tid = lane_id % WARP_K_THREADS;
+    const int v_tid = lane_id / WARP_K_THREADS;
+
+    const int b_hv_vb = blockIdx.x;
+    const int v_block_id = b_hv_vb % NUM_V_BLOCKS;
+    const int b_hv = b_hv_vb / NUM_V_BLOCKS;
+    const int hv_idx = b_hv % NVH;
+    const int hk_idx = hv_idx / (NVH / NKH);
+
+    const int pool_idx = indices[0];
+    if (pool_idx < 0) return;
+
+    const int warp_k_vec_start = k_tid * VEC_K;
+    const int global_v_base = v_block_id * TILE_V + warp_id * WARP_V_THREADS + v_tid;
+    const int leader_addr = ((lane_id / WARP_K_THREADS) * WARP_K_THREADS) << 2;
+
+    const int xor1 = (lane_id ^ 1) << 2;
+    const int xor2 = (lane_id ^ 2) << 2;
+    const int xor4 = (lane_id ^ 4) << 2;
+
+    // State base
+    const int shs = HEAD_V_DIM * HEAD_K_DIM;
+    float* sb = state + (int64_t)pool_idx * NVH * shs + hv_idx * shs;
+
+    // Issue all loads upfront
+    float4 S_load[V_ITERS][K_ITERS];
+    #pragma unroll
+    for (int vi = 0; vi < V_ITERS; vi++) {
+        int gv = global_v_base + vi * WARP_GROUP_TILE_V;
+        #pragma unroll
+        for (int ki = 0; ki < K_ITERS; ki++) {
+            S_load[vi][ki] = *reinterpret_cast<const float4*>(
+                sb + gv * HEAD_K_DIM + warp_k_vec_start + ki * WARP_TILE_K);
+        }
+    }
+
+    const auto* qb = query + hk_idx * HEAD_K_DIM;
+    const auto* kb = key + hk_idx * HEAD_K_DIM;
+    const auto* vb = value + hv_idx * HEAD_V_DIM;
+
+    // Gating parameters
+    float a_val = __bfloat162float(a_input[hv_idx]);
+    float dt_val = __bfloat162float(dt_bias[hv_idx]);
+    float A_log_val = A_log[hv_idx];
+    float b_val = __bfloat162float(b_input[hv_idx]);
+
+    // Compute gating using ASM transcendentals
+    float x = a_val + dt_val;
+    // softplus: sp = log(1 + exp(x)) if x <= 20, else x
+    float sp = (x <= 20.0f) ? asm_fast_log1p(asm_fast_exp(x)) : x;
+    // g = exp(-exp(A_log) * sp) 
+    float exp_g = asm_fast_exp(-asm_fast_exp(A_log_val) * sp);
+    // beta = sigmoid(b) = 1 / (1 + exp(-b))
+    float beta = asm_rcp(1.0f + asm_fast_exp(-b_val));
+
+    // Q/K loads and L2 norms
+    float Q_cache[K_ITERS][VEC_K];
+    float K_cache[K_ITERS][VEC_K];
+    float sq_q = 0.0f, sq_k = 0.0f;
+
+    #pragma unroll
+    for (int ki = 0; ki < K_ITERS; ki++) {
+        int ko = warp_k_vec_start + ki * WARP_TILE_K;
+        #pragma unroll
+        for (int j = 0; j < VEC_K; j++) {
+            float qv = __bfloat162float(qb[ko + j]);
+            float kv = __bfloat162float(kb[ko + j]);
+            Q_cache[ki][j] = qv;
+            K_cache[ki][j] = kv;
+            sq_q = __fmaf_rn(qv, qv, sq_q);
+            sq_k = __fmaf_rn(kv, kv, sq_k);
+        }
+    }
+
+    reduce_2way_asm(sq_q, sq_k, xor1, xor2, xor4);
+
+    // Unpack state
+    float S[V_ITERS][K_ITERS][VEC_K];
+    #pragma unroll
+    for (int vi = 0; vi < V_ITERS; vi++) {
+        #pragma unroll
+        for (int ki = 0; ki < K_ITERS; ki++) {
+            S[vi][ki][0] = S_load[vi][ki].x;
+            S[vi][ki][1] = S_load[vi][ki].y;
+            S[vi][ki][2] = S_load[vi][ki].z;
+            S[vi][ki][3] = S_load[vi][ki].w;
+        }
+    }
+
+    // Normalization using ASM rsqrt
+    const float inv_sq_q = asm_rsqrt(sq_q + 1e-6f);
+    const float inv_sq_k = asm_rsqrt(sq_k + 1e-6f);
+    const float qs = scale * inv_sq_q;
+    const float ks = inv_sq_k;
+
+    #pragma unroll
+    for (int ki = 0; ki < K_ITERS; ki++) {
+        #pragma unroll
+        for (int j = 0; j < VEC_K; j++) {
+            Q_cache[ki][j] *= qs;
+            K_cache[ki][j] *= ks;
+        }
+    }
+
+    // Main computation
+    float dot_kq = 0.0f;
+    float res_hk[V_ITERS];
+    float res_hq[V_ITERS];
+    
+    #pragma unroll
+    for (int vi = 0; vi < V_ITERS; vi++) {
+        res_hk[vi] = 0.0f;
+        res_hq[vi] = 0.0f;
+    }
+
+    #pragma unroll
+    for (int ki = 0; ki < K_ITERS; ki++) {
+        #pragma unroll
+        for (int j = 0; j < VEC_K; j++) {
+            float qv = Q_cache[ki][j];
+            float kv = K_cache[ki][j];
+            dot_kq = __fmaf_rn(kv, qv, dot_kq);
+            #pragma unroll
+            for (int vi = 0; vi < V_ITERS; vi++) {
+                res_hk[vi] = __fmaf_rn(S[vi][ki][j], kv, res_hk[vi]);
+                res_hq[vi] = __fmaf_rn(S[vi][ki][j], qv, res_hq[vi]);
+            }
+        }
+    }
+
+    reduce_1way_fast_asm(dot_kq, xor1, xor2, xor4);
+
+    if constexpr (V_ITERS == 4) {
+        reduce_8way_asm(res_hk[0], res_hk[1], res_hk[2], res_hk[3],
+                       res_hq[0], res_hq[1], res_hq[2], res_hq[3], xor1, xor2, xor4);
+    } else if constexpr (V_ITERS == 2) {
+        reduce_4way_asm(res_hk[0], res_hk[1], res_hq[0], res_hq[1], xor1, xor2, xor4);
+    } else {
+        reduce_2way_asm(res_hk[0], res_hq[0], xor1, xor2, xor4);
+    }
+
+    #pragma unroll
+    for (int vi = 0; vi < V_ITERS; vi++) {
+        res_hk[vi] *= exp_g;
+        res_hq[vi] *= exp_g;
+    }
+
+    float vn[V_ITERS];
+    if constexpr (V_ITERS == 4) {
+        float tmp0 = (__bfloat162float(vb[global_v_base + 0 * WARP_GROUP_TILE_V]) - res_hk[0]) * beta;
+        float tmp1 = (__bfloat162float(vb[global_v_base + 1 * WARP_GROUP_TILE_V]) - res_hk[1]) * beta;
+        float tmp2 = (__bfloat162float(vb[global_v_base + 2 * WARP_GROUP_TILE_V]) - res_hk[2]) * beta;
+        float tmp3 = (__bfloat162float(vb[global_v_base + 3 * WARP_GROUP_TILE_V]) - res_hk[3]) * beta;
+        shfl_idx_4way_asm(vn[0], vn[1], vn[2], vn[3], tmp0, tmp1, tmp2, tmp3, leader_addr);
+    } else if constexpr (V_ITERS == 2) {
+        float tmp0 = (__bfloat162float(vb[global_v_base + 0 * WARP_GROUP_TILE_V]) - res_hk[0]) * beta;
+        float tmp1 = (__bfloat162float(vb[global_v_base + 1 * WARP_GROUP_TILE_V]) - res_hk[1]) * beta;
+        shfl_idx_2way_asm(vn[0], vn[1], tmp0, tmp1, leader_addr);
+    } else {
+        float tmp0 = (__bfloat162float(vb[global_v_base]) - res_hk[0]) * beta;
+        vn[0] = shfl_idx(tmp0, leader_addr >> 2);
+    }
+
+    #pragma unroll
+    for (int vi = 0; vi < V_ITERS; vi++) {
+        res_hq[vi] = __fmaf_rn(vn[vi], dot_kq, res_hq[vi]);
+    }
+
+    if (k_tid == 0) {
+        const int64_t out_base = (int64_t)hv_idx * HEAD_V_DIM + global_v_base;
+        #pragma unroll
+        for (int vi = 0; vi < V_ITERS; vi++) {
+            output[out_base + vi * WARP_GROUP_TILE_V] = __float2bfloat16(res_hq[vi]);
+        }
+    }
+
+    #pragma unroll
+    for (int ki = 0; ki < K_ITERS; ki++) {
+        #pragma unroll
+        for (int j = 0; j < VEC_K; j++) {
+            float kv = K_cache[ki][j];
+            #pragma unroll
+            for (int vi = 0; vi < V_ITERS; vi++) {
+                S[vi][ki][j] = __fmaf_rn(kv, vn[vi], S[vi][ki][j] * exp_g);
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int vi = 0; vi < V_ITERS; vi++) {
+        int gv = global_v_base + vi * WARP_GROUP_TILE_V;
+        #pragma unroll
+        for (int ki = 0; ki < K_ITERS; ki++) {
+            float4 t = {S[vi][ki][0], S[vi][ki][1], S[vi][ki][2], S[vi][ki][3]};
+            *reinterpret_cast<float4*>(sb + gv * HEAD_K_DIM + warp_k_vec_start + ki * WARP_TILE_K) = t;
+        }
+    }
+}
+
+// ============================================================
+// BS=1 Ultra-optimized kernel: maximum latency hiding
+// - All state loads issued first with async semantics
+// - exp2 instead of exp (native instruction)
+// - Fused reduce operations
+// - Interleaved compute with memory ops
+// ============================================================
+template <int NKH, int NVH, int NUM_V_BLOCKS>
+__device__ __forceinline__ void gdn_decode_kernel_bs1_ultra_opt(
+    const __hip_bfloat16* __restrict__ query,
+    const __hip_bfloat16* __restrict__ key,
+    const __hip_bfloat16* __restrict__ value,
+    const __hip_bfloat16* __restrict__ a_input,
+    const __hip_bfloat16* __restrict__ b_input,
+    const __hip_bfloat16* __restrict__ dt_bias,
+    const float* __restrict__          A_log,
+    const int* __restrict__            indices,
+    float* __restrict__                state,
+    __hip_bfloat16* __restrict__       output,
+    float scale
+) {
+    constexpr int TILE_V = HEAD_V_DIM / NUM_V_BLOCKS;
+    constexpr int WARP_GROUP_TILE_V = NUM_WARPS * WARP_V_THREADS;
+    constexpr int V_ITERS = TILE_V / WARP_GROUP_TILE_V;
+
+    const int tid = threadIdx.x;
+    const int lane_id = tid % WARP_SIZE;
+    const int warp_id = tid / WARP_SIZE;
+    const int k_tid = lane_id % WARP_K_THREADS;
+    const int v_tid = lane_id / WARP_K_THREADS;
+
+    const int b_hv_vb = blockIdx.x;
+    const int v_block_id = b_hv_vb % NUM_V_BLOCKS;
+    const int b_hv = b_hv_vb / NUM_V_BLOCKS;
+    // BS=1 specialized: batch_idx always 0
+    const int hv_idx = b_hv % NVH;
+    const int hk_idx = hv_idx / (NVH / NKH);
+
+    const int pool_idx = indices[0];
+    if (pool_idx < 0) return;
+
+    const int warp_k_vec_start = k_tid * VEC_K;
+    const int global_v_base = v_block_id * TILE_V + warp_id * WARP_V_THREADS + v_tid;
+    const int leader_addr = ((lane_id / WARP_K_THREADS) * WARP_K_THREADS) << 2;
+
+    const int xor1 = (lane_id ^ 1) << 2;
+    const int xor2 = (lane_id ^ 2) << 2;
+    const int xor4 = (lane_id ^ 4) << 2;
+
+    // ═══════════════════════════════════════════════════════════
+    // PHASE 1: Issue ALL memory loads (state + Q + K + gating params)
+    // ═══════════════════════════════════════════════════════════
+    
+    const int shs = HEAD_V_DIM * HEAD_K_DIM;
+    float* sb = state + (int64_t)pool_idx * NVH * shs + hv_idx * shs;
+
+    // State loads - let compiler pipeline these
+    float4 S_load[V_ITERS][K_ITERS];
+    #pragma unroll
+    for (int vi = 0; vi < V_ITERS; vi++) {
+        int gv = global_v_base + vi * WARP_GROUP_TILE_V;
+        #pragma unroll
+        for (int ki = 0; ki < K_ITERS; ki++) {
+            S_load[vi][ki] = *reinterpret_cast<const float4*>(
+                sb + gv * HEAD_K_DIM + warp_k_vec_start + ki * WARP_TILE_K);
+        }
+    }
+
+    // Q/K/V pointers (BS=1, so no batch offset needed)
+    const auto* qb = query + hk_idx * HEAD_K_DIM;
+    const auto* kb = key + hk_idx * HEAD_K_DIM;
+    const auto* vb = value + hv_idx * HEAD_V_DIM;
+
+    // Load gating parameters (only once per head)
+    const float a_val = __bfloat162float(a_input[hv_idx]);
+    const float dt_val = __bfloat162float(dt_bias[hv_idx]);
+    const float A_log_val = A_log[hv_idx];
+    const float b_val = __bfloat162float(b_input[hv_idx]);
+
+    // ═══════════════════════════════════════════════════════════
+    // PHASE 2: Compute gating using fast_exp (exp2)
+    // ═══════════════════════════════════════════════════════════
+    
+    float x = a_val + dt_val;
+    float sp = (x <= 20.0f) ? fast_log1p(fast_exp(x)) : x;
+    float exp_g = fast_exp(-fast_exp(A_log_val) * sp);
+    float beta = __frcp_rn(1.0f + fast_exp(-b_val));
+
+    // ═══════════════════════════════════════════════════════════
+    // PHASE 3: Load Q/K and compute L2 norms
+    // ═══════════════════════════════════════════════════════════
+    
+    float Q_cache[K_ITERS][VEC_K];
+    float K_cache[K_ITERS][VEC_K];
+    float sq_q = 0.0f;
+    float sq_k = 0.0f;
+
+    #pragma unroll
+    for (int ki = 0; ki < K_ITERS; ki++) {
+        int ko = warp_k_vec_start + ki * WARP_TILE_K;
+        #pragma unroll
+        for (int j = 0; j < VEC_K; j++) {
+            float qv = __bfloat162float(qb[ko + j]);
+            float kv = __bfloat162float(kb[ko + j]);
+            Q_cache[ki][j] = qv;
+            K_cache[ki][j] = kv;
+            sq_q = __fmaf_rn(qv, qv, sq_q);  // FMA for sq += qv*qv
+            sq_k = __fmaf_rn(kv, kv, sq_k);
+        }
+    }
+
+    // Reduce L2 norms across K threads
+    reduce_2way_asm(sq_q, sq_k, xor1, xor2, xor4);
+
+    // ═══════════════════════════════════════════════════════════
+    // PHASE 4: Unpack state and apply normalization
+    // ═══════════════════════════════════════════════════════════
+    
+    float S[V_ITERS][K_ITERS][VEC_K];
+    #pragma unroll
+    for (int vi = 0; vi < V_ITERS; vi++) {
+        #pragma unroll
+        for (int ki = 0; ki < K_ITERS; ki++) {
+            S[vi][ki][0] = S_load[vi][ki].x;
+            S[vi][ki][1] = S_load[vi][ki].y;
+            S[vi][ki][2] = S_load[vi][ki].z;
+            S[vi][ki][3] = S_load[vi][ki].w;
+        }
+    }
+
+    // Apply rsqrt with FMA
+    const float inv_sq_q = __frsqrt_rn(sq_q + 1e-6f);
+    const float inv_sq_k = __frsqrt_rn(sq_k + 1e-6f);
+    const float qs = scale * inv_sq_q;
+    const float ks = inv_sq_k;
+
+    // Normalize cached Q/K
+    #pragma unroll
+    for (int ki = 0; ki < K_ITERS; ki++) {
+        #pragma unroll
+        for (int j = 0; j < VEC_K; j++) {
+            Q_cache[ki][j] *= qs;
+            K_cache[ki][j] *= ks;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // PHASE 5: Main computation (fused dot products)
+    // ═══════════════════════════════════════════════════════════
+    
+    float dot_kq = 0.0f;
+    float res_hk[V_ITERS];
+    float res_hq[V_ITERS];
+    
+    #pragma unroll
+    for (int vi = 0; vi < V_ITERS; vi++) {
+        res_hk[vi] = 0.0f;
+        res_hq[vi] = 0.0f;
+    }
+
+    // Interleaved dot product computation with FMA
+    #pragma unroll
+    for (int ki = 0; ki < K_ITERS; ki++) {
+        #pragma unroll
+        for (int j = 0; j < VEC_K; j++) {
+            float qv = Q_cache[ki][j];
+            float kv = K_cache[ki][j];
+            dot_kq = __fmaf_rn(kv, qv, dot_kq);
+            #pragma unroll
+            for (int vi = 0; vi < V_ITERS; vi++) {
+                res_hk[vi] = __fmaf_rn(S[vi][ki][j], kv, res_hk[vi]);
+                res_hq[vi] = __fmaf_rn(S[vi][ki][j], qv, res_hq[vi]);
+            }
+        }
+    }
+
+    // Reduce dot_kq
+    reduce_1way_fast_asm(dot_kq, xor1, xor2, xor4);
+
+    // Reduce res_hk and res_hq
+    if constexpr (V_ITERS == 4) {
+        reduce_8way_asm(
+            res_hk[0], res_hk[1], res_hk[2], res_hk[3],
+            res_hq[0], res_hq[1], res_hq[2], res_hq[3],
+            xor1, xor2, xor4);
+    } else if constexpr (V_ITERS == 2) {
+        reduce_4way_asm(res_hk[0], res_hk[1], res_hq[0], res_hq[1], xor1, xor2, xor4);
+    } else {
+        reduce_2way_asm(res_hk[0], res_hq[0], xor1, xor2, xor4);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // PHASE 6: Apply gating and compute delta
+    // ═══════════════════════════════════════════════════════════
+    
+    #pragma unroll
+    for (int vi = 0; vi < V_ITERS; vi++) {
+        res_hk[vi] *= exp_g;
+        res_hq[vi] *= exp_g;
+    }
+
+    float vn[V_ITERS];
+    if constexpr (V_ITERS == 4) {
+        float tmp0 = (__bfloat162float(vb[global_v_base + 0 * WARP_GROUP_TILE_V]) - res_hk[0]) * beta;
+        float tmp1 = (__bfloat162float(vb[global_v_base + 1 * WARP_GROUP_TILE_V]) - res_hk[1]) * beta;
+        float tmp2 = (__bfloat162float(vb[global_v_base + 2 * WARP_GROUP_TILE_V]) - res_hk[2]) * beta;
+        float tmp3 = (__bfloat162float(vb[global_v_base + 3 * WARP_GROUP_TILE_V]) - res_hk[3]) * beta;
+        shfl_idx_4way_asm(vn[0], vn[1], vn[2], vn[3], tmp0, tmp1, tmp2, tmp3, leader_addr);
+    } else if constexpr (V_ITERS == 2) {
+        float tmp0 = (__bfloat162float(vb[global_v_base + 0 * WARP_GROUP_TILE_V]) - res_hk[0]) * beta;
+        float tmp1 = (__bfloat162float(vb[global_v_base + 1 * WARP_GROUP_TILE_V]) - res_hk[1]) * beta;
+        shfl_idx_2way_asm(vn[0], vn[1], tmp0, tmp1, leader_addr);
+    } else {
+        float tmp0 = (__bfloat162float(vb[global_v_base]) - res_hk[0]) * beta;
+        vn[0] = shfl_idx(tmp0, leader_addr >> 2);
+    }
+
+    // Final output computation with FMA
+    #pragma unroll
+    for (int vi = 0; vi < V_ITERS; vi++) {
+        res_hq[vi] = __fmaf_rn(vn[vi], dot_kq, res_hq[vi]);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // PHASE 7: Write output (only k_tid==0)
+    // ═══════════════════════════════════════════════════════════
+    
+    if (k_tid == 0) {
+        const int64_t out_base = (int64_t)hv_idx * HEAD_V_DIM + global_v_base;
+        #pragma unroll
+        for (int vi = 0; vi < V_ITERS; vi++) {
+            output[out_base + vi * WARP_GROUP_TILE_V] = __float2bfloat16(res_hq[vi]);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // PHASE 8: Update state using cached K values
+    // ═══════════════════════════════════════════════════════════
+    
+    #pragma unroll
+    for (int ki = 0; ki < K_ITERS; ki++) {
+        #pragma unroll
+        for (int j = 0; j < VEC_K; j++) {
+            float kv = K_cache[ki][j];
+            #pragma unroll
+            for (int vi = 0; vi < V_ITERS; vi++) {
+                S[vi][ki][j] = __fmaf_rn(kv, vn[vi], S[vi][ki][j] * exp_g);
+            }
+        }
+    }
+
+    // Write back state
+    #pragma unroll
+    for (int vi = 0; vi < V_ITERS; vi++) {
+        int gv = global_v_base + vi * WARP_GROUP_TILE_V;
+        #pragma unroll
+        for (int ki = 0; ki < K_ITERS; ki++) {
+            float4 t = {S[vi][ki][0], S[vi][ki][1], S[vi][ki][2], S[vi][ki][3]};
+            *reinterpret_cast<float4*>(sb + gv * HEAD_K_DIM + warp_k_vec_start + ki * WARP_TILE_K) = t;
+        }
+    }
+}
+
+
+// ============================================================
+// Optimized kernel body for BS=1: aggressive latency hiding
+// - State loads issued early with delayed waitcnt
+// - rsqrt latency hidden by overlapping gating computation
+// - v_dot2_f32_bf16 for L2 norm
+// ============================================================
+template <int NKH, int NVH, int NUM_V_BLOCKS>
+__device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body_opt(
+    const __hip_bfloat16* __restrict__ query,
+    const __hip_bfloat16* __restrict__ key,
+    const __hip_bfloat16* __restrict__ value,
+    const __hip_bfloat16* __restrict__ a_input,
+    const __hip_bfloat16* __restrict__ b_input,
+    const __hip_bfloat16* __restrict__ dt_bias,
+    const float* __restrict__          A_log,
+    const int* __restrict__            indices,
+    float* __restrict__                state,
+    __hip_bfloat16* __restrict__       output,
+    const int* __restrict__            batch_perm,
+    int batch_size, float scale
+) {
+    constexpr int TILE_V = HEAD_V_DIM / NUM_V_BLOCKS;
+    constexpr int WARP_GROUP_TILE_V = NUM_WARPS * WARP_V_THREADS;
+    constexpr int V_ITERS = TILE_V / WARP_GROUP_TILE_V;
+
+    const int tid = threadIdx.x;
+    const int lane_id = tid % WARP_SIZE;
+    const int warp_id = tid / WARP_SIZE;
+    const int k_tid = lane_id % WARP_K_THREADS;
+    const int v_tid = lane_id / WARP_K_THREADS;
+
+    const int b_hv_vb = blockIdx.x;
+    const int v_block_id = b_hv_vb % NUM_V_BLOCKS;
+    const int b_hv = b_hv_vb / NUM_V_BLOCKS;
+    const int batch_idx = b_hv / NVH;
+    const int hv_idx = b_hv % NVH;
+    const int hk_idx = hv_idx / (NVH / NKH);
+
+    if (batch_idx >= batch_size) return;
+    const int pool_idx = indices[batch_idx];
+    if (pool_idx < 0) return;
+    const int io_bid = batch_perm ? batch_perm[batch_idx] : batch_idx;
+
+    const int warp_k_vec_start = k_tid * VEC_K;
+    const int global_v_base = v_block_id * TILE_V + warp_id * WARP_V_THREADS + v_tid;
+    const int leader_addr = ((lane_id / WARP_K_THREADS) * WARP_K_THREADS) << 2;
+
+    const int xor1 = (lane_id ^ 1) << 2;
+    const int xor2 = (lane_id ^ 2) << 2;
+    const int xor4 = (lane_id ^ 4) << 2;
+
+    // ── Phase 1: Issue ALL state loads early (no wait) ──
+    float S[V_ITERS][K_ITERS][VEC_K];
+    const int shs = HEAD_V_DIM * HEAD_K_DIM;
+    float* sb = state + (int64_t)pool_idx * NVH * shs + hv_idx * shs;
+
+    // Issue loads - compiler will pipeline these
+    float4 S_load[V_ITERS][K_ITERS];
+    #pragma unroll
+    for (int vi = 0; vi < V_ITERS; vi++) {
+        int gv = global_v_base + vi * WARP_GROUP_TILE_V;
+        #pragma unroll
+        for (int ki = 0; ki < K_ITERS; ki++) {
+            S_load[vi][ki] = *reinterpret_cast<const float4*>(
+                sb + gv * HEAD_K_DIM + warp_k_vec_start + ki * WARP_TILE_K);
+        }
+    }
+
+    // ── Phase 2: Compute gating (while state loads in flight) ──
+    const int ab = io_bid * NVH + hv_idx;
+    float a_val = __bfloat162float(a_input[ab]);
+    float dt_val = __bfloat162float(dt_bias[hv_idx]);
+    float x = a_val + dt_val;
+    float sp = (x <= 20.0f) ? __logf(1.0f + __expf(x)) : x;
+    float A_log_val = A_log[hv_idx];
+    float exp_g = __expf(-__expf(A_log_val) * sp);
+    float b_val = __bfloat162float(b_input[ab]);
+    float beta = __frcp_rn(1.0f + __expf(-b_val));
+
+    // ── Phase 3: Load Q/K, cache values, and compute L2 norm ──
+    const auto* qb = query + (int64_t)io_bid * NKH * HEAD_K_DIM + hk_idx * HEAD_K_DIM;
+    const auto* kb = key + (int64_t)io_bid * NKH * HEAD_K_DIM + hk_idx * HEAD_K_DIM;
+    const auto* vb = value + (int64_t)io_bid * NVH * HEAD_V_DIM + hv_idx * HEAD_V_DIM;
+
+    // Cache Q/K values to avoid double bf16->f32 conversion
+    float Q_cache[K_ITERS][VEC_K];
+    float K_cache[K_ITERS][VEC_K];
+    float sq_q = 0.0f;
+    float sq_k = 0.0f;
+
+    #pragma unroll
+    for (int ki = 0; ki < K_ITERS; ki++) {
+        int ko = warp_k_vec_start + ki * WARP_TILE_K;
+        #pragma unroll
+        for (int j = 0; j < VEC_K; j++) {
+            float qv = __bfloat162float(qb[ko + j]);
+            float kv = __bfloat162float(kb[ko + j]);
+            Q_cache[ki][j] = qv;
+            K_cache[ki][j] = kv;
+            sq_q += qv * qv;
+            sq_k += kv * kv;
+        }
+    }
+
+    // ── Phase 4: Reduce L2 norms across warp ──
+    reduce_2way_asm(sq_q, sq_k, xor1, xor2, xor4);
+
+    // ── Now unpack state loads (loads should be complete by now) ──
+    #pragma unroll
+    for (int vi = 0; vi < V_ITERS; vi++) {
+        #pragma unroll
+        for (int ki = 0; ki < K_ITERS; ki++) {
+            S[vi][ki][0] = S_load[vi][ki].x;
+            S[vi][ki][1] = S_load[vi][ki].y;
+            S[vi][ki][2] = S_load[vi][ki].z;
+            S[vi][ki][3] = S_load[vi][ki].w;
+        }
+    }
+
+    // ── Phase 5: Compute rsqrt and scale cached Q/K ──
+    const float qs = scale * __frsqrt_rn(sq_q + 1e-6f);
+    const float ks = __frsqrt_rn(sq_k + 1e-6f);
+
+    // Apply normalization to cached values
+    #pragma unroll
+    for (int ki = 0; ki < K_ITERS; ki++) {
+        #pragma unroll
+        for (int j = 0; j < VEC_K; j++) {
+            Q_cache[ki][j] *= qs;
+            K_cache[ki][j] *= ks;
+        }
+    }
+
+    // ── Phase 6: Main dot product loop (using cached values) ──
+    float dot_kq = 0.0f;
+    float res_hk[V_ITERS];
+    float res_hq[V_ITERS];
+    #pragma unroll
+    for (int vi = 0; vi < V_ITERS; vi++) {
+        res_hk[vi] = 0.0f;
+        res_hq[vi] = 0.0f;
+    }
+
+    #pragma unroll
+    for (int ki = 0; ki < K_ITERS; ki++) {
+        #pragma unroll
+        for (int j = 0; j < VEC_K; j++) {
+            float qv = Q_cache[ki][j];
+            float kv = K_cache[ki][j];
+            dot_kq += kv * qv;
+            #pragma unroll
+            for (int vi = 0; vi < V_ITERS; vi++) {
+                res_hk[vi] += S[vi][ki][j] * kv;
+                res_hq[vi] += S[vi][ki][j] * qv;
+            }
+        }
+    }
+    reduce_1way_asm(dot_kq, xor1, xor2, xor4);
+
+    if constexpr (V_ITERS == 4) {
+        reduce_8way_asm(
+            res_hk[0], res_hk[1], res_hk[2], res_hk[3],
+            res_hq[0], res_hq[1], res_hq[2], res_hq[3],
+            xor1, xor2, xor4);
+    } else if constexpr (V_ITERS == 2) {
+        reduce_4way_asm(res_hk[0], res_hk[1], res_hq[0], res_hq[1], xor1, xor2, xor4);
+    } else {
+        // V_ITERS == 1
+        reduce_2way_asm(res_hk[0], res_hq[0], xor1, xor2, xor4);
+    }
+
+    // ── Phase 7: Apply gating and delta update ──
+    #pragma unroll
+    for (int vi = 0; vi < V_ITERS; vi++) {
+        res_hk[vi] *= exp_g;
+        res_hq[vi] *= exp_g;
+    }
+
+    float vn[V_ITERS];
+    if constexpr (V_ITERS == 4) {
+        float tmp0 = (__bfloat162float(vb[global_v_base + 0 * WARP_GROUP_TILE_V]) - res_hk[0]) * beta;
+        float tmp1 = (__bfloat162float(vb[global_v_base + 1 * WARP_GROUP_TILE_V]) - res_hk[1]) * beta;
+        float tmp2 = (__bfloat162float(vb[global_v_base + 2 * WARP_GROUP_TILE_V]) - res_hk[2]) * beta;
+        float tmp3 = (__bfloat162float(vb[global_v_base + 3 * WARP_GROUP_TILE_V]) - res_hk[3]) * beta;
+        shfl_idx_4way_asm(vn[0], vn[1], vn[2], vn[3], tmp0, tmp1, tmp2, tmp3, leader_addr);
+    } else if constexpr (V_ITERS == 2) {
+        float tmp0 = (__bfloat162float(vb[global_v_base + 0 * WARP_GROUP_TILE_V]) - res_hk[0]) * beta;
+        float tmp1 = (__bfloat162float(vb[global_v_base + 1 * WARP_GROUP_TILE_V]) - res_hk[1]) * beta;
+        shfl_idx_2way_asm(vn[0], vn[1], tmp0, tmp1, leader_addr);
+    } else {
+        // V_ITERS == 1: use single shuffle
+        float tmp0 = (__bfloat162float(vb[global_v_base]) - res_hk[0]) * beta;
+        vn[0] = shfl_idx(tmp0, leader_addr >> 2);
+    }
+
+    #pragma unroll
+    for (int vi = 0; vi < V_ITERS; vi++) {
+        res_hq[vi] = res_hq[vi] + vn[vi] * dot_kq;
+    }
+
+    // ── Phase 8: Write output ──
+    if (k_tid == 0) {
+        const int64_t out_base = (int64_t)io_bid * NVH * HEAD_V_DIM
+                               + hv_idx * HEAD_V_DIM + global_v_base;
+        #pragma unroll
+        for (int vi = 0; vi < V_ITERS; vi++) {
+            output[out_base + vi * WARP_GROUP_TILE_V] = __float2bfloat16(res_hq[vi]);
+        }
+    }
+
+    // ── Phase 9: Update and store state (using cached K values) ──
+    #pragma unroll
+    for (int ki = 0; ki < K_ITERS; ki++) {
+        #pragma unroll
+        for (int j = 0; j < VEC_K; j++) {
+            float kv = K_cache[ki][j];  // Already normalized
+            #pragma unroll
+            for (int vi = 0; vi < V_ITERS; vi++) {
+                S[vi][ki][j] = S[vi][ki][j] * exp_g + kv * vn[vi];
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int vi = 0; vi < V_ITERS; vi++) {
+        int gv = global_v_base + vi * WARP_GROUP_TILE_V;
+        #pragma unroll
+        for (int ki = 0; ki < K_ITERS; ki++) {
+            float4 t = {S[vi][ki][0], S[vi][ki][1], S[vi][ki][2], S[vi][ki][3]};
+            *reinterpret_cast<float4*>(sb + gv * HEAD_K_DIM + warp_k_vec_start + ki * WARP_TILE_K) = t;
+        }
+    }
+}
+
+// Forwarding overload
+template <int NKH, int NVH, int NUM_V_BLOCKS>
+__device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body_opt(
+    const __hip_bfloat16* __restrict__ query,
+    const __hip_bfloat16* __restrict__ key,
+    const __hip_bfloat16* __restrict__ value,
+    const __hip_bfloat16* __restrict__ a_input,
+    const __hip_bfloat16* __restrict__ b_input,
+    const __hip_bfloat16* __restrict__ dt_bias,
+    const float* __restrict__          A_log,
+    const int* __restrict__            indices,
+    float* __restrict__                state,
+    __hip_bfloat16* __restrict__       output,
+    int batch_size, float scale
+) {
+    gdn_decode_kernel_iasm_sq1_body_opt<NKH, NVH, NUM_V_BLOCKS>(
+        query, key, value, a_input, b_input, dt_bias, A_log, indices,
+        state, output, (const int*)nullptr, batch_size, scale);
+}
+
+// ============================================================
 // HIP kernel: q+k in registers, auto-dispatch regqk/hybrid
 // ============================================================
 template <int NUM_V_BLOCKS, bool USE_QK_L2NORM>
@@ -1527,6 +2677,235 @@ DEFINE_NVH8_NVB1_VARIANT(gdn_decode_kernel_iasm_tp8_nvh8_sq1_nvb1_lb2w2, 2, 2, 3
 
 #undef DEFINE_NVH8_NVB1_VARIANT
 
+// ── Optimized NVH=8 variants using _opt body (latency hiding) ──
+
+// NVB=2 optimized: more work per block, better for medium parallelism
+__global__
+__launch_bounds__(BLOCK_THREADS, 3)
+__attribute__((amdgpu_waves_per_eu(3, 5)))
+void gdn_decode_kernel_iasm_tp8_nvh8_sq1_nvb2_opt(
+    const __hip_bfloat16* __restrict__ query,
+    const __hip_bfloat16* __restrict__ key,
+    const __hip_bfloat16* __restrict__ value,
+    const __hip_bfloat16* __restrict__ a_input,
+    const __hip_bfloat16* __restrict__ b_input,
+    const __hip_bfloat16* __restrict__ dt_bias,
+    const float* __restrict__          A_log,
+    const int* __restrict__            indices,
+    float* __restrict__                state,
+    __hip_bfloat16* __restrict__       output,
+    int batch_size, float scale
+) {
+    gdn_decode_kernel_iasm_sq1_body_opt<2, 8, 2>(
+        query, key, value, a_input, b_input, dt_bias, A_log, indices, state, output, batch_size, scale);
+}
+
+__global__
+__launch_bounds__(BLOCK_THREADS, 4)
+__attribute__((amdgpu_waves_per_eu(4, 6)))
+void gdn_decode_kernel_iasm_tp8_nvh8_sq1_opt(
+    const __hip_bfloat16* __restrict__ query,
+    const __hip_bfloat16* __restrict__ key,
+    const __hip_bfloat16* __restrict__ value,
+    const __hip_bfloat16* __restrict__ a_input,
+    const __hip_bfloat16* __restrict__ b_input,
+    const __hip_bfloat16* __restrict__ dt_bias,
+    const float* __restrict__          A_log,
+    const int* __restrict__            indices,
+    float* __restrict__                state,
+    __hip_bfloat16* __restrict__       output,
+    int batch_size, float scale
+) {
+    gdn_decode_kernel_iasm_sq1_body_opt<2, 8, 2>(
+        query, key, value, a_input, b_input, dt_bias, A_log, indices, state, output, batch_size, scale);
+}
+
+// NVB=4 variant for small batch: more parallelism
+__global__
+__launch_bounds__(BLOCK_THREADS, 4)
+__attribute__((amdgpu_waves_per_eu(4, 6)))
+void gdn_decode_kernel_iasm_tp8_nvh8_sq1_nvb4_opt(
+    const __hip_bfloat16* __restrict__ query,
+    const __hip_bfloat16* __restrict__ key,
+    const __hip_bfloat16* __restrict__ value,
+    const __hip_bfloat16* __restrict__ a_input,
+    const __hip_bfloat16* __restrict__ b_input,
+    const __hip_bfloat16* __restrict__ dt_bias,
+    const float* __restrict__          A_log,
+    const int* __restrict__            indices,
+    float* __restrict__                state,
+    __hip_bfloat16* __restrict__       output,
+    int batch_size, float scale
+) {
+    gdn_decode_kernel_iasm_sq1_body_opt<2, 8, 4>(
+        query, key, value, a_input, b_input, dt_bias, A_log, indices, state, output, batch_size, scale);
+}
+
+// NVB=4 low occupancy variant: more registers available
+__global__
+__launch_bounds__(BLOCK_THREADS, 2)
+__attribute__((amdgpu_waves_per_eu(2, 4)))
+void gdn_decode_kernel_iasm_tp8_nvh8_sq1_nvb4_opt_lb2(
+    const __hip_bfloat16* __restrict__ query,
+    const __hip_bfloat16* __restrict__ key,
+    const __hip_bfloat16* __restrict__ value,
+    const __hip_bfloat16* __restrict__ a_input,
+    const __hip_bfloat16* __restrict__ b_input,
+    const __hip_bfloat16* __restrict__ dt_bias,
+    const float* __restrict__          A_log,
+    const int* __restrict__            indices,
+    float* __restrict__                state,
+    __hip_bfloat16* __restrict__       output,
+    int batch_size, float scale
+) {
+    gdn_decode_kernel_iasm_sq1_body_opt<2, 8, 4>(
+        query, key, value, a_input, b_input, dt_bias, A_log, indices, state, output, batch_size, scale);
+}
+
+// BS=1 hyper-optimized variants
+__global__
+__launch_bounds__(BLOCK_THREADS, 4)
+__attribute__((amdgpu_waves_per_eu(4, 6)))
+void gdn_decode_kernel_iasm_tp8_nvh8_bs1_hyper_nvb4(
+    const __hip_bfloat16* __restrict__ query,
+    const __hip_bfloat16* __restrict__ key,
+    const __hip_bfloat16* __restrict__ value,
+    const __hip_bfloat16* __restrict__ a_input,
+    const __hip_bfloat16* __restrict__ b_input,
+    const __hip_bfloat16* __restrict__ dt_bias,
+    const float* __restrict__          A_log,
+    const int* __restrict__            indices,
+    float* __restrict__                state,
+    __hip_bfloat16* __restrict__       output,
+    float scale
+) {
+    gdn_decode_kernel_bs1_hyper_opt<2, 8, 4>(
+        query, key, value, a_input, b_input, dt_bias, A_log, indices, state, output, scale);
+}
+
+__global__
+__launch_bounds__(BLOCK_THREADS, 6)
+__attribute__((amdgpu_waves_per_eu(6, 8)))
+void gdn_decode_kernel_iasm_tp8_nvh8_bs1_hyper_nvb4_lb6(
+    const __hip_bfloat16* __restrict__ query,
+    const __hip_bfloat16* __restrict__ key,
+    const __hip_bfloat16* __restrict__ value,
+    const __hip_bfloat16* __restrict__ a_input,
+    const __hip_bfloat16* __restrict__ b_input,
+    const __hip_bfloat16* __restrict__ dt_bias,
+    const float* __restrict__          A_log,
+    const int* __restrict__            indices,
+    float* __restrict__                state,
+    __hip_bfloat16* __restrict__       output,
+    float scale
+) {
+    gdn_decode_kernel_bs1_hyper_opt<2, 8, 4>(
+        query, key, value, a_input, b_input, dt_bias, A_log, indices, state, output, scale);
+}
+
+// BS=1 extreme ASM variants
+__global__
+__launch_bounds__(BLOCK_THREADS, 4)
+__attribute__((amdgpu_waves_per_eu(4, 6)))
+void gdn_decode_kernel_iasm_tp8_nvh8_bs1_extreme_nvb4(
+    const __hip_bfloat16* __restrict__ query,
+    const __hip_bfloat16* __restrict__ key,
+    const __hip_bfloat16* __restrict__ value,
+    const __hip_bfloat16* __restrict__ a_input,
+    const __hip_bfloat16* __restrict__ b_input,
+    const __hip_bfloat16* __restrict__ dt_bias,
+    const float* __restrict__          A_log,
+    const int* __restrict__            indices,
+    float* __restrict__                state,
+    __hip_bfloat16* __restrict__       output,
+    float scale
+) {
+    gdn_decode_kernel_bs1_extreme_asm<2, 8, 4>(
+        query, key, value, a_input, b_input, dt_bias, A_log, indices, state, output, scale);
+}
+
+__global__
+__launch_bounds__(BLOCK_THREADS, 6)
+__attribute__((amdgpu_waves_per_eu(6, 8)))
+void gdn_decode_kernel_iasm_tp8_nvh8_bs1_extreme_nvb4_lb6(
+    const __hip_bfloat16* __restrict__ query,
+    const __hip_bfloat16* __restrict__ key,
+    const __hip_bfloat16* __restrict__ value,
+    const __hip_bfloat16* __restrict__ a_input,
+    const __hip_bfloat16* __restrict__ b_input,
+    const __hip_bfloat16* __restrict__ dt_bias,
+    const float* __restrict__          A_log,
+    const int* __restrict__            indices,
+    float* __restrict__                state,
+    __hip_bfloat16* __restrict__       output,
+    float scale
+) {
+    gdn_decode_kernel_bs1_extreme_asm<2, 8, 4>(
+        query, key, value, a_input, b_input, dt_bias, A_log, indices, state, output, scale);
+}
+
+// BS=1 ultra-optimized variants
+__global__
+__launch_bounds__(BLOCK_THREADS, 4)
+__attribute__((amdgpu_waves_per_eu(4, 6)))
+void gdn_decode_kernel_iasm_tp8_nvh8_bs1_ultra_nvb4(
+    const __hip_bfloat16* __restrict__ query,
+    const __hip_bfloat16* __restrict__ key,
+    const __hip_bfloat16* __restrict__ value,
+    const __hip_bfloat16* __restrict__ a_input,
+    const __hip_bfloat16* __restrict__ b_input,
+    const __hip_bfloat16* __restrict__ dt_bias,
+    const float* __restrict__          A_log,
+    const int* __restrict__            indices,
+    float* __restrict__                state,
+    __hip_bfloat16* __restrict__       output,
+    float scale
+) {
+    gdn_decode_kernel_bs1_ultra_opt<2, 8, 4>(
+        query, key, value, a_input, b_input, dt_bias, A_log, indices, state, output, scale);
+}
+
+__global__
+__launch_bounds__(BLOCK_THREADS, 6)
+__attribute__((amdgpu_waves_per_eu(6, 8)))
+void gdn_decode_kernel_iasm_tp8_nvh8_bs1_ultra_nvb4_lb6(
+    const __hip_bfloat16* __restrict__ query,
+    const __hip_bfloat16* __restrict__ key,
+    const __hip_bfloat16* __restrict__ value,
+    const __hip_bfloat16* __restrict__ a_input,
+    const __hip_bfloat16* __restrict__ b_input,
+    const __hip_bfloat16* __restrict__ dt_bias,
+    const float* __restrict__          A_log,
+    const int* __restrict__            indices,
+    float* __restrict__                state,
+    __hip_bfloat16* __restrict__       output,
+    float scale
+) {
+    gdn_decode_kernel_bs1_ultra_opt<2, 8, 4>(
+        query, key, value, a_input, b_input, dt_bias, A_log, indices, state, output, scale);
+}
+
+// NVB=4 high occupancy variant
+__global__
+__launch_bounds__(BLOCK_THREADS, 6)
+__attribute__((amdgpu_waves_per_eu(6, 8)))
+void gdn_decode_kernel_iasm_tp8_nvh8_sq1_nvb4_opt_lb6(
+    const __hip_bfloat16* __restrict__ query,
+    const __hip_bfloat16* __restrict__ key,
+    const __hip_bfloat16* __restrict__ value,
+    const __hip_bfloat16* __restrict__ a_input,
+    const __hip_bfloat16* __restrict__ b_input,
+    const __hip_bfloat16* __restrict__ dt_bias,
+    const float* __restrict__          A_log,
+    const int* __restrict__            indices,
+    float* __restrict__                state,
+    __hip_bfloat16* __restrict__       output,
+    int batch_size, float scale
+) {
+    gdn_decode_kernel_iasm_sq1_body_opt<2, 8, 4>(
+        query, key, value, a_input, b_input, dt_bias, A_log, indices, state, output, batch_size, scale);
+}
+
 // ── Sorted variants: accept batch_perm for indirect I/O indexing ──
 // indices must be pre-sorted; batch_perm maps sorted position → original batch position
 __global__
@@ -1901,6 +3280,290 @@ void launch_gdn_decode_iasm_nvh8_streaming(
     dim3 grid(batch_size * 8);
     dim3 block(BLOCK_THREADS);
     hipLaunchKernelGGL(gdn_decode_kernel_iasm_tp8_nvh8_sq1_nvb1_streaming, dim3(grid), dim3(block), 0, stream,
+        reinterpret_cast<const __hip_bfloat16*>(query),
+        reinterpret_cast<const __hip_bfloat16*>(key),
+        reinterpret_cast<const __hip_bfloat16*>(value),
+        reinterpret_cast<const __hip_bfloat16*>(a_input),
+        reinterpret_cast<const __hip_bfloat16*>(b_input),
+        reinterpret_cast<const __hip_bfloat16*>(dt_bias),
+        reinterpret_cast<const float*>(A_log),
+        reinterpret_cast<const int*>(indices),
+        reinterpret_cast<float*>(state),
+        reinterpret_cast<__hip_bfloat16*>(output),
+        batch_size, scale);
+}
+
+// ============================================================
+// Optimized NVH=8 launchers: latency hiding + v_dot2_f32_bf16
+// ============================================================
+// BS=1 hyper-optimized launchers
+extern "C"
+void launch_gdn_decode_iasm_nvh8_bs1_hyper(
+    const void* query, const void* key, const void* value,
+    const void* a_input, const void* b_input, const void* dt_bias,
+    const void* A_log, const void* indices,
+    void* state, void* output,
+    float scale,
+    hipStream_t stream
+) {
+    dim3 grid(8 * 4);
+    dim3 block(BLOCK_THREADS);
+    hipLaunchKernelGGL(gdn_decode_kernel_iasm_tp8_nvh8_bs1_hyper_nvb4, dim3(grid), dim3(block), 0, stream,
+        reinterpret_cast<const __hip_bfloat16*>(query),
+        reinterpret_cast<const __hip_bfloat16*>(key),
+        reinterpret_cast<const __hip_bfloat16*>(value),
+        reinterpret_cast<const __hip_bfloat16*>(a_input),
+        reinterpret_cast<const __hip_bfloat16*>(b_input),
+        reinterpret_cast<const __hip_bfloat16*>(dt_bias),
+        reinterpret_cast<const float*>(A_log),
+        reinterpret_cast<const int*>(indices),
+        reinterpret_cast<float*>(state),
+        reinterpret_cast<__hip_bfloat16*>(output),
+        scale);
+}
+
+extern "C"
+void launch_gdn_decode_iasm_nvh8_bs1_hyper_lb6(
+    const void* query, const void* key, const void* value,
+    const void* a_input, const void* b_input, const void* dt_bias,
+    const void* A_log, const void* indices,
+    void* state, void* output,
+    float scale,
+    hipStream_t stream
+) {
+    dim3 grid(8 * 4);
+    dim3 block(BLOCK_THREADS);
+    hipLaunchKernelGGL(gdn_decode_kernel_iasm_tp8_nvh8_bs1_hyper_nvb4_lb6, dim3(grid), dim3(block), 0, stream,
+        reinterpret_cast<const __hip_bfloat16*>(query),
+        reinterpret_cast<const __hip_bfloat16*>(key),
+        reinterpret_cast<const __hip_bfloat16*>(value),
+        reinterpret_cast<const __hip_bfloat16*>(a_input),
+        reinterpret_cast<const __hip_bfloat16*>(b_input),
+        reinterpret_cast<const __hip_bfloat16*>(dt_bias),
+        reinterpret_cast<const float*>(A_log),
+        reinterpret_cast<const int*>(indices),
+        reinterpret_cast<float*>(state),
+        reinterpret_cast<__hip_bfloat16*>(output),
+        scale);
+}
+
+// BS=1 extreme ASM launchers
+extern "C"
+void launch_gdn_decode_iasm_nvh8_bs1_extreme(
+    const void* query, const void* key, const void* value,
+    const void* a_input, const void* b_input, const void* dt_bias,
+    const void* A_log, const void* indices,
+    void* state, void* output,
+    float scale,
+    hipStream_t stream
+) {
+    dim3 grid(8 * 4);  // NVH * NUM_V_BLOCKS
+    dim3 block(BLOCK_THREADS);
+    hipLaunchKernelGGL(gdn_decode_kernel_iasm_tp8_nvh8_bs1_extreme_nvb4, dim3(grid), dim3(block), 0, stream,
+        reinterpret_cast<const __hip_bfloat16*>(query),
+        reinterpret_cast<const __hip_bfloat16*>(key),
+        reinterpret_cast<const __hip_bfloat16*>(value),
+        reinterpret_cast<const __hip_bfloat16*>(a_input),
+        reinterpret_cast<const __hip_bfloat16*>(b_input),
+        reinterpret_cast<const __hip_bfloat16*>(dt_bias),
+        reinterpret_cast<const float*>(A_log),
+        reinterpret_cast<const int*>(indices),
+        reinterpret_cast<float*>(state),
+        reinterpret_cast<__hip_bfloat16*>(output),
+        scale);
+}
+
+extern "C"
+void launch_gdn_decode_iasm_nvh8_bs1_extreme_lb6(
+    const void* query, const void* key, const void* value,
+    const void* a_input, const void* b_input, const void* dt_bias,
+    const void* A_log, const void* indices,
+    void* state, void* output,
+    float scale,
+    hipStream_t stream
+) {
+    dim3 grid(8 * 4);
+    dim3 block(BLOCK_THREADS);
+    hipLaunchKernelGGL(gdn_decode_kernel_iasm_tp8_nvh8_bs1_extreme_nvb4_lb6, dim3(grid), dim3(block), 0, stream,
+        reinterpret_cast<const __hip_bfloat16*>(query),
+        reinterpret_cast<const __hip_bfloat16*>(key),
+        reinterpret_cast<const __hip_bfloat16*>(value),
+        reinterpret_cast<const __hip_bfloat16*>(a_input),
+        reinterpret_cast<const __hip_bfloat16*>(b_input),
+        reinterpret_cast<const __hip_bfloat16*>(dt_bias),
+        reinterpret_cast<const float*>(A_log),
+        reinterpret_cast<const int*>(indices),
+        reinterpret_cast<float*>(state),
+        reinterpret_cast<__hip_bfloat16*>(output),
+        scale);
+}
+
+// BS=1 ultra-optimized launchers
+extern "C"
+void launch_gdn_decode_iasm_nvh8_bs1_ultra(
+    const void* query, const void* key, const void* value,
+    const void* a_input, const void* b_input, const void* dt_bias,
+    const void* A_log, const void* indices,
+    void* state, void* output,
+    float scale,
+    hipStream_t stream
+) {
+    // BS=1 with nvb=4 -> 32 blocks
+    dim3 grid(8 * 4);  // NVH * NUM_V_BLOCKS
+    dim3 block(BLOCK_THREADS);
+    hipLaunchKernelGGL(gdn_decode_kernel_iasm_tp8_nvh8_bs1_ultra_nvb4, dim3(grid), dim3(block), 0, stream,
+        reinterpret_cast<const __hip_bfloat16*>(query),
+        reinterpret_cast<const __hip_bfloat16*>(key),
+        reinterpret_cast<const __hip_bfloat16*>(value),
+        reinterpret_cast<const __hip_bfloat16*>(a_input),
+        reinterpret_cast<const __hip_bfloat16*>(b_input),
+        reinterpret_cast<const __hip_bfloat16*>(dt_bias),
+        reinterpret_cast<const float*>(A_log),
+        reinterpret_cast<const int*>(indices),
+        reinterpret_cast<float*>(state),
+        reinterpret_cast<__hip_bfloat16*>(output),
+        scale);
+}
+
+extern "C"
+void launch_gdn_decode_iasm_nvh8_bs1_ultra_lb6(
+    const void* query, const void* key, const void* value,
+    const void* a_input, const void* b_input, const void* dt_bias,
+    const void* A_log, const void* indices,
+    void* state, void* output,
+    float scale,
+    hipStream_t stream
+) {
+    dim3 grid(8 * 4);
+    dim3 block(BLOCK_THREADS);
+    hipLaunchKernelGGL(gdn_decode_kernel_iasm_tp8_nvh8_bs1_ultra_nvb4_lb6, dim3(grid), dim3(block), 0, stream,
+        reinterpret_cast<const __hip_bfloat16*>(query),
+        reinterpret_cast<const __hip_bfloat16*>(key),
+        reinterpret_cast<const __hip_bfloat16*>(value),
+        reinterpret_cast<const __hip_bfloat16*>(a_input),
+        reinterpret_cast<const __hip_bfloat16*>(b_input),
+        reinterpret_cast<const __hip_bfloat16*>(dt_bias),
+        reinterpret_cast<const float*>(A_log),
+        reinterpret_cast<const int*>(indices),
+        reinterpret_cast<float*>(state),
+        reinterpret_cast<__hip_bfloat16*>(output),
+        scale);
+}
+
+extern "C"
+void launch_gdn_decode_iasm_nvh8_nvb2_opt(
+    const void* query, const void* key, const void* value,
+    const void* a_input, const void* b_input, const void* dt_bias,
+    const void* A_log, const void* indices,
+    void* state, void* output,
+    int batch_size, float scale,
+    hipStream_t stream
+) {
+    dim3 grid(batch_size * 8 * 2);
+    dim3 block(BLOCK_THREADS);
+    hipLaunchKernelGGL(gdn_decode_kernel_iasm_tp8_nvh8_sq1_nvb2_opt, dim3(grid), dim3(block), 0, stream,
+        reinterpret_cast<const __hip_bfloat16*>(query),
+        reinterpret_cast<const __hip_bfloat16*>(key),
+        reinterpret_cast<const __hip_bfloat16*>(value),
+        reinterpret_cast<const __hip_bfloat16*>(a_input),
+        reinterpret_cast<const __hip_bfloat16*>(b_input),
+        reinterpret_cast<const __hip_bfloat16*>(dt_bias),
+        reinterpret_cast<const float*>(A_log),
+        reinterpret_cast<const int*>(indices),
+        reinterpret_cast<float*>(state),
+        reinterpret_cast<__hip_bfloat16*>(output),
+        batch_size, scale);
+}
+
+extern "C"
+void launch_gdn_decode_iasm_nvh8_opt(
+    const void* query, const void* key, const void* value,
+    const void* a_input, const void* b_input, const void* dt_bias,
+    const void* A_log, const void* indices,
+    void* state, void* output,
+    int batch_size, float scale,
+    hipStream_t stream
+) {
+    // nvb=2 for small batch, more parallelism
+    dim3 grid(batch_size * 8 * 2);
+    dim3 block(BLOCK_THREADS);
+    hipLaunchKernelGGL(gdn_decode_kernel_iasm_tp8_nvh8_sq1_opt, dim3(grid), dim3(block), 0, stream,
+        reinterpret_cast<const __hip_bfloat16*>(query),
+        reinterpret_cast<const __hip_bfloat16*>(key),
+        reinterpret_cast<const __hip_bfloat16*>(value),
+        reinterpret_cast<const __hip_bfloat16*>(a_input),
+        reinterpret_cast<const __hip_bfloat16*>(b_input),
+        reinterpret_cast<const __hip_bfloat16*>(dt_bias),
+        reinterpret_cast<const float*>(A_log),
+        reinterpret_cast<const int*>(indices),
+        reinterpret_cast<float*>(state),
+        reinterpret_cast<__hip_bfloat16*>(output),
+        batch_size, scale);
+}
+
+extern "C"
+void launch_gdn_decode_iasm_nvh8_nvb4_opt(
+    const void* query, const void* key, const void* value,
+    const void* a_input, const void* b_input, const void* dt_bias,
+    const void* A_log, const void* indices,
+    void* state, void* output,
+    int batch_size, float scale,
+    hipStream_t stream
+) {
+    // nvb=4 for BS=1: maximum parallelism (32 blocks)
+    dim3 grid(batch_size * 8 * 4);
+    dim3 block(BLOCK_THREADS);
+    hipLaunchKernelGGL(gdn_decode_kernel_iasm_tp8_nvh8_sq1_nvb4_opt, dim3(grid), dim3(block), 0, stream,
+        reinterpret_cast<const __hip_bfloat16*>(query),
+        reinterpret_cast<const __hip_bfloat16*>(key),
+        reinterpret_cast<const __hip_bfloat16*>(value),
+        reinterpret_cast<const __hip_bfloat16*>(a_input),
+        reinterpret_cast<const __hip_bfloat16*>(b_input),
+        reinterpret_cast<const __hip_bfloat16*>(dt_bias),
+        reinterpret_cast<const float*>(A_log),
+        reinterpret_cast<const int*>(indices),
+        reinterpret_cast<float*>(state),
+        reinterpret_cast<__hip_bfloat16*>(output),
+        batch_size, scale);
+}
+
+extern "C"
+void launch_gdn_decode_iasm_nvh8_nvb4_opt_lb2(
+    const void* query, const void* key, const void* value,
+    const void* a_input, const void* b_input, const void* dt_bias,
+    const void* A_log, const void* indices,
+    void* state, void* output,
+    int batch_size, float scale,
+    hipStream_t stream
+) {
+    dim3 grid(batch_size * 8 * 4);
+    dim3 block(BLOCK_THREADS);
+    hipLaunchKernelGGL(gdn_decode_kernel_iasm_tp8_nvh8_sq1_nvb4_opt_lb2, dim3(grid), dim3(block), 0, stream,
+        reinterpret_cast<const __hip_bfloat16*>(query),
+        reinterpret_cast<const __hip_bfloat16*>(key),
+        reinterpret_cast<const __hip_bfloat16*>(value),
+        reinterpret_cast<const __hip_bfloat16*>(a_input),
+        reinterpret_cast<const __hip_bfloat16*>(b_input),
+        reinterpret_cast<const __hip_bfloat16*>(dt_bias),
+        reinterpret_cast<const float*>(A_log),
+        reinterpret_cast<const int*>(indices),
+        reinterpret_cast<float*>(state),
+        reinterpret_cast<__hip_bfloat16*>(output),
+        batch_size, scale);
+}
+
+extern "C"
+void launch_gdn_decode_iasm_nvh8_nvb4_opt_lb6(
+    const void* query, const void* key, const void* value,
+    const void* a_input, const void* b_input, const void* dt_bias,
+    const void* A_log, const void* indices,
+    void* state, void* output,
+    int batch_size, float scale,
+    hipStream_t stream
+) {
+    dim3 grid(batch_size * 8 * 4);
+    dim3 block(BLOCK_THREADS);
+    hipLaunchKernelGGL(gdn_decode_kernel_iasm_tp8_nvh8_sq1_nvb4_opt_lb6, dim3(grid), dim3(block), 0, stream,
         reinterpret_cast<const __hip_bfloat16*>(query),
         reinterpret_cast<const __hip_bfloat16*>(key),
         reinterpret_cast<const __hip_bfloat16*>(value),

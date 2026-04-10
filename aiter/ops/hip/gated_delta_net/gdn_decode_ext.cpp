@@ -147,6 +147,105 @@ void launch_gdn_decode_iasm_nvh8_streaming(
     hipStream_t stream
 );
 
+void launch_gdn_decode_iasm_nvh8_bs1_hyper(
+    const void* query, const void* key, const void* value,
+    const void* a_input, const void* b_input, const void* dt_bias,
+    const void* A_log, const void* indices,
+    void* state, void* output,
+    float scale,
+    hipStream_t stream
+);
+
+void launch_gdn_decode_iasm_nvh8_bs1_hyper_lb6(
+    const void* query, const void* key, const void* value,
+    const void* a_input, const void* b_input, const void* dt_bias,
+    const void* A_log, const void* indices,
+    void* state, void* output,
+    float scale,
+    hipStream_t stream
+);
+
+void launch_gdn_decode_iasm_nvh8_bs1_extreme(
+    const void* query, const void* key, const void* value,
+    const void* a_input, const void* b_input, const void* dt_bias,
+    const void* A_log, const void* indices,
+    void* state, void* output,
+    float scale,
+    hipStream_t stream
+);
+
+void launch_gdn_decode_iasm_nvh8_bs1_extreme_lb6(
+    const void* query, const void* key, const void* value,
+    const void* a_input, const void* b_input, const void* dt_bias,
+    const void* A_log, const void* indices,
+    void* state, void* output,
+    float scale,
+    hipStream_t stream
+);
+
+void launch_gdn_decode_iasm_nvh8_bs1_ultra(
+    const void* query, const void* key, const void* value,
+    const void* a_input, const void* b_input, const void* dt_bias,
+    const void* A_log, const void* indices,
+    void* state, void* output,
+    float scale,
+    hipStream_t stream
+);
+
+void launch_gdn_decode_iasm_nvh8_bs1_ultra_lb6(
+    const void* query, const void* key, const void* value,
+    const void* a_input, const void* b_input, const void* dt_bias,
+    const void* A_log, const void* indices,
+    void* state, void* output,
+    float scale,
+    hipStream_t stream
+);
+
+void launch_gdn_decode_iasm_nvh8_opt(
+    const void* query, const void* key, const void* value,
+    const void* a_input, const void* b_input, const void* dt_bias,
+    const void* A_log, const void* indices,
+    void* state, void* output,
+    int batch_size, float scale,
+    hipStream_t stream
+);
+
+void launch_gdn_decode_iasm_nvh8_nvb2_opt(
+    const void* query, const void* key, const void* value,
+    const void* a_input, const void* b_input, const void* dt_bias,
+    const void* A_log, const void* indices,
+    void* state, void* output,
+    int batch_size, float scale,
+    hipStream_t stream
+);
+
+void launch_gdn_decode_iasm_nvh8_nvb4_opt(
+    const void* query, const void* key, const void* value,
+    const void* a_input, const void* b_input, const void* dt_bias,
+    const void* A_log, const void* indices,
+    void* state, void* output,
+    int batch_size, float scale,
+    hipStream_t stream
+);
+
+void launch_gdn_decode_iasm_nvh8_nvb4_opt_lb2(
+    const void* query, const void* key, const void* value,
+    const void* a_input, const void* b_input, const void* dt_bias,
+    const void* A_log, const void* indices,
+    void* state, void* output,
+    int batch_size, float scale,
+    hipStream_t stream
+);
+
+void launch_gdn_decode_iasm_nvh8_nvb4_opt_lb6(
+    const void* query, const void* key, const void* value,
+    const void* a_input, const void* b_input, const void* dt_bias,
+    const void* A_log, const void* indices,
+    void* state, void* output,
+    int batch_size, float scale,
+    hipStream_t stream
+);
+
 void launch_gdn_decode_fused(
     const void* query, const void* key, const void* value,
     const void* a_input, const void* b_input, const void* dt_bias,
@@ -379,7 +478,105 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     DEF_NVH8_VARIANT("hip_gdn_nvh8_nvb1_lb4", launch_gdn_decode_iasm_nvh8_nvb1_lb4);
     DEF_NVH8_VARIANT("hip_gdn_nvh8_nvb1_lb2w2", launch_gdn_decode_iasm_nvh8_nvb1_lb2w2);
     DEF_NVH8_VARIANT("hip_gdn_nvh8_streaming", launch_gdn_decode_iasm_nvh8_streaming);
+    // Optimized variants: latency hiding
+    DEF_NVH8_VARIANT("hip_gdn_nvh8_opt", launch_gdn_decode_iasm_nvh8_opt);
+    DEF_NVH8_VARIANT("hip_gdn_nvh8_nvb2_opt", launch_gdn_decode_iasm_nvh8_nvb2_opt);
+    DEF_NVH8_VARIANT("hip_gdn_nvh8_nvb4_opt", launch_gdn_decode_iasm_nvh8_nvb4_opt);
+    DEF_NVH8_VARIANT("hip_gdn_nvh8_nvb4_opt_lb2", launch_gdn_decode_iasm_nvh8_nvb4_opt_lb2);
+    DEF_NVH8_VARIANT("hip_gdn_nvh8_nvb4_opt_lb6", launch_gdn_decode_iasm_nvh8_nvb4_opt_lb6);
     #undef DEF_NVH8_VARIANT
+
+    // BS=1 ultra-optimized variants (no batch_size param)
+    m.def("hip_gdn_nvh8_bs1_ultra", [](
+        torch::Tensor query, torch::Tensor key, torch::Tensor value,
+        torch::Tensor a, torch::Tensor b, torch::Tensor dt_bias,
+        torch::Tensor A_log, torch::Tensor indices,
+        torch::Tensor state, torch::Tensor output,
+        float scale
+    ) {
+        auto stream = at::hip::getCurrentHIPStream().stream();
+        launch_gdn_decode_iasm_nvh8_bs1_ultra(
+            query.data_ptr(), key.data_ptr(), value.data_ptr(),
+            a.data_ptr(), b.data_ptr(), dt_bias.data_ptr(),
+            A_log.data_ptr(), indices.data_ptr(),
+            state.data_ptr(), output.data_ptr(),
+            scale, stream);
+    });
+    m.def("hip_gdn_nvh8_bs1_hyper", [](
+        torch::Tensor query, torch::Tensor key, torch::Tensor value,
+        torch::Tensor a, torch::Tensor b, torch::Tensor dt_bias,
+        torch::Tensor A_log, torch::Tensor indices,
+        torch::Tensor state, torch::Tensor output,
+        float scale
+    ) {
+        auto stream = at::hip::getCurrentHIPStream().stream();
+        launch_gdn_decode_iasm_nvh8_bs1_hyper(
+            query.data_ptr(), key.data_ptr(), value.data_ptr(),
+            a.data_ptr(), b.data_ptr(), dt_bias.data_ptr(),
+            A_log.data_ptr(), indices.data_ptr(),
+            state.data_ptr(), output.data_ptr(),
+            scale, stream);
+    });
+    m.def("hip_gdn_nvh8_bs1_hyper_lb6", [](
+        torch::Tensor query, torch::Tensor key, torch::Tensor value,
+        torch::Tensor a, torch::Tensor b, torch::Tensor dt_bias,
+        torch::Tensor A_log, torch::Tensor indices,
+        torch::Tensor state, torch::Tensor output,
+        float scale
+    ) {
+        auto stream = at::hip::getCurrentHIPStream().stream();
+        launch_gdn_decode_iasm_nvh8_bs1_hyper_lb6(
+            query.data_ptr(), key.data_ptr(), value.data_ptr(),
+            a.data_ptr(), b.data_ptr(), dt_bias.data_ptr(),
+            A_log.data_ptr(), indices.data_ptr(),
+            state.data_ptr(), output.data_ptr(),
+            scale, stream);
+    });
+    m.def("hip_gdn_nvh8_bs1_extreme", [](
+        torch::Tensor query, torch::Tensor key, torch::Tensor value,
+        torch::Tensor a, torch::Tensor b, torch::Tensor dt_bias,
+        torch::Tensor A_log, torch::Tensor indices,
+        torch::Tensor state, torch::Tensor output,
+        float scale
+    ) {
+        auto stream = at::hip::getCurrentHIPStream().stream();
+        launch_gdn_decode_iasm_nvh8_bs1_extreme(
+            query.data_ptr(), key.data_ptr(), value.data_ptr(),
+            a.data_ptr(), b.data_ptr(), dt_bias.data_ptr(),
+            A_log.data_ptr(), indices.data_ptr(),
+            state.data_ptr(), output.data_ptr(),
+            scale, stream);
+    });
+    m.def("hip_gdn_nvh8_bs1_extreme_lb6", [](
+        torch::Tensor query, torch::Tensor key, torch::Tensor value,
+        torch::Tensor a, torch::Tensor b, torch::Tensor dt_bias,
+        torch::Tensor A_log, torch::Tensor indices,
+        torch::Tensor state, torch::Tensor output,
+        float scale
+    ) {
+        auto stream = at::hip::getCurrentHIPStream().stream();
+        launch_gdn_decode_iasm_nvh8_bs1_extreme_lb6(
+            query.data_ptr(), key.data_ptr(), value.data_ptr(),
+            a.data_ptr(), b.data_ptr(), dt_bias.data_ptr(),
+            A_log.data_ptr(), indices.data_ptr(),
+            state.data_ptr(), output.data_ptr(),
+            scale, stream);
+    });
+    m.def("hip_gdn_nvh8_bs1_ultra_lb6", [](
+        torch::Tensor query, torch::Tensor key, torch::Tensor value,
+        torch::Tensor a, torch::Tensor b, torch::Tensor dt_bias,
+        torch::Tensor A_log, torch::Tensor indices,
+        torch::Tensor state, torch::Tensor output,
+        float scale
+    ) {
+        auto stream = at::hip::getCurrentHIPStream().stream();
+        launch_gdn_decode_iasm_nvh8_bs1_ultra_lb6(
+            query.data_ptr(), key.data_ptr(), value.data_ptr(),
+            a.data_ptr(), b.data_ptr(), dt_bias.data_ptr(),
+            A_log.data_ptr(), indices.data_ptr(),
+            state.data_ptr(), output.data_ptr(),
+            scale, stream);
+    });
 
     m.def("hip_gdn_decode_kv4_inplace", [](
         torch::Tensor query, torch::Tensor key, torch::Tensor value,
