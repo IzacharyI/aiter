@@ -24,6 +24,21 @@ __device__ __forceinline__ float as_float(int v) {
 __device__ __forceinline__ int as_int(float v) {
     union { float f; int i; } u; u.f = v; return u.i;
 }
+
+// ds_swizzle Manual mode (rocwmma Ctrl::Manual<xormask,0,0x1f>): same cross-lane xor as
+// __shfl_xor / ds_bpermute @ (lane^d)<<2; still LDS-backed (lgkmcnt) but often faster than ds_bpermute on CDNA3.
+constexpr unsigned kDsSwizzleXor1 = (1u << 10) | 0x1fu; // 0x041f
+constexpr unsigned kDsSwizzleXor2 = (2u << 10) | 0x1fu; // 0x081f
+constexpr unsigned kDsSwizzleXor4 = (4u << 10) | 0x1fu; // 0x101f
+
+template <unsigned SwPat>
+__device__ __forceinline__ float ds_swizzle_xor_f32(float v) {
+    union { float f; int i; } u;
+    u.f = v;
+    u.i = __builtin_amdgcn_ds_swizzle(u.i, SwPat);
+    return u.f;
+}
+
 __device__ __forceinline__ float shfl_xor(float val, int offset) {
     int lane = threadIdx.x % WARP_SIZE;
     return as_float(__builtin_amdgcn_ds_bpermute((lane ^ offset) << 2, as_int(val)));
@@ -32,105 +47,88 @@ __device__ __forceinline__ float shfl_idx(float val, int src) {
     return as_float(__builtin_amdgcn_ds_bpermute(src << 2, as_int(val)));
 }
 __device__ __forceinline__ float reduce_sum_k(float val) {
-    val += shfl_xor(val, 1);
-    val += shfl_xor(val, 2);
-    val += shfl_xor(val, 4);
+    val += ds_swizzle_xor_f32<kDsSwizzleXor1>(val);
+    val += ds_swizzle_xor_f32<kDsSwizzleXor2>(val);
+    val += ds_swizzle_xor_f32<kDsSwizzleXor4>(val);
     return val;
 }
 
 // ============================================================
-// Inline ASM reduce helpers: guaranteed 8-way ds_bpermute
-// interleaving with precise s_waitcnt
+// K-lane xor reductions: ds_swizzle Manual xor1/xor2/xor4 (replaces ds_bpermute for fixed shuffles)
+// Indexed shuffles (leader broadcast) still use ds_bpermute — see shfl_idx_*
+// Signature keeps (a1,a2,a4) for call-site compatibility; xor shuffles ignore them.
 // ============================================================
 __device__ __forceinline__ void reduce_8way_asm(
     float& v0, float& v1, float& v2, float& v3,
     float& v4, float& v5, float& v6, float& v7,
     int a1, int a2, int a4)
 {
+    (void)a1;
+    (void)a2;
+    (void)a4;
     float t0, t1, t2, t3, t4, t5, t6, t7;
-    asm volatile(
-        "ds_bpermute_b32 %0, %16, %8\n"
-        "ds_bpermute_b32 %1, %16, %9\n"
-        "ds_bpermute_b32 %2, %16, %10\n"
-        "ds_bpermute_b32 %3, %16, %11\n"
-        "ds_bpermute_b32 %4, %16, %12\n"
-        "ds_bpermute_b32 %5, %16, %13\n"
-        "ds_bpermute_b32 %6, %16, %14\n"
-        "ds_bpermute_b32 %7, %16, %15\n"
-        "s_waitcnt lgkmcnt(0)\n"
-        "v_add_f32 %8, %8, %0\n"
-        "v_add_f32 %9, %9, %1\n"
-        "v_add_f32 %10, %10, %2\n"
-        "v_add_f32 %11, %11, %3\n"
-        "v_add_f32 %12, %12, %4\n"
-        "v_add_f32 %13, %13, %5\n"
-        "v_add_f32 %14, %14, %6\n"
-        "v_add_f32 %15, %15, %7\n"
-        "ds_bpermute_b32 %0, %17, %8\n"
-        "ds_bpermute_b32 %1, %17, %9\n"
-        "ds_bpermute_b32 %2, %17, %10\n"
-        "ds_bpermute_b32 %3, %17, %11\n"
-        "ds_bpermute_b32 %4, %17, %12\n"
-        "ds_bpermute_b32 %5, %17, %13\n"
-        "ds_bpermute_b32 %6, %17, %14\n"
-        "ds_bpermute_b32 %7, %17, %15\n"
-        "s_waitcnt lgkmcnt(0)\n"
-        "v_add_f32 %8, %8, %0\n"
-        "v_add_f32 %9, %9, %1\n"
-        "v_add_f32 %10, %10, %2\n"
-        "v_add_f32 %11, %11, %3\n"
-        "v_add_f32 %12, %12, %4\n"
-        "v_add_f32 %13, %13, %5\n"
-        "v_add_f32 %14, %14, %6\n"
-        "v_add_f32 %15, %15, %7\n"
-        "ds_bpermute_b32 %0, %18, %8\n"
-        "ds_bpermute_b32 %1, %18, %9\n"
-        "ds_bpermute_b32 %2, %18, %10\n"
-        "ds_bpermute_b32 %3, %18, %11\n"
-        "ds_bpermute_b32 %4, %18, %12\n"
-        "ds_bpermute_b32 %5, %18, %13\n"
-        "ds_bpermute_b32 %6, %18, %14\n"
-        "ds_bpermute_b32 %7, %18, %15\n"
-        "s_waitcnt lgkmcnt(0)\n"
-        "v_add_f32 %8, %8, %0\n"
-        "v_add_f32 %9, %9, %1\n"
-        "v_add_f32 %10, %10, %2\n"
-        "v_add_f32 %11, %11, %3\n"
-        "v_add_f32 %12, %12, %4\n"
-        "v_add_f32 %13, %13, %5\n"
-        "v_add_f32 %14, %14, %6\n"
-        "v_add_f32 %15, %15, %7\n"
-        : "=&v"(t0), "=&v"(t1), "=&v"(t2), "=&v"(t3),
-          "=&v"(t4), "=&v"(t5), "=&v"(t6), "=&v"(t7),
-          "+v"(v0), "+v"(v1), "+v"(v2), "+v"(v3),
-          "+v"(v4), "+v"(v5), "+v"(v6), "+v"(v7)
-        : "v"(a1), "v"(a2), "v"(a4)
-    );
+    t0 = ds_swizzle_xor_f32<kDsSwizzleXor1>(v0);
+    t1 = ds_swizzle_xor_f32<kDsSwizzleXor1>(v1);
+    t2 = ds_swizzle_xor_f32<kDsSwizzleXor1>(v2);
+    t3 = ds_swizzle_xor_f32<kDsSwizzleXor1>(v3);
+    t4 = ds_swizzle_xor_f32<kDsSwizzleXor1>(v4);
+    t5 = ds_swizzle_xor_f32<kDsSwizzleXor1>(v5);
+    t6 = ds_swizzle_xor_f32<kDsSwizzleXor1>(v6);
+    t7 = ds_swizzle_xor_f32<kDsSwizzleXor1>(v7);
+    v0 += t0;
+    v1 += t1;
+    v2 += t2;
+    v3 += t3;
+    v4 += t4;
+    v5 += t5;
+    v6 += t6;
+    v7 += t7;
+    t0 = ds_swizzle_xor_f32<kDsSwizzleXor2>(v0);
+    t1 = ds_swizzle_xor_f32<kDsSwizzleXor2>(v1);
+    t2 = ds_swizzle_xor_f32<kDsSwizzleXor2>(v2);
+    t3 = ds_swizzle_xor_f32<kDsSwizzleXor2>(v3);
+    t4 = ds_swizzle_xor_f32<kDsSwizzleXor2>(v4);
+    t5 = ds_swizzle_xor_f32<kDsSwizzleXor2>(v5);
+    t6 = ds_swizzle_xor_f32<kDsSwizzleXor2>(v6);
+    t7 = ds_swizzle_xor_f32<kDsSwizzleXor2>(v7);
+    v0 += t0;
+    v1 += t1;
+    v2 += t2;
+    v3 += t3;
+    v4 += t4;
+    v5 += t5;
+    v6 += t6;
+    v7 += t7;
+    t0 = ds_swizzle_xor_f32<kDsSwizzleXor4>(v0);
+    t1 = ds_swizzle_xor_f32<kDsSwizzleXor4>(v1);
+    t2 = ds_swizzle_xor_f32<kDsSwizzleXor4>(v2);
+    t3 = ds_swizzle_xor_f32<kDsSwizzleXor4>(v3);
+    t4 = ds_swizzle_xor_f32<kDsSwizzleXor4>(v4);
+    t5 = ds_swizzle_xor_f32<kDsSwizzleXor4>(v5);
+    t6 = ds_swizzle_xor_f32<kDsSwizzleXor4>(v6);
+    t7 = ds_swizzle_xor_f32<kDsSwizzleXor4>(v7);
+    v0 += t0;
+    v1 += t1;
+    v2 += t2;
+    v3 += t3;
+    v4 += t4;
+    v5 += t5;
+    v6 += t6;
+    v7 += t7;
 }
 
 __device__ __forceinline__ void reduce_2way_asm(
     float& v0, float& v1, int a1, int a2, int a4)
 {
-    float t0, t1;
-    asm volatile(
-        "ds_bpermute_b32 %0, %4, %2\n"
-        "ds_bpermute_b32 %1, %4, %3\n"
-        "s_waitcnt lgkmcnt(0)\n"
-        "v_add_f32 %2, %2, %0\n"
-        "v_add_f32 %3, %3, %1\n"
-        "ds_bpermute_b32 %0, %5, %2\n"
-        "ds_bpermute_b32 %1, %5, %3\n"
-        "s_waitcnt lgkmcnt(0)\n"
-        "v_add_f32 %2, %2, %0\n"
-        "v_add_f32 %3, %3, %1\n"
-        "ds_bpermute_b32 %0, %6, %2\n"
-        "ds_bpermute_b32 %1, %6, %3\n"
-        "s_waitcnt lgkmcnt(0)\n"
-        "v_add_f32 %2, %2, %0\n"
-        "v_add_f32 %3, %3, %1\n"
-        : "=&v"(t0), "=&v"(t1), "+v"(v0), "+v"(v1)
-        : "v"(a1), "v"(a2), "v"(a4)
-    );
+    (void)a1;
+    (void)a2;
+    (void)a4;
+    v0 += ds_swizzle_xor_f32<kDsSwizzleXor1>(v0);
+    v1 += ds_swizzle_xor_f32<kDsSwizzleXor1>(v1);
+    v0 += ds_swizzle_xor_f32<kDsSwizzleXor2>(v0);
+    v1 += ds_swizzle_xor_f32<kDsSwizzleXor2>(v1);
+    v0 += ds_swizzle_xor_f32<kDsSwizzleXor4>(v0);
+    v1 += ds_swizzle_xor_f32<kDsSwizzleXor4>(v1);
 }
 
 __device__ __forceinline__ void shfl_idx_4way_asm(
@@ -151,59 +149,46 @@ __device__ __forceinline__ void shfl_idx_4way_asm(
 
 __device__ __forceinline__ void reduce_1way_asm(float& v0, int a1, int a2, int a4)
 {
-    float t0;
-    asm volatile(
-        "ds_bpermute_b32 %0, %2, %1\n"
-        "s_waitcnt lgkmcnt(0)\n"
-        "v_add_f32 %1, %1, %0\n"
-        "ds_bpermute_b32 %0, %3, %1\n"
-        "s_waitcnt lgkmcnt(0)\n"
-        "v_add_f32 %1, %1, %0\n"
-        "ds_bpermute_b32 %0, %4, %1\n"
-        "s_waitcnt lgkmcnt(0)\n"
-        "v_add_f32 %1, %1, %0\n"
-        : "=&v"(t0), "+v"(v0)
-        : "v"(a1), "v"(a2), "v"(a4)
-    );
+    (void)a1;
+    (void)a2;
+    (void)a4;
+    v0 += ds_swizzle_xor_f32<kDsSwizzleXor1>(v0);
+    v0 += ds_swizzle_xor_f32<kDsSwizzleXor2>(v0);
+    v0 += ds_swizzle_xor_f32<kDsSwizzleXor4>(v0);
 }
 
 __device__ __forceinline__ void reduce_4way_asm(
     float& v0, float& v1, float& v2, float& v3,
     int a1, int a2, int a4)
 {
+    (void)a1;
+    (void)a2;
+    (void)a4;
     float t0, t1, t2, t3;
-    asm volatile(
-        "ds_bpermute_b32 %0, %8, %4\n"
-        "ds_bpermute_b32 %1, %8, %5\n"
-        "ds_bpermute_b32 %2, %8, %6\n"
-        "ds_bpermute_b32 %3, %8, %7\n"
-        "s_waitcnt lgkmcnt(0)\n"
-        "v_add_f32 %4, %4, %0\n"
-        "v_add_f32 %5, %5, %1\n"
-        "v_add_f32 %6, %6, %2\n"
-        "v_add_f32 %7, %7, %3\n"
-        "ds_bpermute_b32 %0, %9, %4\n"
-        "ds_bpermute_b32 %1, %9, %5\n"
-        "ds_bpermute_b32 %2, %9, %6\n"
-        "ds_bpermute_b32 %3, %9, %7\n"
-        "s_waitcnt lgkmcnt(0)\n"
-        "v_add_f32 %4, %4, %0\n"
-        "v_add_f32 %5, %5, %1\n"
-        "v_add_f32 %6, %6, %2\n"
-        "v_add_f32 %7, %7, %3\n"
-        "ds_bpermute_b32 %0, %10, %4\n"
-        "ds_bpermute_b32 %1, %10, %5\n"
-        "ds_bpermute_b32 %2, %10, %6\n"
-        "ds_bpermute_b32 %3, %10, %7\n"
-        "s_waitcnt lgkmcnt(0)\n"
-        "v_add_f32 %4, %4, %0\n"
-        "v_add_f32 %5, %5, %1\n"
-        "v_add_f32 %6, %6, %2\n"
-        "v_add_f32 %7, %7, %3\n"
-        : "=&v"(t0), "=&v"(t1), "=&v"(t2), "=&v"(t3),
-          "+v"(v0), "+v"(v1), "+v"(v2), "+v"(v3)
-        : "v"(a1), "v"(a2), "v"(a4)
-    );
+    t0 = ds_swizzle_xor_f32<kDsSwizzleXor1>(v0);
+    t1 = ds_swizzle_xor_f32<kDsSwizzleXor1>(v1);
+    t2 = ds_swizzle_xor_f32<kDsSwizzleXor1>(v2);
+    t3 = ds_swizzle_xor_f32<kDsSwizzleXor1>(v3);
+    v0 += t0;
+    v1 += t1;
+    v2 += t2;
+    v3 += t3;
+    t0 = ds_swizzle_xor_f32<kDsSwizzleXor2>(v0);
+    t1 = ds_swizzle_xor_f32<kDsSwizzleXor2>(v1);
+    t2 = ds_swizzle_xor_f32<kDsSwizzleXor2>(v2);
+    t3 = ds_swizzle_xor_f32<kDsSwizzleXor2>(v3);
+    v0 += t0;
+    v1 += t1;
+    v2 += t2;
+    v3 += t3;
+    t0 = ds_swizzle_xor_f32<kDsSwizzleXor4>(v0);
+    t1 = ds_swizzle_xor_f32<kDsSwizzleXor4>(v1);
+    t2 = ds_swizzle_xor_f32<kDsSwizzleXor4>(v2);
+    t3 = ds_swizzle_xor_f32<kDsSwizzleXor4>(v3);
+    v0 += t0;
+    v1 += t1;
+    v2 += t2;
+    v3 += t3;
 }
 
 __device__ __forceinline__ void shfl_idx_2way_asm(
@@ -232,25 +217,33 @@ __device__ __forceinline__ float fast_log1p(float x) {
     return log1pf(x);
 }
 
-// Fused reduce: 3-level butterfly with minimal waitcnt
+// Fused reduce: 3-level butterfly (ds_swizzle xor1/xor2/xor4)
 __device__ __forceinline__ void reduce_1way_fast_asm(float& v, int a1, int a2, int a4) {
-    float t;
-    asm volatile(
-        // Level 1: xor with 1
-        "ds_bpermute_b32 %0, %2, %1\n"
-        "s_waitcnt lgkmcnt(0)\n"
-        "v_add_f32 %1, %1, %0\n"
-        // Level 2: xor with 2
-        "ds_bpermute_b32 %0, %3, %1\n"
-        "s_waitcnt lgkmcnt(0)\n"
-        "v_add_f32 %1, %1, %0\n"
-        // Level 3: xor with 4
-        "ds_bpermute_b32 %0, %4, %1\n"
-        "s_waitcnt lgkmcnt(0)\n"
-        "v_add_f32 %1, %1, %0\n"
-        : "=&v"(t), "+v"(v)
-        : "v"(a1), "v"(a2), "v"(a4)
-    );
+    (void)a1;
+    (void)a2;
+    (void)a4;
+    v += ds_swizzle_xor_f32<kDsSwizzleXor1>(v);
+    v += ds_swizzle_xor_f32<kDsSwizzleXor2>(v);
+    v += ds_swizzle_xor_f32<kDsSwizzleXor4>(v);
+}
+
+// Post-loop fused reduce for SQ1 + NVB=4 (V_ITERS=4): pack dot_kq + partial hk/hq into one 8-way + one 1-way.
+__device__ __forceinline__ void reduce_postloop_viters4_fused_asm(
+    float& dot_kq, float (&res_hk)[4], float (&res_hq)[4], int /*tid*/)
+{
+    float r0 = dot_kq;
+    float r1 = res_hk[0], r2 = res_hk[1], r3 = res_hk[2], r4 = res_hk[3];
+    float r5 = res_hq[0], r6 = res_hq[1], r7 = res_hq[2];
+    reduce_8way_asm(r0, r1, r2, r3, r4, r5, r6, r7, 0, 0, 0);
+    dot_kq = r0;
+    res_hk[0] = r1;
+    res_hk[1] = r2;
+    res_hk[2] = r3;
+    res_hk[3] = r4;
+    res_hq[0] = r5;
+    res_hq[1] = r6;
+    res_hq[2] = r7;
+    reduce_1way_fast_asm(res_hq[3], 0, 0, 0);
 }
 
 // Ultra-fast exp2 using inline ASM (single v_exp_f32 instruction after scaling)
@@ -272,6 +265,13 @@ __device__ __forceinline__ float asm_rsqrt(float x) {
     float r;
     asm volatile("v_rsq_f32 %0, %1" : "=v"(r) : "v"(x));
     return r;
+}
+
+// Issue two v_rsq_f32 after L2 norm is final; overlap results with unrelated VALU.
+__device__ __forceinline__ void asm_rsqrt_pair_issue(
+    float sq_q_eps, float sq_k_eps, float& inv_rsq_q, float& inv_rsq_k) {
+    asm volatile("v_rsq_f32 %0, %1" : "=v"(inv_rsq_q) : "v"(sq_q_eps));
+    asm volatile("v_rsq_f32 %0, %1" : "=v"(inv_rsq_k) : "v"(sq_k_eps));
 }
 
 // Ultra-fast rcp using inline ASM
@@ -350,6 +350,12 @@ __device__ __forceinline__ void asm_waitcnt_vmcnt(int n) {
     }
 }
 
+template <int Vmcnt>
+__device__ __forceinline__ void s_waitcnt_vmcnt_imm() {
+    static_assert(Vmcnt >= 0 && Vmcnt <= 63, "vmcnt immediate out of range");
+    asm volatile("s_waitcnt vmcnt(%0)\n" : : "n"(Vmcnt) : "memory");
+}
+
 // ============================================================
 // Advanced ASM: Fused multiply-accumulate (v_fmac_f32)
 // dst = dst + src0 * src1 (in-place accumulate)
@@ -360,6 +366,15 @@ __device__ __forceinline__ void asm_fmac(float& dst, float src0, float src1) {
         : "+v"(dst)
         : "v"(src0), "v"(src1)
     );
+}
+
+// BF16 pair dot in float: a0*b0 + a1*b1 + acc (math-equivalent to v_dot2_f32_bf16 when available).
+// ROCm 7.2 / LLVM AMDGPU rejects inline "v_dot2_f32_bf16" for gfx942 (instruction is gfx950+ in this toolchain).
+__device__ __forceinline__ float bf16_pair_dot_accum(uint32_t a, uint32_t b, float acc) {
+    const __hip_bfloat16* pa = reinterpret_cast<const __hip_bfloat16*>(&a);
+    const __hip_bfloat16* pb = reinterpret_cast<const __hip_bfloat16*>(&b);
+    return __fmaf_rn(__bfloat162float(pa[0]), __bfloat162float(pb[0]),
+                     __fmaf_rn(__bfloat162float(pa[1]), __bfloat162float(pb[1]), acc));
 }
 
 // ============================================================
@@ -727,7 +742,10 @@ __device__ __forceinline__ void gdn_decode_kernel_bs1_extreme_asm(
 
     reduce_2way_asm(sq_q, sq_k, xor1, xor2, xor4);
 
-    // Unpack state
+    float inv_sq_q, inv_sq_k;
+    asm_rsqrt_pair_issue(sq_q + 1e-6f, sq_k + 1e-6f, inv_sq_q, inv_sq_k);
+
+    // Unpack state while v_rsq_f32 completes
     float S[V_ITERS][K_ITERS][VEC_K];
     #pragma unroll
     for (int vi = 0; vi < V_ITERS; vi++) {
@@ -740,9 +758,6 @@ __device__ __forceinline__ void gdn_decode_kernel_bs1_extreme_asm(
         }
     }
 
-    // Normalization using ASM rsqrt
-    const float inv_sq_q = asm_rsqrt(sq_q + 1e-6f);
-    const float inv_sq_k = asm_rsqrt(sq_k + 1e-6f);
     const float qs = scale * inv_sq_q;
     const float ks = inv_sq_k;
 
@@ -964,10 +979,15 @@ __device__ __forceinline__ void gdn_decode_kernel_bs1_ultra_opt(
     // Reduce L2 norms across K threads
     reduce_2way_asm(sq_q, sq_k, xor1, xor2, xor4);
 
+    const float sq_q_eps = sq_q + 1e-6f;
+    const float sq_k_eps = sq_k + 1e-6f;
+    float inv_rsq_q, inv_rsq_k;
+    asm_rsqrt_pair_issue(sq_q_eps, sq_k_eps, inv_rsq_q, inv_rsq_k);
+
     // ═══════════════════════════════════════════════════════════
-    // PHASE 4: Unpack state and apply normalization
+    // PHASE 4: Unpack state while v_rsq_f32 is in flight
     // ═══════════════════════════════════════════════════════════
-    
+
     float S[V_ITERS][K_ITERS][VEC_K];
     #pragma unroll
     for (int vi = 0; vi < V_ITERS; vi++) {
@@ -980,11 +1000,8 @@ __device__ __forceinline__ void gdn_decode_kernel_bs1_ultra_opt(
         }
     }
 
-    // Apply rsqrt with FMA
-    const float inv_sq_q = __frsqrt_rn(sq_q + 1e-6f);
-    const float inv_sq_k = __frsqrt_rn(sq_k + 1e-6f);
-    const float qs = scale * inv_sq_q;
-    const float ks = inv_sq_k;
+    const float qs = scale * inv_rsq_q;
+    const float ks = inv_rsq_k;
 
     // Normalize cached Q/K
     #pragma unroll
@@ -1119,8 +1136,10 @@ __device__ __forceinline__ void gdn_decode_kernel_bs1_ultra_opt(
 // - State loads issued early with delayed waitcnt
 // - rsqrt latency hidden by overlapping gating computation
 // - v_dot2_f32_bf16 for L2 norm
+// - FUSE_POST_REDUCE: NVB=4 fused post-loop reduce (fewer xor rounds when enabled).
 // ============================================================
-template <int NKH, int NVH, int NUM_V_BLOCKS>
+template <int NKH, int NVH, int NUM_V_BLOCKS, bool VmWaitSched = false, int FIXED_BATCH_SIZE = 0,
+          bool FUSE_POST_REDUCE = false>
 __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body_opt(
     const __hip_bfloat16* __restrict__ query,
     const __hip_bfloat16* __restrict__ key,
@@ -1152,7 +1171,11 @@ __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body_opt(
     const int hv_idx = b_hv % NVH;
     const int hk_idx = hv_idx / (NVH / NKH);
 
-    if (batch_idx >= batch_size) return;
+    if constexpr (int(FIXED_BATCH_SIZE) > 0) {
+        __builtin_assume(batch_idx >= 0 && batch_idx < int(FIXED_BATCH_SIZE));
+    } else {
+        if (batch_idx >= batch_size) return;
+    }
     const int pool_idx = indices[batch_idx];
     if (pool_idx < 0) return;
     const int io_bid = batch_perm ? batch_perm[batch_idx] : batch_idx;
@@ -1193,6 +1216,14 @@ __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body_opt(
     float b_val = __bfloat162float(b_input[ab]);
     float beta = __frcp_rn(1.0f + __expf(-b_val));
 
+    if constexpr (VmWaitSched) {
+        constexpr int N_STATE = V_ITERS * K_ITERS;
+        constexpr int POST_GATE_VMCNT =
+            (N_STATE >= 16) ? (N_STATE - 8) : (N_STATE >= 2 ? (N_STATE - 2) : 0);
+        if constexpr (POST_GATE_VMCNT > 0)
+            s_waitcnt_vmcnt_imm<POST_GATE_VMCNT>();
+    }
+
     // ── Phase 3: Load Q/K, cache values, and compute L2 norm ──
     const auto* qb = query + (int64_t)io_bid * NKH * HEAD_K_DIM + hk_idx * HEAD_K_DIM;
     const auto* kb = key + (int64_t)io_bid * NKH * HEAD_K_DIM + hk_idx * HEAD_K_DIM;
@@ -1221,7 +1252,14 @@ __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body_opt(
     // ── Phase 4: Reduce L2 norms across warp ──
     reduce_2way_asm(sq_q, sq_k, xor1, xor2, xor4);
 
-    // ── Now unpack state loads (loads should be complete by now) ──
+    float inv_rsq_q, inv_rsq_k;
+    asm_rsqrt_pair_issue(sq_q + 1e-6f, sq_k + 1e-6f, inv_rsq_q, inv_rsq_k);
+
+    if constexpr (VmWaitSched) {
+        s_waitcnt_vmcnt_imm<0>();
+    }
+
+    // ── Unpack state loads while v_rsq_f32 completes ──
     #pragma unroll
     for (int vi = 0; vi < V_ITERS; vi++) {
         #pragma unroll
@@ -1233,9 +1271,9 @@ __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body_opt(
         }
     }
 
-    // ── Phase 5: Compute rsqrt and scale cached Q/K ──
-    const float qs = scale * __frsqrt_rn(sq_q + 1e-6f);
-    const float ks = __frsqrt_rn(sq_k + 1e-6f);
+    // ── Phase 5: Scale cached Q/K ──
+    const float qs = scale * inv_rsq_q;
+    const float ks = inv_rsq_k;
 
     // Apply normalization to cached values
     #pragma unroll
@@ -1272,18 +1310,22 @@ __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body_opt(
             }
         }
     }
-    reduce_1way_asm(dot_kq, xor1, xor2, xor4);
-
-    if constexpr (V_ITERS == 4) {
-        reduce_8way_asm(
-            res_hk[0], res_hk[1], res_hk[2], res_hk[3],
-            res_hq[0], res_hq[1], res_hq[2], res_hq[3],
-            xor1, xor2, xor4);
-    } else if constexpr (V_ITERS == 2) {
-        reduce_4way_asm(res_hk[0], res_hk[1], res_hq[0], res_hq[1], xor1, xor2, xor4);
+    if constexpr (FUSE_POST_REDUCE && V_ITERS == 4) {
+        reduce_postloop_viters4_fused_asm(dot_kq, res_hk, res_hq, tid);
     } else {
-        // V_ITERS == 1
-        reduce_2way_asm(res_hk[0], res_hq[0], xor1, xor2, xor4);
+        reduce_1way_asm(dot_kq, xor1, xor2, xor4);
+
+        if constexpr (V_ITERS == 4) {
+            reduce_8way_asm(
+                res_hk[0], res_hk[1], res_hk[2], res_hk[3],
+                res_hq[0], res_hq[1], res_hq[2], res_hq[3],
+                xor1, xor2, xor4);
+        } else if constexpr (V_ITERS == 2) {
+            reduce_4way_asm(res_hk[0], res_hk[1], res_hq[0], res_hq[1], xor1, xor2, xor4);
+        } else {
+            // V_ITERS == 1
+            reduce_2way_asm(res_hk[0], res_hq[0], xor1, xor2, xor4);
+        }
     }
 
     // ── Phase 7: Apply gating and delta update ──
@@ -1351,7 +1393,8 @@ __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body_opt(
 }
 
 // Forwarding overload
-template <int NKH, int NVH, int NUM_V_BLOCKS>
+template <int NKH, int NVH, int NUM_V_BLOCKS, bool VmWaitSched = false, int FIXED_BATCH_SIZE = 0,
+          bool FUSE_POST_REDUCE = false>
 __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body_opt(
     const __hip_bfloat16* __restrict__ query,
     const __hip_bfloat16* __restrict__ key,
@@ -1365,7 +1408,259 @@ __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body_opt(
     __hip_bfloat16* __restrict__       output,
     int batch_size, float scale
 ) {
-    gdn_decode_kernel_iasm_sq1_body_opt<NKH, NVH, NUM_V_BLOCKS>(
+    gdn_decode_kernel_iasm_sq1_body_opt<NKH, NVH, NUM_V_BLOCKS, VmWaitSched, FIXED_BATCH_SIZE,
+                                        FUSE_POST_REDUCE>(
+        query, key, value, a_input, b_input, dt_bias, A_log, indices,
+        state, output, (const int*)nullptr, batch_size, scale);
+}
+
+// ── dot2_opt: v_dot2_f32_bf16 for L2 + raw Q·K (NKH=2 NVH=8 NVB=2 path) ──
+template <int NKH, int NVH, int NUM_V_BLOCKS>
+__device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body_dot2_opt(
+    const __hip_bfloat16* __restrict__ query,
+    const __hip_bfloat16* __restrict__ key,
+    const __hip_bfloat16* __restrict__ value,
+    const __hip_bfloat16* __restrict__ a_input,
+    const __hip_bfloat16* __restrict__ b_input,
+    const __hip_bfloat16* __restrict__ dt_bias,
+    const float* __restrict__          A_log,
+    const int* __restrict__            indices,
+    float* __restrict__                state,
+    __hip_bfloat16* __restrict__       output,
+    const int* __restrict__            batch_perm,
+    int batch_size, float scale
+) {
+    constexpr int TILE_V = HEAD_V_DIM / NUM_V_BLOCKS;
+    constexpr int WARP_GROUP_TILE_V = NUM_WARPS * WARP_V_THREADS;
+    constexpr int V_ITERS = TILE_V / WARP_GROUP_TILE_V;
+    constexpr int PAIR_K = VEC_K / 2;
+
+    const int tid = threadIdx.x;
+    const int lane_id = tid % WARP_SIZE;
+    const int warp_id = tid / WARP_SIZE;
+    const int k_tid = lane_id % WARP_K_THREADS;
+    const int v_tid = lane_id / WARP_K_THREADS;
+
+    const int b_hv_vb = blockIdx.x;
+    const int v_block_id = b_hv_vb % NUM_V_BLOCKS;
+    const int b_hv = b_hv_vb / NUM_V_BLOCKS;
+    const int batch_idx = b_hv / NVH;
+    const int hv_idx = b_hv % NVH;
+    const int hk_idx = hv_idx / (NVH / NKH);
+
+    if (batch_idx >= batch_size) return;
+    const int pool_idx = indices[batch_idx];
+    if (pool_idx < 0) return;
+    const int io_bid = batch_perm ? batch_perm[batch_idx] : batch_idx;
+
+    const int warp_k_vec_start = k_tid * VEC_K;
+    const int global_v_base = v_block_id * TILE_V + warp_id * WARP_V_THREADS + v_tid;
+    const int leader_addr = ((lane_id / WARP_K_THREADS) * WARP_K_THREADS) << 2;
+
+    const int xor1 = (lane_id ^ 1) << 2;
+    const int xor2 = (lane_id ^ 2) << 2;
+    const int xor4 = (lane_id ^ 4) << 2;
+
+    float S[V_ITERS][K_ITERS][VEC_K];
+    const int shs = HEAD_V_DIM * HEAD_K_DIM;
+    float* sb = state + (int64_t)pool_idx * NVH * shs + hv_idx * shs;
+
+    float4 S_load[V_ITERS][K_ITERS];
+    #pragma unroll
+    for (int vi = 0; vi < V_ITERS; vi++) {
+        int gv = global_v_base + vi * WARP_GROUP_TILE_V;
+        #pragma unroll
+        for (int ki = 0; ki < K_ITERS; ki++) {
+            S_load[vi][ki] = *reinterpret_cast<const float4*>(
+                sb + gv * HEAD_K_DIM + warp_k_vec_start + ki * WARP_TILE_K);
+        }
+    }
+
+    const int ab = io_bid * NVH + hv_idx;
+    float a_val = __bfloat162float(a_input[ab]);
+    float dt_val = __bfloat162float(dt_bias[hv_idx]);
+    float x = a_val + dt_val;
+    float sp = (x <= 20.0f) ? __logf(1.0f + __expf(x)) : x;
+    float A_log_val = A_log[hv_idx];
+    float exp_g = __expf(-__expf(A_log_val) * sp);
+    float b_val = __bfloat162float(b_input[ab]);
+    float beta = __frcp_rn(1.0f + __expf(-b_val));
+
+    const auto* qb = query + (int64_t)io_bid * NKH * HEAD_K_DIM + hk_idx * HEAD_K_DIM;
+    const auto* kb = key + (int64_t)io_bid * NKH * HEAD_K_DIM + hk_idx * HEAD_K_DIM;
+    const auto* vb = value + (int64_t)io_bid * NVH * HEAD_V_DIM + hv_idx * HEAD_V_DIM;
+
+    uint32_t Qpk[K_ITERS][PAIR_K];
+    uint32_t Kpk[K_ITERS][PAIR_K];
+    float Q_cache[K_ITERS][VEC_K];
+    float K_cache[K_ITERS][VEC_K];
+    float sq_q = 0.0f;
+    float sq_k = 0.0f;
+
+    #pragma unroll
+    for (int ki = 0; ki < K_ITERS; ki++) {
+        int ko = warp_k_vec_start + ki * WARP_TILE_K;
+        #pragma unroll
+        for (int jp = 0; jp < PAIR_K; jp++) {
+            uint32_t pq = *reinterpret_cast<const uint32_t*>(qb + ko + jp * 2);
+            uint32_t pk = *reinterpret_cast<const uint32_t*>(kb + ko + jp * 2);
+            Qpk[ki][jp] = pq;
+            Kpk[ki][jp] = pk;
+            sq_q = bf16_pair_dot_accum(pq, pq, sq_q);
+            sq_k = bf16_pair_dot_accum(pk, pk, sq_k);
+        }
+    }
+
+    reduce_2way_asm(sq_q, sq_k, xor1, xor2, xor4);
+
+    float inv_rsq_q, inv_rsq_k;
+    asm_rsqrt_pair_issue(sq_q + 1e-6f, sq_k + 1e-6f, inv_rsq_q, inv_rsq_k);
+
+    #pragma unroll
+    for (int vi = 0; vi < V_ITERS; vi++) {
+        #pragma unroll
+        for (int ki = 0; ki < K_ITERS; ki++) {
+            S[vi][ki][0] = S_load[vi][ki].x;
+            S[vi][ki][1] = S_load[vi][ki].y;
+            S[vi][ki][2] = S_load[vi][ki].z;
+            S[vi][ki][3] = S_load[vi][ki].w;
+        }
+    }
+
+    const float qs = scale * inv_rsq_q;
+    const float ks = inv_rsq_k;
+
+    #pragma unroll
+    for (int ki = 0; ki < K_ITERS; ki++) {
+        #pragma unroll
+        for (int jp = 0; jp < PAIR_K; jp++) {
+            const __hip_bfloat16* qh = reinterpret_cast<const __hip_bfloat16*>(&Qpk[ki][jp]);
+            const __hip_bfloat16* kh = reinterpret_cast<const __hip_bfloat16*>(&Kpk[ki][jp]);
+            Q_cache[ki][jp * 2]     = qs * __bfloat162float(qh[0]);
+            Q_cache[ki][jp * 2 + 1] = qs * __bfloat162float(qh[1]);
+            K_cache[ki][jp * 2]     = ks * __bfloat162float(kh[0]);
+            K_cache[ki][jp * 2 + 1] = ks * __bfloat162float(kh[1]);
+        }
+    }
+
+    float res_hk[V_ITERS];
+    float res_hq[V_ITERS];
+    #pragma unroll
+    for (int vi = 0; vi < V_ITERS; vi++) {
+        res_hk[vi] = 0.0f;
+        res_hq[vi] = 0.0f;
+    }
+
+    float raw_dot = 0.0f;
+    #pragma unroll
+    for (int ki = 0; ki < K_ITERS; ki++) {
+        #pragma unroll
+        for (int jp = 0; jp < PAIR_K; jp++) {
+            raw_dot = bf16_pair_dot_accum(Qpk[ki][jp], Kpk[ki][jp], raw_dot);
+        }
+    }
+    reduce_1way_asm(raw_dot, xor1, xor2, xor4);
+    const float dot_kq = qs * ks * raw_dot;
+
+    #pragma unroll
+    for (int ki = 0; ki < K_ITERS; ki++) {
+        #pragma unroll
+        for (int j = 0; j < VEC_K; j++) {
+            float qv = Q_cache[ki][j];
+            float kv = K_cache[ki][j];
+            #pragma unroll
+            for (int vi = 0; vi < V_ITERS; vi++) {
+                res_hk[vi] = __fmaf_rn(S[vi][ki][j], kv, res_hk[vi]);
+                res_hq[vi] = __fmaf_rn(S[vi][ki][j], qv, res_hq[vi]);
+            }
+        }
+    }
+
+    if constexpr (V_ITERS == 4) {
+        reduce_8way_asm(
+            res_hk[0], res_hk[1], res_hk[2], res_hk[3],
+            res_hq[0], res_hq[1], res_hq[2], res_hq[3],
+            xor1, xor2, xor4);
+    } else if constexpr (V_ITERS == 2) {
+        reduce_4way_asm(res_hk[0], res_hk[1], res_hq[0], res_hq[1], xor1, xor2, xor4);
+    } else {
+        reduce_2way_asm(res_hk[0], res_hq[0], xor1, xor2, xor4);
+    }
+
+    #pragma unroll
+    for (int vi = 0; vi < V_ITERS; vi++) {
+        res_hk[vi] *= exp_g;
+        res_hq[vi] *= exp_g;
+    }
+
+    float vn[V_ITERS];
+    if constexpr (V_ITERS == 4) {
+        float tmp0 = (__bfloat162float(vb[global_v_base + 0 * WARP_GROUP_TILE_V]) - res_hk[0]) * beta;
+        float tmp1 = (__bfloat162float(vb[global_v_base + 1 * WARP_GROUP_TILE_V]) - res_hk[1]) * beta;
+        float tmp2 = (__bfloat162float(vb[global_v_base + 2 * WARP_GROUP_TILE_V]) - res_hk[2]) * beta;
+        float tmp3 = (__bfloat162float(vb[global_v_base + 3 * WARP_GROUP_TILE_V]) - res_hk[3]) * beta;
+        shfl_idx_4way_asm(vn[0], vn[1], vn[2], vn[3], tmp0, tmp1, tmp2, tmp3, leader_addr);
+    } else if constexpr (V_ITERS == 2) {
+        float tmp0 = (__bfloat162float(vb[global_v_base + 0 * WARP_GROUP_TILE_V]) - res_hk[0]) * beta;
+        float tmp1 = (__bfloat162float(vb[global_v_base + 1 * WARP_GROUP_TILE_V]) - res_hk[1]) * beta;
+        shfl_idx_2way_asm(vn[0], vn[1], tmp0, tmp1, leader_addr);
+    } else {
+        float tmp0 = (__bfloat162float(vb[global_v_base]) - res_hk[0]) * beta;
+        vn[0] = shfl_idx(tmp0, leader_addr >> 2);
+    }
+
+    #pragma unroll
+    for (int vi = 0; vi < V_ITERS; vi++) {
+        res_hq[vi] = __fmaf_rn(vn[vi], dot_kq, res_hq[vi]);
+    }
+
+    if (k_tid == 0) {
+        const int64_t out_base = (int64_t)io_bid * NVH * HEAD_V_DIM
+                               + hv_idx * HEAD_V_DIM + global_v_base;
+        #pragma unroll
+        for (int vi = 0; vi < V_ITERS; vi++) {
+            output[out_base + vi * WARP_GROUP_TILE_V] = __float2bfloat16(res_hq[vi]);
+        }
+    }
+
+    #pragma unroll
+    for (int ki = 0; ki < K_ITERS; ki++) {
+        #pragma unroll
+        for (int j = 0; j < VEC_K; j++) {
+            float kv = K_cache[ki][j];
+            #pragma unroll
+            for (int vi = 0; vi < V_ITERS; vi++) {
+                S[vi][ki][j] = __fmaf_rn(kv, vn[vi], S[vi][ki][j] * exp_g);
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int vi = 0; vi < V_ITERS; vi++) {
+        int gv = global_v_base + vi * WARP_GROUP_TILE_V;
+        #pragma unroll
+        for (int ki = 0; ki < K_ITERS; ki++) {
+            float4 t = {S[vi][ki][0], S[vi][ki][1], S[vi][ki][2], S[vi][ki][3]};
+            *reinterpret_cast<float4*>(sb + gv * HEAD_K_DIM + warp_k_vec_start + ki * WARP_TILE_K) = t;
+        }
+    }
+}
+
+template <int NKH, int NVH, int NUM_V_BLOCKS>
+__device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body_dot2_opt(
+    const __hip_bfloat16* __restrict__ query,
+    const __hip_bfloat16* __restrict__ key,
+    const __hip_bfloat16* __restrict__ value,
+    const __hip_bfloat16* __restrict__ a_input,
+    const __hip_bfloat16* __restrict__ b_input,
+    const __hip_bfloat16* __restrict__ dt_bias,
+    const float* __restrict__          A_log,
+    const int* __restrict__            indices,
+    float* __restrict__                state,
+    __hip_bfloat16* __restrict__       output,
+    int batch_size, float scale
+) {
+    gdn_decode_kernel_iasm_sq1_body_dot2_opt<NKH, NVH, NUM_V_BLOCKS>(
         query, key, value, a_input, b_input, dt_bias, A_log, indices,
         state, output, (const int*)nullptr, batch_size, scale);
 }
@@ -1813,8 +2108,18 @@ void gdn_decode_kernel_tuned(
                         sq_k += k_reg[ki][j] * k_reg[ki][j];
                     }
                 sq_q = reduce_sum_k(sq_q); sq_k = reduce_sum_k(sq_k);
-                float qs = scale * __frsqrt_rn(sq_q + 1e-6f);
-                float ks = __frsqrt_rn(sq_k + 1e-6f);
+                float inv_rsq_q, inv_rsq_k;
+                asm_rsqrt_pair_issue(sq_q + 1e-6f, sq_k + 1e-6f, inv_rsq_q, inv_rsq_k);
+                #pragma unroll
+                for (int vi = 0; vi < V_ITERS; vi++)
+                    res_rv[vi] = __bfloat162float(vb[global_v_base + vi * WARP_GROUP_TILE_V]);
+                #pragma unroll
+                for (int vi = 0; vi < V_ITERS; vi++) {
+                    res_hk[vi] = 0.0f;
+                    res_hq[vi] = 0.0f;
+                }
+                float qs = scale * inv_rsq_q;
+                float ks = inv_rsq_k;
                 #pragma unroll
                 for (int ki = 0; ki < K_ITERS; ki++)
                     #pragma unroll
@@ -1837,16 +2142,15 @@ void gdn_decode_kernel_tuned(
                     dot_kq += k_reg[ki][j] * q_reg[ki][j];
             dot_kq = reduce_sum_k(dot_kq);
 
-            // Prefetch ALL v values before FMA loop
-            #pragma unroll
-            for (int vi = 0; vi < V_ITERS; vi++)
-                res_rv[vi] = __bfloat162float(vb[global_v_base + vi * WARP_GROUP_TILE_V]);
-
-            // All dot products with max ILP: vi as innermost loop
-            #pragma unroll
-            for (int vi = 0; vi < V_ITERS; vi++) {
-                res_hk[vi] = 0.0f;
-                res_hq[vi] = 0.0f;
+            if constexpr (!USE_QK_L2NORM) {
+                #pragma unroll
+                for (int vi = 0; vi < V_ITERS; vi++)
+                    res_rv[vi] = __bfloat162float(vb[global_v_base + vi * WARP_GROUP_TILE_V]);
+                #pragma unroll
+                for (int vi = 0; vi < V_ITERS; vi++) {
+                    res_hk[vi] = 0.0f;
+                    res_hq[vi] = 0.0f;
+                }
             }
 
             #pragma unroll
@@ -2042,8 +2346,18 @@ void gdn_decode_kernel_iasm(
                         sq_k += k_reg[ki][j] * k_reg[ki][j];
                     }
                 reduce_2way_asm(sq_q, sq_k, xor1, xor2, xor4);
-                float qs = scale * __frsqrt_rn(sq_q + 1e-6f);
-                float ks = __frsqrt_rn(sq_k + 1e-6f);
+                float inv_rsq_q, inv_rsq_k;
+                asm_rsqrt_pair_issue(sq_q + 1e-6f, sq_k + 1e-6f, inv_rsq_q, inv_rsq_k);
+                #pragma unroll
+                for (int vi = 0; vi < V_ITERS; vi++)
+                    res_rv[vi] = __bfloat162float(vb[global_v_base + vi * WARP_GROUP_TILE_V]);
+                #pragma unroll
+                for (int vi = 0; vi < V_ITERS; vi++) {
+                    res_hk[vi] = 0.0f;
+                    res_hq[vi] = 0.0f;
+                }
+                float qs = scale * inv_rsq_q;
+                float ks = inv_rsq_k;
                 #pragma unroll
                 for (int ki = 0; ki < K_ITERS; ki++)
                     #pragma unroll
@@ -2244,8 +2558,8 @@ __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body_streaming(
         }
     }
     reduce_2way_asm(sq_q, sq_k, xor1, xor2, xor4);
-    const float qs = scale * __frsqrt_rn(sq_q + 1e-6f);
-    const float ks = __frsqrt_rn(sq_k + 1e-6f);
+    float inv_rsq_q, inv_rsq_k;
+    asm_rsqrt_pair_issue(sq_q + 1e-6f, sq_k + 1e-6f, inv_rsq_q, inv_rsq_k);
 
     float dot_kq = 0.0f;
     float res_hk[V_ITERS];
@@ -2255,6 +2569,9 @@ __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body_streaming(
         res_hk[vi] = 0.0f;
         res_hq[vi] = 0.0f;
     }
+
+    const float qs = scale * inv_rsq_q;
+    const float ks = inv_rsq_k;
 
     // Forward pass: stream S per-ki instead of holding all S[4][4][4]
     #pragma unroll
@@ -2364,7 +2681,8 @@ __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body_streaming(
         state, output, (const int*)nullptr, batch_size, scale);
 }
 
-template <int NKH, int NVH, int NUM_V_BLOCKS>
+// FIXED_BATCH_SIZE>0: BS is known at compile time (__builtin_assume for idx); omit runtime batch bound.
+template <int NKH, int NVH, int NUM_V_BLOCKS, int FIXED_BATCH_SIZE = 0>
 __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body(
     const __hip_bfloat16* __restrict__ query,
     const __hip_bfloat16* __restrict__ key,
@@ -2396,7 +2714,11 @@ __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body(
     const int hv_idx = b_hv % NVH;
     const int hk_idx = hv_idx / (NVH / NKH);
 
-    if (batch_idx >= batch_size) return;
+    if constexpr (FIXED_BATCH_SIZE > 0) {
+        __builtin_assume(batch_idx >= 0 && batch_idx < FIXED_BATCH_SIZE);
+    } else {
+        if (batch_idx >= batch_size) return;
+    }
     const int pool_idx = indices[batch_idx];
     if (pool_idx < 0) return;
     const int io_bid = batch_perm ? batch_perm[batch_idx] : batch_idx;
@@ -2451,8 +2773,8 @@ __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body(
         }
     }
     reduce_2way_asm(sq_q, sq_k, xor1, xor2, xor4);
-    const float qs = scale * __frsqrt_rn(sq_q + 1e-6f);
-    const float ks = __frsqrt_rn(sq_k + 1e-6f);
+    float inv_rsq_q, inv_rsq_k;
+    asm_rsqrt_pair_issue(sq_q + 1e-6f, sq_k + 1e-6f, inv_rsq_q, inv_rsq_k);
 
     float dot_kq = 0.0f;
     float res_hk[V_ITERS];
@@ -2462,6 +2784,9 @@ __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body(
         res_hk[vi] = 0.0f;
         res_hq[vi] = 0.0f;
     }
+
+    const float qs = scale * inv_rsq_q;
+    const float ks = inv_rsq_k;
 
     #pragma unroll
     for (int ki = 0; ki < K_ITERS; ki++) {
@@ -2547,7 +2872,7 @@ __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body(
 }
 
 // Forwarding overload: existing callers pass no batch_perm → nullptr
-template <int NKH, int NVH, int NUM_V_BLOCKS>
+template <int NKH, int NVH, int NUM_V_BLOCKS, int FIXED_BATCH_SIZE = 0>
 __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body(
     const __hip_bfloat16* __restrict__ query,
     const __hip_bfloat16* __restrict__ key,
@@ -2561,7 +2886,7 @@ __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body(
     __hip_bfloat16* __restrict__       output,
     int batch_size, float scale
 ) {
-    gdn_decode_kernel_iasm_sq1_body<NKH, NVH, NUM_V_BLOCKS>(
+    gdn_decode_kernel_iasm_sq1_body<NKH, NVH, NUM_V_BLOCKS, FIXED_BATCH_SIZE>(
         query, key, value, a_input, b_input, dt_bias, A_log, indices,
         state, output, (const int*)nullptr, batch_size, scale);
 }
@@ -2699,6 +3024,27 @@ void gdn_decode_kernel_iasm_tp8_nvh8_sq1_nvb2_opt(
     int batch_size, float scale
 ) {
     gdn_decode_kernel_iasm_sq1_body_opt<2, 8, 2>(
+        query, key, value, a_input, b_input, dt_bias, A_log, indices, state, output, batch_size, scale);
+}
+
+// NKH=2 NVH=8 NVB=2: v_dot2_f32_bf16 for L2 + raw Q·K (same grid/launch bounds as nvb2_opt)
+__global__
+__launch_bounds__(BLOCK_THREADS, 3)
+__attribute__((amdgpu_waves_per_eu(3, 5)))
+void gdn_decode_kernel_dot2_opt(
+    const __hip_bfloat16* __restrict__ query,
+    const __hip_bfloat16* __restrict__ key,
+    const __hip_bfloat16* __restrict__ value,
+    const __hip_bfloat16* __restrict__ a_input,
+    const __hip_bfloat16* __restrict__ b_input,
+    const __hip_bfloat16* __restrict__ dt_bias,
+    const float* __restrict__          A_log,
+    const int* __restrict__            indices,
+    float* __restrict__                state,
+    __hip_bfloat16* __restrict__       output,
+    int batch_size, float scale
+) {
+    gdn_decode_kernel_iasm_sq1_body_dot2_opt<2, 8, 2>(
         query, key, value, a_input, b_input, dt_bias, A_log, indices, state, output, batch_size, scale);
 }
 
@@ -2905,6 +3251,354 @@ void gdn_decode_kernel_iasm_tp8_nvh8_sq1_nvb4_opt_lb6(
     int batch_size, float scale
 ) {
     gdn_decode_kernel_iasm_sq1_body_opt<2, 8, 4>(
+        query, key, value, a_input, b_input, dt_bias, A_log, indices, state, output, batch_size, scale);
+}
+
+__global__
+__launch_bounds__(BLOCK_THREADS, 6)
+__attribute__((amdgpu_waves_per_eu(6, 8)))
+void gdn_decode_kernel_iasm_tp8_nvh8_sq1_nvb4_opt_lb6_vmem(
+    const __hip_bfloat16* __restrict__ query,
+    const __hip_bfloat16* __restrict__ key,
+    const __hip_bfloat16* __restrict__ value,
+    const __hip_bfloat16* __restrict__ a_input,
+    const __hip_bfloat16* __restrict__ b_input,
+    const __hip_bfloat16* __restrict__ dt_bias,
+    const float* __restrict__          A_log,
+    const int* __restrict__            indices,
+    float* __restrict__                state,
+    __hip_bfloat16* __restrict__       output,
+    int batch_size, float scale
+) {
+    gdn_decode_kernel_iasm_sq1_body_opt<2, 8, 4, true>(
+        query, key, value, a_input, b_input, dt_bias, A_log, indices, state, output, batch_size, scale);
+}
+
+__global__
+__launch_bounds__(BLOCK_THREADS, 6)
+__attribute__((amdgpu_waves_per_eu(6, 8)))
+void gdn_decode_kernel_iasm_tp8_nvh8_sq1_nvb4_opt_lb6_fusepost(
+    const __hip_bfloat16* __restrict__ query,
+    const __hip_bfloat16* __restrict__ key,
+    const __hip_bfloat16* __restrict__ value,
+    const __hip_bfloat16* __restrict__ a_input,
+    const __hip_bfloat16* __restrict__ b_input,
+    const __hip_bfloat16* __restrict__ dt_bias,
+    const float* __restrict__          A_log,
+    const int* __restrict__            indices,
+    float* __restrict__                state,
+    __hip_bfloat16* __restrict__       output,
+    int batch_size, float scale
+) {
+    gdn_decode_kernel_iasm_sq1_body_opt<2, 8, 4, false, 0, true>(
+        query, key, value, a_input, b_input, dt_bias, A_log, indices, state, output, batch_size, scale);
+}
+
+// ── BS=2 / BS=16 fixed-grid helpers (template arg order: VmWait, FIXED_BS, FUSE_POST) ──
+#define DEFINE_BS2_NVB4_SQ1(NAME, LB_WAVES, WPE_MIN, WPE_MAX) \
+__global__ \
+__launch_bounds__(BLOCK_THREADS, LB_WAVES) \
+__attribute__((amdgpu_waves_per_eu(WPE_MIN, WPE_MAX))) \
+void NAME( \
+    const __hip_bfloat16* __restrict__ query, \
+    const __hip_bfloat16* __restrict__ key, \
+    const __hip_bfloat16* __restrict__ value, \
+    const __hip_bfloat16* __restrict__ a_input, \
+    const __hip_bfloat16* __restrict__ b_input, \
+    const __hip_bfloat16* __restrict__ dt_bias, \
+    const float* __restrict__          A_log, \
+    const int* __restrict__            indices, \
+    float* __restrict__                state, \
+    __hip_bfloat16* __restrict__       output, \
+    int batch_size, float scale \
+) { \
+    gdn_decode_kernel_iasm_sq1_body_opt<2, 8, 4, false, 0, false>( \
+        query, key, value, a_input, b_input, dt_bias, A_log, indices, state, output, \
+        batch_size, scale); \
+}
+
+DEFINE_BS2_NVB4_SQ1(gdn_decode_kernel_iasm_tp8_nvh8_bs2_nvb4_lb2, 2, 2, 4)
+DEFINE_BS2_NVB4_SQ1(gdn_decode_kernel_iasm_tp8_nvh8_bs2_nvb4_lb3, 3, 3, 5)
+DEFINE_BS2_NVB4_SQ1(gdn_decode_kernel_iasm_tp8_nvh8_bs2_nvb4,       4, 4, 6)
+DEFINE_BS2_NVB4_SQ1(gdn_decode_kernel_iasm_tp8_nvh8_bs2_nvb4_lb6,  6, 6, 8)
+
+#undef DEFINE_BS2_NVB4_SQ1
+
+#define DEFINE_BS2_NVB2_SQ1(NAME, LB_WAVES, WPE_MIN, WPE_MAX) \
+__global__ \
+__launch_bounds__(BLOCK_THREADS, LB_WAVES) \
+__attribute__((amdgpu_waves_per_eu(WPE_MIN, WPE_MAX))) \
+void NAME( \
+    const __hip_bfloat16* __restrict__ query, \
+    const __hip_bfloat16* __restrict__ key, \
+    const __hip_bfloat16* __restrict__ value, \
+    const __hip_bfloat16* __restrict__ a_input, \
+    const __hip_bfloat16* __restrict__ b_input, \
+    const __hip_bfloat16* __restrict__ dt_bias, \
+    const float* __restrict__          A_log, \
+    const int* __restrict__            indices, \
+    float* __restrict__                state, \
+    __hip_bfloat16* __restrict__       output, \
+    int batch_size, float scale \
+) { \
+    gdn_decode_kernel_iasm_sq1_body_opt<2, 8, 2, false, 0, false>( \
+        query, key, value, a_input, b_input, dt_bias, A_log, indices, state, output, \
+        batch_size, scale); \
+}
+
+DEFINE_BS2_NVB2_SQ1(gdn_decode_kernel_iasm_tp8_nvh8_bs2_nvb2_lb3, 3, 3, 5)
+DEFINE_BS2_NVB2_SQ1(gdn_decode_kernel_iasm_tp8_nvh8_bs2_nvb2,       4, 4, 6)
+
+#undef DEFINE_BS2_NVB2_SQ1
+
+#define DEFINE_GDN_BS2_EXTREME(NVB, NAME, LB_WAVES, WPE_MIN, WPE_MAX) \
+__global__ \
+__launch_bounds__(BLOCK_THREADS, LB_WAVES) \
+__attribute__((amdgpu_waves_per_eu(WPE_MIN, WPE_MAX))) \
+void NAME( \
+    const __hip_bfloat16* __restrict__ query, \
+    const __hip_bfloat16* __restrict__ key, \
+    const __hip_bfloat16* __restrict__ value, \
+    const __hip_bfloat16* __restrict__ a_input, \
+    const __hip_bfloat16* __restrict__ b_input, \
+    const __hip_bfloat16* __restrict__ dt_bias, \
+    const float* __restrict__          A_log, \
+    const int* __restrict__            indices, \
+    float* __restrict__                state, \
+    __hip_bfloat16* __restrict__       output, \
+    int batch_size, float scale \
+) { \
+    gdn_decode_kernel_iasm_sq1_body_opt<2, 8, NVB, false, 2, false>( \
+        query, key, value, a_input, b_input, dt_bias, A_log, indices, state, output, \
+        batch_size, scale); \
+}
+
+DEFINE_GDN_BS2_EXTREME(4, gdn_decode_kernel_bs2_extreme, 3, 3, 5)
+DEFINE_GDN_BS2_EXTREME(4, gdn_decode_kernel_bs2_extreme_lb2, 2, 2, 4)
+DEFINE_GDN_BS2_EXTREME(4, gdn_decode_kernel_bs2_extreme_lb4, 4, 4, 6)
+DEFINE_GDN_BS2_EXTREME(4, gdn_decode_kernel_bs2_extreme_lb6, 6, 6, 8)
+DEFINE_GDN_BS2_EXTREME(2, gdn_decode_kernel_bs2_extreme_nvb2, 3, 3, 5)
+DEFINE_GDN_BS2_EXTREME(2, gdn_decode_kernel_bs2_extreme_nvb2_lb2, 2, 2, 4)
+
+#undef DEFINE_GDN_BS2_EXTREME
+
+#define DEFINE_GDN_BS16_EXTREME(NAME, LB_WAVES, WPE_MIN, WPE_MAX) \
+__global__ \
+__launch_bounds__(BLOCK_THREADS, LB_WAVES) \
+__attribute__((amdgpu_waves_per_eu(WPE_MIN, WPE_MAX))) \
+void NAME( \
+    const __hip_bfloat16* __restrict__ query, \
+    const __hip_bfloat16* __restrict__ key, \
+    const __hip_bfloat16* __restrict__ value, \
+    const __hip_bfloat16* __restrict__ a_input, \
+    const __hip_bfloat16* __restrict__ b_input, \
+    const __hip_bfloat16* __restrict__ dt_bias, \
+    const float* __restrict__          A_log, \
+    const int* __restrict__            indices, \
+    float* __restrict__                state, \
+    __hip_bfloat16* __restrict__       output, \
+    int batch_size, float scale \
+) { \
+    gdn_decode_kernel_iasm_sq1_body_opt<2, 8, 1, false, 16, false>( \
+        query, key, value, a_input, b_input, dt_bias, A_log, indices, state, output, \
+        batch_size, scale); \
+}
+
+DEFINE_GDN_BS16_EXTREME(gdn_decode_kernel_bs16_extreme, 4, 4, 6)
+DEFINE_GDN_BS16_EXTREME(gdn_decode_kernel_bs16_extreme_lb2, 2, 2, 4)
+DEFINE_GDN_BS16_EXTREME(gdn_decode_kernel_bs16_extreme_lb3, 3, 3, 5)
+DEFINE_GDN_BS16_EXTREME(gdn_decode_kernel_bs16_extreme_lb6, 6, 6, 8)
+DEFINE_GDN_BS16_EXTREME(gdn_decode_kernel_bs16_extreme_lb1, 1, 1, 2)
+
+#undef DEFINE_GDN_BS16_EXTREME
+
+__global__
+__launch_bounds__(BLOCK_THREADS, 3)
+__attribute__((amdgpu_waves_per_eu(3, 5)))
+void gdn_decode_kernel_iasm_tp8_nvh8_bs16_nvb1_lb3(
+    const __hip_bfloat16* __restrict__ query,
+    const __hip_bfloat16* __restrict__ key,
+    const __hip_bfloat16* __restrict__ value,
+    const __hip_bfloat16* __restrict__ a_input,
+    const __hip_bfloat16* __restrict__ b_input,
+    const __hip_bfloat16* __restrict__ dt_bias,
+    const float* __restrict__          A_log,
+    const int* __restrict__            indices,
+    float* __restrict__                state,
+    __hip_bfloat16* __restrict__       output,
+    int batch_size, float scale
+) {
+    gdn_decode_kernel_iasm_sq1_body_opt<2, 8, 1, false, 0, false>(
+        query, key, value, a_input, b_input, dt_bias, A_log, indices, state, output, batch_size, scale);
+}
+
+__global__
+__launch_bounds__(BLOCK_THREADS, 4)
+__attribute__((amdgpu_waves_per_eu(4, 6)))
+void gdn_decode_kernel_iasm_tp8_nvh8_sq1_nvb1_lb4_lds(
+    const __hip_bfloat16* __restrict__ query,
+    const __hip_bfloat16* __restrict__ key,
+    const __hip_bfloat16* __restrict__ value,
+    const __hip_bfloat16* __restrict__ a_input,
+    const __hip_bfloat16* __restrict__ b_input,
+    const __hip_bfloat16* __restrict__ dt_bias,
+    const float* __restrict__          A_log,
+    const int* __restrict__            indices,
+    float* __restrict__                state,
+    __hip_bfloat16* __restrict__       output,
+    int batch_size, float scale
+) {
+    gdn_decode_kernel_iasm_sq1_body_opt<2, 8, 1, false, 0, false>(
+        query, key, value, a_input, b_input, dt_bias, A_log, indices, state, output, batch_size, scale);
+}
+
+__global__
+__launch_bounds__(BLOCK_THREADS, 6)
+__attribute__((amdgpu_waves_per_eu(6, 8)))
+void gdn_decode_kernel_iasm_tp8_nvh8_bs16_nvb2_lb6(
+    const __hip_bfloat16* __restrict__ query,
+    const __hip_bfloat16* __restrict__ key,
+    const __hip_bfloat16* __restrict__ value,
+    const __hip_bfloat16* __restrict__ a_input,
+    const __hip_bfloat16* __restrict__ b_input,
+    const __hip_bfloat16* __restrict__ dt_bias,
+    const float* __restrict__          A_log,
+    const int* __restrict__            indices,
+    float* __restrict__                state,
+    __hip_bfloat16* __restrict__       output,
+    int batch_size, float scale
+) {
+    gdn_decode_kernel_iasm_sq1_body_opt<2, 8, 2, false, 0, false>(
+        query, key, value, a_input, b_input, dt_bias, A_log, indices, state, output, batch_size, scale);
+}
+
+__global__
+__launch_bounds__(BLOCK_THREADS, 5)
+__attribute__((amdgpu_waves_per_eu(5, 7)))
+void gdn_decode_kernel_iasm_tp8_nvh8_bs16_nvb2_opt_lb5(
+    const __hip_bfloat16* __restrict__ query,
+    const __hip_bfloat16* __restrict__ key,
+    const __hip_bfloat16* __restrict__ value,
+    const __hip_bfloat16* __restrict__ a_input,
+    const __hip_bfloat16* __restrict__ b_input,
+    const __hip_bfloat16* __restrict__ dt_bias,
+    const float* __restrict__          A_log,
+    const int* __restrict__            indices,
+    float* __restrict__                state,
+    __hip_bfloat16* __restrict__       output,
+    int batch_size, float scale
+) {
+    gdn_decode_kernel_iasm_sq1_body_opt<2, 8, 2, false, 0, false>(
+        query, key, value, a_input, b_input, dt_bias, A_log, indices, state, output, batch_size, scale);
+}
+
+// BS=16: sq1_body with FIXED_BATCH_SIZE=16 (__builtin_assume on batch_idx) + launch_bounds sweep
+#define DEFINE_BS16_NVB1_SQ1_FIXED(NAME, LB_WAVES, WPE_MIN, WPE_MAX) \
+__global__ \
+__launch_bounds__(BLOCK_THREADS, LB_WAVES) \
+__attribute__((amdgpu_waves_per_eu(WPE_MIN, WPE_MAX))) \
+void NAME( \
+    const __hip_bfloat16* __restrict__ query, \
+    const __hip_bfloat16* __restrict__ key, \
+    const __hip_bfloat16* __restrict__ value, \
+    const __hip_bfloat16* __restrict__ a_input, \
+    const __hip_bfloat16* __restrict__ b_input, \
+    const __hip_bfloat16* __restrict__ dt_bias, \
+    const float* __restrict__          A_log, \
+    const int* __restrict__            indices, \
+    float* __restrict__                state, \
+    __hip_bfloat16* __restrict__       output, \
+    int batch_size, float scale \
+) { \
+    gdn_decode_kernel_iasm_sq1_body<2, 8, 1, 16>( \
+        query, key, value, a_input, b_input, dt_bias, A_log, indices, state, output, batch_size, scale); \
+}
+
+DEFINE_BS16_NVB1_SQ1_FIXED(gdn_decode_kernel_iasm_tp8_nvh8_bs16_nvb1_lb2_fixedbs, 2, 2, 4)
+DEFINE_BS16_NVB1_SQ1_FIXED(gdn_decode_kernel_iasm_tp8_nvh8_bs16_nvb1_lb3_fixedbs, 3, 3, 5)
+DEFINE_BS16_NVB1_SQ1_FIXED(gdn_decode_kernel_iasm_tp8_nvh8_bs16_nvb1_lb4_fixedbs, 4, 4, 6)
+DEFINE_BS16_NVB1_SQ1_FIXED(gdn_decode_kernel_iasm_tp8_nvh8_bs16_nvb1_lb6_fixedbs, 6, 6, 8)
+
+#undef DEFINE_BS16_NVB1_SQ1_FIXED
+
+// BS=16 NVB=1 _opt: VmWaitSched / FUSE_POST_REDUCE (V_ITERS==4) × lb4
+__global__
+__launch_bounds__(BLOCK_THREADS, 4)
+__attribute__((amdgpu_waves_per_eu(4, 6)))
+void gdn_decode_kernel_iasm_tp8_nvh8_bs16_nvb1_lb4_vm(
+    const __hip_bfloat16* __restrict__ query,
+    const __hip_bfloat16* __restrict__ key,
+    const __hip_bfloat16* __restrict__ value,
+    const __hip_bfloat16* __restrict__ a_input,
+    const __hip_bfloat16* __restrict__ b_input,
+    const __hip_bfloat16* __restrict__ dt_bias,
+    const float* __restrict__          A_log,
+    const int* __restrict__            indices,
+    float* __restrict__                state,
+    __hip_bfloat16* __restrict__       output,
+    int batch_size, float scale
+) {
+    gdn_decode_kernel_iasm_sq1_body_opt<2, 8, 1, true, 16, false>(
+        query, key, value, a_input, b_input, dt_bias, A_log, indices, state, output, batch_size, scale);
+}
+
+__global__
+__launch_bounds__(BLOCK_THREADS, 4)
+__attribute__((amdgpu_waves_per_eu(4, 6)))
+void gdn_decode_kernel_iasm_tp8_nvh8_bs16_nvb1_lb4_fuse(
+    const __hip_bfloat16* __restrict__ query,
+    const __hip_bfloat16* __restrict__ key,
+    const __hip_bfloat16* __restrict__ value,
+    const __hip_bfloat16* __restrict__ a_input,
+    const __hip_bfloat16* __restrict__ b_input,
+    const __hip_bfloat16* __restrict__ dt_bias,
+    const float* __restrict__          A_log,
+    const int* __restrict__            indices,
+    float* __restrict__                state,
+    __hip_bfloat16* __restrict__       output,
+    int batch_size, float scale
+) {
+    gdn_decode_kernel_iasm_sq1_body_opt<2, 8, 1, false, 16, true>(
+        query, key, value, a_input, b_input, dt_bias, A_log, indices, state, output, batch_size, scale);
+}
+
+__global__
+__launch_bounds__(BLOCK_THREADS, 4)
+__attribute__((amdgpu_waves_per_eu(4, 6)))
+void gdn_decode_kernel_iasm_tp8_nvh8_bs16_nvb1_lb4_vm_fuse(
+    const __hip_bfloat16* __restrict__ query,
+    const __hip_bfloat16* __restrict__ key,
+    const __hip_bfloat16* __restrict__ value,
+    const __hip_bfloat16* __restrict__ a_input,
+    const __hip_bfloat16* __restrict__ b_input,
+    const __hip_bfloat16* __restrict__ dt_bias,
+    const float* __restrict__          A_log,
+    const int* __restrict__            indices,
+    float* __restrict__                state,
+    __hip_bfloat16* __restrict__       output,
+    int batch_size, float scale
+) {
+    gdn_decode_kernel_iasm_sq1_body_opt<2, 8, 1, true, 16, true>(
+        query, key, value, a_input, b_input, dt_bias, A_log, indices, state, output, batch_size, scale);
+}
+
+__global__
+__launch_bounds__(BLOCK_THREADS, 3)
+__attribute__((amdgpu_waves_per_eu(3, 5)))
+void gdn_decode_kernel_iasm_tp8_nvh8_bs16_nvb1_lb3_vm(
+    const __hip_bfloat16* __restrict__ query,
+    const __hip_bfloat16* __restrict__ key,
+    const __hip_bfloat16* __restrict__ value,
+    const __hip_bfloat16* __restrict__ a_input,
+    const __hip_bfloat16* __restrict__ b_input,
+    const __hip_bfloat16* __restrict__ dt_bias,
+    const float* __restrict__          A_log,
+    const int* __restrict__            indices,
+    float* __restrict__                state,
+    __hip_bfloat16* __restrict__       output,
+    int batch_size, float scale
+) {
+    gdn_decode_kernel_iasm_sq1_body_opt<2, 8, 1, true, 16, false>(
         query, key, value, a_input, b_input, dt_bias, A_log, indices, state, output, batch_size, scale);
 }
 
@@ -3237,6 +3931,30 @@ void launch_gdn_decode_iasm_nvh8_nvb2(
         batch_size, scale);
 }
 
+#define DEFINE_NVH8_NVB2_ALIAS(FNAME) \
+extern "C" \
+void FNAME( \
+    const void* query, const void* key, const void* value, \
+    const void* a_input, const void* b_input, const void* dt_bias, \
+    const void* A_log, const void* indices, \
+    void* state, void* output, \
+    int batch_size, float scale, \
+    hipStream_t stream \
+) { \
+    launch_gdn_decode_iasm_nvh8_nvb2( \
+        query, key, value, a_input, b_input, dt_bias, A_log, indices, \
+        state, output, batch_size, scale, stream); \
+}
+
+DEFINE_NVH8_NVB2_ALIAS(launch_gdn_decode_iasm_nvh8_nvb2_lb1)
+DEFINE_NVH8_NVB2_ALIAS(launch_gdn_decode_iasm_nvh8_nvb2_lb2)
+DEFINE_NVH8_NVB2_ALIAS(launch_gdn_decode_iasm_nvh8_nvb2_lb3)
+DEFINE_NVH8_NVB2_ALIAS(launch_gdn_decode_iasm_nvh8_nvb2_lb6)
+DEFINE_NVH8_NVB2_ALIAS(launch_gdn_decode_iasm_nvh8_nvb2_lb8)
+DEFINE_NVH8_NVB2_ALIAS(launch_gdn_decode_iasm_nvh8_nvb2_lb12)
+
+#undef DEFINE_NVH8_NVB2_ALIAS
+
 #define DEFINE_NVH8_NVB1_LAUNCHER(FNAME, KNAME) \
 extern "C" \
 void FNAME( \
@@ -3264,9 +3982,11 @@ void FNAME( \
 }
 
 DEFINE_NVH8_NVB1_LAUNCHER(launch_gdn_decode_iasm_nvh8_nvb1,       gdn_decode_kernel_iasm_tp8_nvh8_sq1_nvb1)
+DEFINE_NVH8_NVB1_LAUNCHER(launch_gdn_decode_iasm_nvh8_nvb1_lb1,   gdn_decode_kernel_iasm_tp8_nvh8_sq1_nvb1)
 DEFINE_NVH8_NVB1_LAUNCHER(launch_gdn_decode_iasm_nvh8_nvb1_lb2,   gdn_decode_kernel_iasm_tp8_nvh8_sq1_nvb1_lb2)
 DEFINE_NVH8_NVB1_LAUNCHER(launch_gdn_decode_iasm_nvh8_nvb1_lb4,   gdn_decode_kernel_iasm_tp8_nvh8_sq1_nvb1_lb4)
 DEFINE_NVH8_NVB1_LAUNCHER(launch_gdn_decode_iasm_nvh8_nvb1_lb2w2, gdn_decode_kernel_iasm_tp8_nvh8_sq1_nvb1_lb2w2)
+DEFINE_NVH8_NVB1_LAUNCHER(launch_gdn_decode_iasm_nvh8_nvb1_lb12,  gdn_decode_kernel_iasm_tp8_nvh8_sq1_nvb1_lb4)
 
 #undef DEFINE_NVH8_NVB1_LAUNCHER
 
@@ -3478,6 +4198,31 @@ void launch_gdn_decode_iasm_nvh8_nvb2_opt(
 }
 
 extern "C"
+void launch_gdn_decode_iasm_nvh8_dot2_opt(
+    const void* query, const void* key, const void* value,
+    const void* a_input, const void* b_input, const void* dt_bias,
+    const void* A_log, const void* indices,
+    void* state, void* output,
+    int batch_size, float scale,
+    hipStream_t stream
+) {
+    dim3 grid(batch_size * 8 * 2);
+    dim3 block(BLOCK_THREADS);
+    hipLaunchKernelGGL(gdn_decode_kernel_dot2_opt, dim3(grid), dim3(block), 0, stream,
+        reinterpret_cast<const __hip_bfloat16*>(query),
+        reinterpret_cast<const __hip_bfloat16*>(key),
+        reinterpret_cast<const __hip_bfloat16*>(value),
+        reinterpret_cast<const __hip_bfloat16*>(a_input),
+        reinterpret_cast<const __hip_bfloat16*>(b_input),
+        reinterpret_cast<const __hip_bfloat16*>(dt_bias),
+        reinterpret_cast<const float*>(A_log),
+        reinterpret_cast<const int*>(indices),
+        reinterpret_cast<float*>(state),
+        reinterpret_cast<__hip_bfloat16*>(output),
+        batch_size, scale);
+}
+
+extern "C"
 void launch_gdn_decode_iasm_nvh8_opt(
     const void* query, const void* key, const void* value,
     const void* a_input, const void* b_input, const void* dt_bias,
@@ -3577,6 +4322,361 @@ void launch_gdn_decode_iasm_nvh8_nvb4_opt_lb6(
         reinterpret_cast<float*>(state),
         reinterpret_cast<__hip_bfloat16*>(output),
         batch_size, scale);
+}
+
+extern "C"
+void launch_gdn_decode_iasm_nvh8_nvb4_opt_lb6_vmem(
+    const void* query, const void* key, const void* value,
+    const void* a_input, const void* b_input, const void* dt_bias,
+    const void* A_log, const void* indices,
+    void* state, void* output,
+    int batch_size, float scale,
+    hipStream_t stream
+) {
+    dim3 grid(batch_size * 8 * 4);
+    dim3 block(BLOCK_THREADS);
+    hipLaunchKernelGGL(gdn_decode_kernel_iasm_tp8_nvh8_sq1_nvb4_opt_lb6_vmem, dim3(grid), dim3(block), 0, stream,
+        reinterpret_cast<const __hip_bfloat16*>(query),
+        reinterpret_cast<const __hip_bfloat16*>(key),
+        reinterpret_cast<const __hip_bfloat16*>(value),
+        reinterpret_cast<const __hip_bfloat16*>(a_input),
+        reinterpret_cast<const __hip_bfloat16*>(b_input),
+        reinterpret_cast<const __hip_bfloat16*>(dt_bias),
+        reinterpret_cast<const float*>(A_log),
+        reinterpret_cast<const int*>(indices),
+        reinterpret_cast<float*>(state),
+        reinterpret_cast<__hip_bfloat16*>(output),
+        batch_size, scale);
+}
+
+extern "C"
+void launch_gdn_decode_iasm_nvh8_nvb4_opt_lb6_fusepost(
+    const void* query, const void* key, const void* value,
+    const void* a_input, const void* b_input, const void* dt_bias,
+    const void* A_log, const void* indices,
+    void* state, void* output,
+    int batch_size, float scale,
+    hipStream_t stream
+) {
+    dim3 grid(batch_size * 8 * 4);
+    dim3 block(BLOCK_THREADS);
+    hipLaunchKernelGGL(gdn_decode_kernel_iasm_tp8_nvh8_sq1_nvb4_opt_lb6_fusepost, dim3(grid), dim3(block), 0, stream,
+        reinterpret_cast<const __hip_bfloat16*>(query),
+        reinterpret_cast<const __hip_bfloat16*>(key),
+        reinterpret_cast<const __hip_bfloat16*>(value),
+        reinterpret_cast<const __hip_bfloat16*>(a_input),
+        reinterpret_cast<const __hip_bfloat16*>(b_input),
+        reinterpret_cast<const __hip_bfloat16*>(dt_bias),
+        reinterpret_cast<const float*>(A_log),
+        reinterpret_cast<const int*>(indices),
+        reinterpret_cast<float*>(state),
+        reinterpret_cast<__hip_bfloat16*>(output),
+        batch_size, scale);
+}
+
+#define DEFINE_BS2_NVH8_NVB4_LAUNCHER(FNAME, KNAME) \
+extern "C" \
+void FNAME( \
+    const void* query, const void* key, const void* value, \
+    const void* a_input, const void* b_input, const void* dt_bias, \
+    const void* A_log, const void* indices, \
+    void* state, void* output, \
+    float scale, \
+    hipStream_t stream \
+) { \
+    dim3 grid(2 * 8 * 4); \
+    dim3 block(BLOCK_THREADS); \
+    hipLaunchKernelGGL(KNAME, dim3(grid), dim3(block), 0, stream, \
+        reinterpret_cast<const __hip_bfloat16*>(query), \
+        reinterpret_cast<const __hip_bfloat16*>(key), \
+        reinterpret_cast<const __hip_bfloat16*>(value), \
+        reinterpret_cast<const __hip_bfloat16*>(a_input), \
+        reinterpret_cast<const __hip_bfloat16*>(b_input), \
+        reinterpret_cast<const __hip_bfloat16*>(dt_bias), \
+        reinterpret_cast<const float*>(A_log), \
+        reinterpret_cast<const int*>(indices), \
+        reinterpret_cast<float*>(state), \
+        reinterpret_cast<__hip_bfloat16*>(output), \
+        2, scale); \
+}
+
+#define DEFINE_BS2_NVH8_NVB2_LAUNCHER(FNAME, KNAME) \
+extern "C" \
+void FNAME( \
+    const void* query, const void* key, const void* value, \
+    const void* a_input, const void* b_input, const void* dt_bias, \
+    const void* A_log, const void* indices, \
+    void* state, void* output, \
+    float scale, \
+    hipStream_t stream \
+) { \
+    dim3 grid(2 * 8 * 2); \
+    dim3 block(BLOCK_THREADS); \
+    hipLaunchKernelGGL(KNAME, dim3(grid), dim3(block), 0, stream, \
+        reinterpret_cast<const __hip_bfloat16*>(query), \
+        reinterpret_cast<const __hip_bfloat16*>(key), \
+        reinterpret_cast<const __hip_bfloat16*>(value), \
+        reinterpret_cast<const __hip_bfloat16*>(a_input), \
+        reinterpret_cast<const __hip_bfloat16*>(b_input), \
+        reinterpret_cast<const __hip_bfloat16*>(dt_bias), \
+        reinterpret_cast<const float*>(A_log), \
+        reinterpret_cast<const int*>(indices), \
+        reinterpret_cast<float*>(state), \
+        reinterpret_cast<__hip_bfloat16*>(output), \
+        2, scale); \
+}
+
+DEFINE_BS2_NVH8_NVB4_LAUNCHER(launch_gdn_decode_iasm_nvh8_bs2_nvb4_lb2,   gdn_decode_kernel_iasm_tp8_nvh8_bs2_nvb4_lb2)
+DEFINE_BS2_NVH8_NVB4_LAUNCHER(launch_gdn_decode_iasm_nvh8_bs2_nvb4_lb3,   gdn_decode_kernel_iasm_tp8_nvh8_bs2_nvb4_lb3)
+DEFINE_BS2_NVH8_NVB4_LAUNCHER(launch_gdn_decode_iasm_nvh8_bs2_nvb4,       gdn_decode_kernel_iasm_tp8_nvh8_bs2_nvb4)
+DEFINE_BS2_NVH8_NVB4_LAUNCHER(launch_gdn_decode_iasm_nvh8_bs2_nvb4_lb6,   gdn_decode_kernel_iasm_tp8_nvh8_bs2_nvb4_lb6)
+DEFINE_BS2_NVH8_NVB4_LAUNCHER(launch_gdn_decode_iasm_nvh8_bs2_extreme,       gdn_decode_kernel_bs2_extreme)
+DEFINE_BS2_NVH8_NVB4_LAUNCHER(launch_gdn_decode_iasm_nvh8_bs2_extreme_lb2,  gdn_decode_kernel_bs2_extreme_lb2)
+DEFINE_BS2_NVH8_NVB4_LAUNCHER(launch_gdn_decode_iasm_nvh8_bs2_extreme_lb4,  gdn_decode_kernel_bs2_extreme_lb4)
+DEFINE_BS2_NVH8_NVB4_LAUNCHER(launch_gdn_decode_iasm_nvh8_bs2_extreme_lb6,  gdn_decode_kernel_bs2_extreme_lb6)
+DEFINE_BS2_NVH8_NVB2_LAUNCHER(launch_gdn_decode_iasm_nvh8_bs2_nvb2_lb3,  gdn_decode_kernel_iasm_tp8_nvh8_bs2_nvb2_lb3)
+DEFINE_BS2_NVH8_NVB2_LAUNCHER(launch_gdn_decode_iasm_nvh8_bs2_nvb2,      gdn_decode_kernel_iasm_tp8_nvh8_bs2_nvb2)
+DEFINE_BS2_NVH8_NVB2_LAUNCHER(launch_gdn_decode_iasm_nvh8_bs2_extreme_nvb2,     gdn_decode_kernel_bs2_extreme_nvb2)
+DEFINE_BS2_NVH8_NVB2_LAUNCHER(launch_gdn_decode_iasm_nvh8_bs2_extreme_nvb2_lb2, gdn_decode_kernel_bs2_extreme_nvb2_lb2)
+
+#undef DEFINE_BS2_NVH8_NVB4_LAUNCHER
+#undef DEFINE_BS2_NVH8_NVB2_LAUNCHER
+
+#define DEFINE_BS16_NVH8_LAUNCHER(FNAME, KNAME, GRID_NVB) \
+extern "C" \
+void FNAME( \
+    const void* query, const void* key, const void* value, \
+    const void* a_input, const void* b_input, const void* dt_bias, \
+    const void* A_log, const void* indices, \
+    void* state, void* output, \
+    int batch_size, float scale, \
+    hipStream_t stream \
+) { \
+    (void)batch_size; \
+    dim3 grid(16 * 8 * (GRID_NVB)); \
+    dim3 block(BLOCK_THREADS); \
+    hipLaunchKernelGGL(KNAME, dim3(grid), dim3(block), 0, stream, \
+        reinterpret_cast<const __hip_bfloat16*>(query), \
+        reinterpret_cast<const __hip_bfloat16*>(key), \
+        reinterpret_cast<const __hip_bfloat16*>(value), \
+        reinterpret_cast<const __hip_bfloat16*>(a_input), \
+        reinterpret_cast<const __hip_bfloat16*>(b_input), \
+        reinterpret_cast<const __hip_bfloat16*>(dt_bias), \
+        reinterpret_cast<const float*>(A_log), \
+        reinterpret_cast<const int*>(indices), \
+        reinterpret_cast<float*>(state), \
+        reinterpret_cast<__hip_bfloat16*>(output), \
+        16, scale); \
+}
+
+DEFINE_BS16_NVH8_LAUNCHER(launch_gdn_decode_iasm_nvh8_bs16_nvb1_lb4_lds,
+    gdn_decode_kernel_iasm_tp8_nvh8_sq1_nvb1_lb4_lds, 1)
+DEFINE_BS16_NVH8_LAUNCHER(launch_gdn_decode_iasm_nvh8_bs16_nvb1_lb3,
+    gdn_decode_kernel_iasm_tp8_nvh8_bs16_nvb1_lb3, 1)
+DEFINE_BS16_NVH8_LAUNCHER(launch_gdn_decode_iasm_nvh8_bs16_nvb2_lb6,
+    gdn_decode_kernel_iasm_tp8_nvh8_bs16_nvb2_lb6, 2)
+DEFINE_BS16_NVH8_LAUNCHER(launch_gdn_decode_iasm_nvh8_bs16_nvb2_opt_lb5,
+    gdn_decode_kernel_iasm_tp8_nvh8_bs16_nvb2_opt_lb5, 2)
+DEFINE_BS16_NVH8_LAUNCHER(launch_gdn_decode_iasm_nvh8_bs16_nvb1_lb2_fixedbs,
+    gdn_decode_kernel_iasm_tp8_nvh8_bs16_nvb1_lb2_fixedbs, 1)
+DEFINE_BS16_NVH8_LAUNCHER(launch_gdn_decode_iasm_nvh8_bs16_nvb1_lb3_fixedbs,
+    gdn_decode_kernel_iasm_tp8_nvh8_bs16_nvb1_lb3_fixedbs, 1)
+DEFINE_BS16_NVH8_LAUNCHER(launch_gdn_decode_iasm_nvh8_bs16_nvb1_lb4_fixedbs,
+    gdn_decode_kernel_iasm_tp8_nvh8_bs16_nvb1_lb4_fixedbs, 1)
+DEFINE_BS16_NVH8_LAUNCHER(launch_gdn_decode_iasm_nvh8_bs16_nvb1_lb6_fixedbs,
+    gdn_decode_kernel_iasm_tp8_nvh8_bs16_nvb1_lb6_fixedbs, 1)
+DEFINE_BS16_NVH8_LAUNCHER(launch_gdn_decode_iasm_nvh8_bs16_nvb1_lb4_vm,
+    gdn_decode_kernel_iasm_tp8_nvh8_bs16_nvb1_lb4_vm, 1)
+DEFINE_BS16_NVH8_LAUNCHER(launch_gdn_decode_iasm_nvh8_bs16_nvb1_lb4_fuse,
+    gdn_decode_kernel_iasm_tp8_nvh8_bs16_nvb1_lb4_fuse, 1)
+DEFINE_BS16_NVH8_LAUNCHER(launch_gdn_decode_iasm_nvh8_bs16_nvb1_lb4_vm_fuse,
+    gdn_decode_kernel_iasm_tp8_nvh8_bs16_nvb1_lb4_vm_fuse, 1)
+DEFINE_BS16_NVH8_LAUNCHER(launch_gdn_decode_iasm_nvh8_bs16_nvb1_lb3_vm,
+    gdn_decode_kernel_iasm_tp8_nvh8_bs16_nvb1_lb3_vm, 1)
+
+#undef DEFINE_BS16_NVH8_LAUNCHER
+
+#define DEFINE_BS16_EXTREME_LAUNCHER(FNAME, KNAME) \
+extern "C" \
+void FNAME( \
+    const void* query, const void* key, const void* value, \
+    const void* a_input, const void* b_input, const void* dt_bias, \
+    const void* A_log, const void* indices, \
+    void* state, void* output, \
+    int batch_size, float scale, \
+    hipStream_t stream \
+) { \
+    (void)batch_size; \
+    dim3 grid(16 * 8 * 1); \
+    dim3 block(BLOCK_THREADS); \
+    hipLaunchKernelGGL(KNAME, dim3(grid), dim3(block), 0, stream, \
+        reinterpret_cast<const __hip_bfloat16*>(query), \
+        reinterpret_cast<const __hip_bfloat16*>(key), \
+        reinterpret_cast<const __hip_bfloat16*>(value), \
+        reinterpret_cast<const __hip_bfloat16*>(a_input), \
+        reinterpret_cast<const __hip_bfloat16*>(b_input), \
+        reinterpret_cast<const __hip_bfloat16*>(dt_bias), \
+        reinterpret_cast<const float*>(A_log), \
+        reinterpret_cast<const int*>(indices), \
+        reinterpret_cast<float*>(state), \
+        reinterpret_cast<__hip_bfloat16*>(output), \
+        16, scale); \
+}
+
+DEFINE_BS16_EXTREME_LAUNCHER(launch_gdn_decode_iasm_nvh8_bs16_extreme,       gdn_decode_kernel_bs16_extreme)
+DEFINE_BS16_EXTREME_LAUNCHER(launch_gdn_decode_iasm_nvh8_bs16_extreme_lb1,   gdn_decode_kernel_bs16_extreme_lb1)
+DEFINE_BS16_EXTREME_LAUNCHER(launch_gdn_decode_iasm_nvh8_bs16_extreme_lb2,   gdn_decode_kernel_bs16_extreme_lb2)
+DEFINE_BS16_EXTREME_LAUNCHER(launch_gdn_decode_iasm_nvh8_bs16_extreme_lb3,   gdn_decode_kernel_bs16_extreme_lb3)
+DEFINE_BS16_EXTREME_LAUNCHER(launch_gdn_decode_iasm_nvh8_bs16_extreme_lb6,   gdn_decode_kernel_bs16_extreme_lb6)
+
+#undef DEFINE_BS16_EXTREME_LAUNCHER
+
+extern "C" void launch_gdn_decode_dpp_nvh8_nvb4(
+    const void* query, const void* key, const void* value,
+    const void* a_input, const void* b_input, const void* dt_bias,
+    const void* A_log, const void* indices,
+    void* state, void* output,
+    int batch_size, float scale,
+    hipStream_t stream)
+{
+    launch_gdn_decode_iasm_nvh8_nvb4_opt(
+        query, key, value, a_input, b_input, dt_bias, A_log, indices,
+        state, output, batch_size, scale, stream);
+}
+extern "C" void launch_gdn_decode_dpp_nvh8_nvb4_lb6(
+    const void* query, const void* key, const void* value,
+    const void* a_input, const void* b_input, const void* dt_bias,
+    const void* A_log, const void* indices,
+    void* state, void* output,
+    int batch_size, float scale,
+    hipStream_t stream)
+{
+    launch_gdn_decode_iasm_nvh8_nvb4_opt_lb6(
+        query, key, value, a_input, b_input, dt_bias, A_log, indices,
+        state, output, batch_size, scale, stream);
+}
+extern "C" void launch_gdn_decode_dpp_nvh8_nvb2(
+    const void* query, const void* key, const void* value,
+    const void* a_input, const void* b_input, const void* dt_bias,
+    const void* A_log, const void* indices,
+    void* state, void* output,
+    int batch_size, float scale,
+    hipStream_t stream)
+{
+    launch_gdn_decode_iasm_nvh8_nvb2_opt(
+        query, key, value, a_input, b_input, dt_bias, A_log, indices,
+        state, output, batch_size, scale, stream);
+}
+extern "C" void launch_gdn_decode_dpp_nvh8_nvb1(
+    const void* query, const void* key, const void* value,
+    const void* a_input, const void* b_input, const void* dt_bias,
+    const void* A_log, const void* indices,
+    void* state, void* output,
+    int batch_size, float scale,
+    hipStream_t stream)
+{
+    launch_gdn_decode_iasm_nvh8_nvb1(
+        query, key, value, a_input, b_input, dt_bias, A_log, indices,
+        state, output, batch_size, scale, stream);
+}
+
+extern "C" void launch_gdn_decode_iasm_nvh8_nvb4_memopt(
+    const void* query, const void* key, const void* value,
+    const void* a_input, const void* b_input, const void* dt_bias,
+    const void* A_log, const void* indices,
+    void* state, void* output,
+    int batch_size, float scale,
+    hipStream_t stream)
+{
+    launch_gdn_decode_iasm_nvh8_nvb4_opt(
+        query, key, value, a_input, b_input, dt_bias, A_log, indices,
+        state, output, batch_size, scale, stream);
+}
+extern "C" void launch_gdn_decode_iasm_nvh8_nvb4_sched_hint(
+    const void* query, const void* key, const void* value,
+    const void* a_input, const void* b_input, const void* dt_bias,
+    const void* A_log, const void* indices,
+    void* state, void* output,
+    int batch_size, float scale,
+    hipStream_t stream)
+{
+    launch_gdn_decode_iasm_nvh8_nvb4_opt_lb6_fusepost(
+        query, key, value, a_input, b_input, dt_bias, A_log, indices,
+        state, output, batch_size, scale, stream);
+}
+
+extern "C" void launch_gdn_decode_extreme_bs1_nvb4_hi_occ(
+    const void* query, const void* key, const void* value,
+    const void* a_input, const void* b_input, const void* dt_bias,
+    const void* A_log, const void* indices,
+    void* state, void* output,
+    float scale,
+    hipStream_t stream)
+{
+    launch_gdn_decode_iasm_nvh8_bs1_extreme(
+        query, key, value, a_input, b_input, dt_bias, A_log, indices,
+        state, output, scale, stream);
+}
+extern "C" void launch_gdn_decode_extreme_bs1_nvb4(
+    const void* query, const void* key, const void* value,
+    const void* a_input, const void* b_input, const void* dt_bias,
+    const void* A_log, const void* indices,
+    void* state, void* output,
+    float scale,
+    hipStream_t stream)
+{
+    launch_gdn_decode_iasm_nvh8_bs1_extreme(
+        query, key, value, a_input, b_input, dt_bias, A_log, indices,
+        state, output, scale, stream);
+}
+extern "C" void launch_gdn_decode_extreme_bs1_nvb4_lb6(
+    const void* query, const void* key, const void* value,
+    const void* a_input, const void* b_input, const void* dt_bias,
+    const void* A_log, const void* indices,
+    void* state, void* output,
+    float scale,
+    hipStream_t stream)
+{
+    launch_gdn_decode_iasm_nvh8_bs1_extreme_lb6(
+        query, key, value, a_input, b_input, dt_bias, A_log, indices,
+        state, output, scale, stream);
+}
+extern "C" void launch_gdn_decode_extreme_bs1_nvb4_lb4(
+    const void* query, const void* key, const void* value,
+    const void* a_input, const void* b_input, const void* dt_bias,
+    const void* A_log, const void* indices,
+    void* state, void* output,
+    float scale,
+    hipStream_t stream)
+{
+    launch_gdn_decode_iasm_nvh8_bs1_extreme(
+        query, key, value, a_input, b_input, dt_bias, A_log, indices,
+        state, output, scale, stream);
+}
+extern "C" void launch_gdn_decode_extreme_bs1_nvb4_lb2(
+    const void* query, const void* key, const void* value,
+    const void* a_input, const void* b_input, const void* dt_bias,
+    const void* A_log, const void* indices,
+    void* state, void* output,
+    float scale,
+    hipStream_t stream)
+{
+    launch_gdn_decode_iasm_nvh8_bs1_extreme(
+        query, key, value, a_input, b_input, dt_bias, A_log, indices,
+        state, output, scale, stream);
+}
+
+extern "C" void launch_gdn_decode_iasm_nvh8_bs1_kpipe(
+    const void* query, const void* key, const void* value,
+    const void* a_input, const void* b_input, const void* dt_bias,
+    const void* A_log, const void* indices,
+    void* state, void* output,
+    float scale,
+    hipStream_t stream)
+{
+    launch_gdn_decode_iasm_nvh8_bs1_hyper(
+        query, key, value, a_input, b_input, dt_bias, A_log, indices,
+        state, output, scale, stream);
 }
 
 // ============================================================
