@@ -203,6 +203,27 @@ __device__ __forceinline__ void shfl_idx_2way_asm(
     );
 }
 
+__device__ __forceinline__ void shfl_idx_4way_bi(
+    float& d0, float& d1, float& d2, float& d3,
+    float s0, float s1, float s2, float s3, int addr)
+{
+    d0 = as_float(__builtin_amdgcn_ds_bpermute(addr, as_int(s0)));
+    d1 = as_float(__builtin_amdgcn_ds_bpermute(addr, as_int(s1)));
+    d2 = as_float(__builtin_amdgcn_ds_bpermute(addr, as_int(s2)));
+    d3 = as_float(__builtin_amdgcn_ds_bpermute(addr, as_int(s3)));
+}
+
+__device__ __forceinline__ void shfl_idx_2way_bi(
+    float& d0, float& d1, float s0, float s1, int addr)
+{
+    d0 = as_float(__builtin_amdgcn_ds_bpermute(addr, as_int(s0)));
+    d1 = as_float(__builtin_amdgcn_ds_bpermute(addr, as_int(s1)));
+}
+
+__device__ __forceinline__ float shfl_idx_1way_bi(float s, int addr) {
+    return as_float(__builtin_amdgcn_ds_bpermute(addr, as_int(s)));
+}
+
 // Fused 5-way xor reduce: dot_kq + res_hk[0..1] + res_hq[0..1] in 3 rounds (vs 6 for 1+4)
 __device__ __forceinline__ void reduce_5way_asm(
     float& v0, float& v1, float& v2, float& v3, float& v4,
@@ -3206,6 +3227,197 @@ __device__ __forceinline__ void gdn_decode_kernel_builtin_body(
     }
 }
 
+// ============================================================
+// Stable body: zero asm-volatile — compiler has 100% scheduling freedom.
+// Replaces shfl_idx asm volatile with __builtin_amdgcn_ds_bpermute.
+// ============================================================
+template <int NKH, int NVH, int NUM_V_BLOCKS>
+__device__ __forceinline__ void gdn_decode_kernel_stable_body(
+    const __hip_bfloat16* __restrict__ query,
+    const __hip_bfloat16* __restrict__ key,
+    const __hip_bfloat16* __restrict__ value,
+    const __hip_bfloat16* __restrict__ a_input,
+    const __hip_bfloat16* __restrict__ b_input,
+    const __hip_bfloat16* __restrict__ dt_bias,
+    const float* __restrict__          A_log,
+    const int* __restrict__            indices,
+    float* __restrict__                state,
+    __hip_bfloat16* __restrict__       output,
+    int batch_size, float scale
+) {
+    constexpr int TILE_V = HEAD_V_DIM / NUM_V_BLOCKS;
+    constexpr int WARP_GROUP_TILE_V = NUM_WARPS * WARP_V_THREADS;
+    constexpr int V_ITERS = TILE_V / WARP_GROUP_TILE_V;
+
+    const int tid = threadIdx.x;
+    const int lane_id = tid % WARP_SIZE;
+    const int warp_id = tid / WARP_SIZE;
+    const int k_tid = lane_id % WARP_K_THREADS;
+    const int v_tid = lane_id / WARP_K_THREADS;
+
+    const int b_hv_vb = blockIdx.x;
+    const int v_block_id = b_hv_vb % NUM_V_BLOCKS;
+    const int b_hv = b_hv_vb / NUM_V_BLOCKS;
+    const int batch_idx = b_hv / NVH;
+    const int hv_idx = b_hv % NVH;
+    const int hk_idx = hv_idx / (NVH / NKH);
+
+    if (batch_idx >= batch_size) return;
+    const int pool_idx = indices[batch_idx];
+    if (pool_idx < 0) return;
+
+    const int warp_k_vec_start = k_tid * VEC_K;
+    const int global_v_base = v_block_id * TILE_V + warp_id * WARP_V_THREADS + v_tid;
+    const int leader_addr = ((lane_id / WARP_K_THREADS) * WARP_K_THREADS) << 2;
+
+    const int ab = batch_idx * NVH + hv_idx;
+    float x = __bfloat162float(a_input[ab]) + __bfloat162float(dt_bias[hv_idx]);
+    float sp = bi_fast_log1p(bi_fast_exp(x));
+    float exp_g = bi_fast_exp(-bi_fast_exp(A_log[hv_idx]) * sp);
+    float beta = bi_rcp(1.0f + bi_fast_exp(-__bfloat162float(b_input[ab])));
+
+    float S[V_ITERS][K_ITERS][VEC_K];
+    const int shs = HEAD_V_DIM * HEAD_K_DIM;
+    float* sb = state + (int64_t)pool_idx * NVH * shs + hv_idx * shs;
+    #pragma unroll
+    for (int vi = 0; vi < V_ITERS; vi++) {
+        int gv = global_v_base + vi * WARP_GROUP_TILE_V;
+        #pragma unroll
+        for (int ki = 0; ki < K_ITERS; ki++) {
+            float4 t = *reinterpret_cast<const float4*>(
+                sb + gv * HEAD_K_DIM + warp_k_vec_start + ki * WARP_TILE_K);
+            S[vi][ki][0] = t.x; S[vi][ki][1] = t.y;
+            S[vi][ki][2] = t.z; S[vi][ki][3] = t.w;
+        }
+    }
+
+    const auto* qb = query + (int64_t)batch_idx * NKH * HEAD_K_DIM + hk_idx * HEAD_K_DIM;
+    const auto* kb = key   + (int64_t)batch_idx * NKH * HEAD_K_DIM + hk_idx * HEAD_K_DIM;
+    const auto* vb = value + (int64_t)batch_idx * NVH * HEAD_V_DIM + hv_idx * HEAD_V_DIM;
+
+    float q_reg[K_ITERS][VEC_K], k_reg[K_ITERS][VEC_K];
+    float sq_q = 0.0f, sq_k = 0.0f;
+    #pragma unroll
+    for (int ki = 0; ki < K_ITERS; ki++) {
+        int ko = warp_k_vec_start + ki * WARP_TILE_K;
+        #pragma unroll
+        for (int j = 0; j < VEC_K; j++) {
+            float qv = __bfloat162float(qb[ko + j]);
+            float kv = __bfloat162float(kb[ko + j]);
+            q_reg[ki][j] = qv; k_reg[ki][j] = kv;
+            sq_q += qv * qv; sq_k += kv * kv;
+        }
+    }
+
+    reduce_2way_asm(sq_q, sq_k,
+        (lane_id ^ 1) << 2, (lane_id ^ 2) << 2, (lane_id ^ 4) << 2);
+    float inv_rsq_q = bi_rsqrt(sq_q + 1e-6f);
+    float inv_rsq_k = bi_rsqrt(sq_k + 1e-6f);
+
+    const float qs = scale * inv_rsq_q;
+    const float ks = inv_rsq_k;
+    #pragma unroll
+    for (int ki = 0; ki < K_ITERS; ki++) {
+        #pragma unroll
+        for (int j = 0; j < VEC_K; j++) {
+            q_reg[ki][j] *= qs; k_reg[ki][j] *= ks;
+        }
+    }
+
+    float dot_kq = 0.0f;
+    float res_hk[V_ITERS], res_hq[V_ITERS];
+    #pragma unroll
+    for (int vi = 0; vi < V_ITERS; vi++) { res_hk[vi] = 0.0f; res_hq[vi] = 0.0f; }
+    #pragma unroll
+    for (int ki = 0; ki < K_ITERS; ki++) {
+        #pragma unroll
+        for (int j = 0; j < VEC_K; j++) {
+            float qv = q_reg[ki][j], kv = k_reg[ki][j];
+            dot_kq += kv * qv;
+            #pragma unroll
+            for (int vi = 0; vi < V_ITERS; vi++) {
+                res_hk[vi] += S[vi][ki][j] * kv;
+                res_hq[vi] += S[vi][ki][j] * qv;
+            }
+        }
+    }
+
+    if constexpr (V_ITERS == 4) {
+        reduce_postloop_viters4_fused_asm(dot_kq, res_hk, res_hq, tid);
+    } else if constexpr (V_ITERS == 2) {
+        reduce_5way_asm(dot_kq, res_hk[0], res_hk[1], res_hq[0], res_hq[1],
+            (lane_id ^ 1) << 2, (lane_id ^ 2) << 2, (lane_id ^ 4) << 2);
+    } else {
+        float t0, t1, t2;
+        t0 = ds_swizzle_xor_f32<kDsSwizzleXor1>(dot_kq);
+        t1 = ds_swizzle_xor_f32<kDsSwizzleXor1>(res_hk[0]);
+        t2 = ds_swizzle_xor_f32<kDsSwizzleXor1>(res_hq[0]);
+        dot_kq += t0; res_hk[0] += t1; res_hq[0] += t2;
+        t0 = ds_swizzle_xor_f32<kDsSwizzleXor2>(dot_kq);
+        t1 = ds_swizzle_xor_f32<kDsSwizzleXor2>(res_hk[0]);
+        t2 = ds_swizzle_xor_f32<kDsSwizzleXor2>(res_hq[0]);
+        dot_kq += t0; res_hk[0] += t1; res_hq[0] += t2;
+        t0 = ds_swizzle_xor_f32<kDsSwizzleXor4>(dot_kq);
+        t1 = ds_swizzle_xor_f32<kDsSwizzleXor4>(res_hk[0]);
+        t2 = ds_swizzle_xor_f32<kDsSwizzleXor4>(res_hq[0]);
+        dot_kq += t0; res_hk[0] += t1; res_hq[0] += t2;
+    }
+
+    #pragma unroll
+    for (int vi = 0; vi < V_ITERS; vi++) {
+        res_hk[vi] *= exp_g; res_hq[vi] *= exp_g;
+    }
+
+    float vn[V_ITERS];
+    if constexpr (V_ITERS == 4) {
+        float tmp0 = (__bfloat162float(vb[global_v_base + 0*WARP_GROUP_TILE_V]) - res_hk[0]) * beta;
+        float tmp1 = (__bfloat162float(vb[global_v_base + 1*WARP_GROUP_TILE_V]) - res_hk[1]) * beta;
+        float tmp2 = (__bfloat162float(vb[global_v_base + 2*WARP_GROUP_TILE_V]) - res_hk[2]) * beta;
+        float tmp3 = (__bfloat162float(vb[global_v_base + 3*WARP_GROUP_TILE_V]) - res_hk[3]) * beta;
+        shfl_idx_4way_bi(vn[0], vn[1], vn[2], vn[3], tmp0, tmp1, tmp2, tmp3, leader_addr);
+    } else if constexpr (V_ITERS >= 2) {
+        float tmp0 = (__bfloat162float(vb[global_v_base + 0*WARP_GROUP_TILE_V]) - res_hk[0]) * beta;
+        float tmp1 = (__bfloat162float(vb[global_v_base + 1*WARP_GROUP_TILE_V]) - res_hk[1]) * beta;
+        shfl_idx_2way_bi(vn[0], vn[1], tmp0, tmp1, leader_addr);
+    } else {
+        float tmp0 = (__bfloat162float(vb[global_v_base]) - res_hk[0]) * beta;
+        vn[0] = shfl_idx_1way_bi(tmp0, leader_addr);
+    }
+
+    #pragma unroll
+    for (int vi = 0; vi < V_ITERS; vi++)
+        res_hq[vi] = res_hq[vi] + vn[vi] * dot_kq;
+
+    if (k_tid == 0) {
+        const int64_t out_base = (int64_t)batch_idx * NVH * HEAD_V_DIM
+                               + hv_idx * HEAD_V_DIM + global_v_base;
+        #pragma unroll
+        for (int vi = 0; vi < V_ITERS; vi++)
+            output[out_base + vi * WARP_GROUP_TILE_V] = __float2bfloat16(res_hq[vi]);
+    }
+
+    #pragma unroll
+    for (int ki = 0; ki < K_ITERS; ki++) {
+        #pragma unroll
+        for (int j = 0; j < VEC_K; j++) {
+            float kv = k_reg[ki][j];
+            #pragma unroll
+            for (int vi = 0; vi < V_ITERS; vi++)
+                S[vi][ki][j] = S[vi][ki][j] * exp_g + kv * vn[vi];
+        }
+    }
+
+    #pragma unroll
+    for (int vi = 0; vi < V_ITERS; vi++) {
+        int gv = global_v_base + vi * WARP_GROUP_TILE_V;
+        #pragma unroll
+        for (int ki = 0; ki < K_ITERS; ki++) {
+            float4 t = {S[vi][ki][0], S[vi][ki][1], S[vi][ki][2], S[vi][ki][3]};
+            *reinterpret_cast<float4*>(sb + gv * HEAD_K_DIM + warp_k_vec_start + ki * WARP_TILE_K) = t;
+        }
+    }
+}
+
 __global__
 __launch_bounds__(BLOCK_THREADS, 4)
 __attribute__((amdgpu_waves_per_eu(4, 6)))
@@ -4433,9 +4645,43 @@ DEF_NVH8_NVB4_BUILTIN_V(_v80_lb6, 6, 6, 6, 80)
 DEF_NVH8_NVB4_BUILTIN_V(_v96_lb5, 5, 5, 5, 96)
 DEF_NVH8_NVB4_BUILTIN_V(_v64_lb8, 8, 8, 8, 64)
 DEF_NVH8_NVB4_BUILTIN_V(_v44_lb12, 12, 12, 12, 44)
+DEF_NVH8_NVB4_BUILTIN_V(_v56_lb9, 9, 9, 9, 56)
+DEF_NVH8_NVB4_BUILTIN_V(_v52_lb10, 10, 10, 10, 52)
+DEF_NVH8_NVB4_BUILTIN_V(_v60_lb9, 9, 9, 9, 60)
+DEF_NVH8_NVB4_BUILTIN_V(_v48_lb10, 10, 10, 10, 48)
 
 #undef DEF_NVH8_NVB4_BUILTIN
 #undef DEF_NVH8_NVB4_BUILTIN_V
+
+#define DEF_NVH8_NVB4_STABLE_V(SUFFIX, LB, WPE_LO, WPE_HI, VGPR) \
+__global__ \
+__launch_bounds__(BLOCK_THREADS, LB) \
+__attribute__((amdgpu_waves_per_eu(WPE_LO, WPE_HI))) \
+__attribute__((amdgpu_num_vgpr(VGPR))) \
+void gdn_decode_kernel_stable_nvh8_nvb4##SUFFIX( \
+    const __hip_bfloat16* __restrict__ query, \
+    const __hip_bfloat16* __restrict__ key, \
+    const __hip_bfloat16* __restrict__ value, \
+    const __hip_bfloat16* __restrict__ a_input, \
+    const __hip_bfloat16* __restrict__ b_input, \
+    const __hip_bfloat16* __restrict__ dt_bias, \
+    const float* __restrict__ A_log, \
+    const int* __restrict__ indices, \
+    float* __restrict__ state, \
+    __hip_bfloat16* __restrict__ output, \
+    int batch_size, float scale \
+) { \
+    gdn_decode_kernel_stable_body<2, 8, 4>( \
+        query, key, value, a_input, b_input, dt_bias, A_log, indices, \
+        state, output, batch_size, scale); \
+}
+
+DEF_NVH8_NVB4_STABLE_V(_v64_lb8, 8, 8, 8, 64)
+DEF_NVH8_NVB4_STABLE_V(_v56_lb10, 10, 10, 10, 56)
+DEF_NVH8_NVB4_STABLE_V(_v60_lb9, 9, 9, 9, 60)
+DEF_NVH8_NVB4_STABLE_V(_v48_lb12, 12, 12, 12, 48)
+
+#undef DEF_NVH8_NVB4_STABLE_V
 
 // opt body with v80_lb6 tuning
 __global__
@@ -5356,7 +5602,23 @@ void launch_gdn_decode_iasm(
                         q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
                     case 23: hipLaunchKernelGGL(gdn_decode_kernel_builtin_nvh8_nvb4_v44_lb12, dim3(grid), dim3(block), 0, stream,
                         q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
-                    default: hipLaunchKernelGGL(gdn_decode_kernel_builtin_nvh8_nvb4_v64_lb8, dim3(grid), dim3(block), 0, stream,
+                    case 24: hipLaunchKernelGGL(gdn_decode_kernel_builtin_nvh8_nvb4_v56_lb9, dim3(grid), dim3(block), 0, stream,
+                        q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
+                    case 25: hipLaunchKernelGGL(gdn_decode_kernel_builtin_nvh8_nvb4_v52_lb10, dim3(grid), dim3(block), 0, stream,
+                        q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
+                    case 26: hipLaunchKernelGGL(gdn_decode_kernel_builtin_nvh8_nvb4_v60_lb9, dim3(grid), dim3(block), 0, stream,
+                        q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
+                    case 27: hipLaunchKernelGGL(gdn_decode_kernel_builtin_nvh8_nvb4_v48_lb10, dim3(grid), dim3(block), 0, stream,
+                        q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
+                    case 28: hipLaunchKernelGGL(gdn_decode_kernel_stable_nvh8_nvb4_v64_lb8, dim3(grid), dim3(block), 0, stream,
+                        q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
+                    case 29: hipLaunchKernelGGL(gdn_decode_kernel_stable_nvh8_nvb4_v56_lb10, dim3(grid), dim3(block), 0, stream,
+                        q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
+                    case 30: hipLaunchKernelGGL(gdn_decode_kernel_stable_nvh8_nvb4_v60_lb9, dim3(grid), dim3(block), 0, stream,
+                        q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
+                    case 31: hipLaunchKernelGGL(gdn_decode_kernel_stable_nvh8_nvb4_v48_lb12, dim3(grid), dim3(block), 0, stream,
+                        q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
+                    default: hipLaunchKernelGGL(gdn_decode_kernel_stable_nvh8_nvb4_v60_lb9, dim3(grid), dim3(block), 0, stream,
                         q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
                     }
                 } else {
