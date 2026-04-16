@@ -5356,7 +5356,7 @@ void launch_gdn_decode_iasm(
                         q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
                     case 23: hipLaunchKernelGGL(gdn_decode_kernel_builtin_nvh8_nvb4_v44_lb12, dim3(grid), dim3(block), 0, stream,
                         q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
-                    default: hipLaunchKernelGGL(gdn_decode_kernel_builtin_nvh8_nvb4_lb2, dim3(grid), dim3(block), 0, stream,
+                    default: hipLaunchKernelGGL(gdn_decode_kernel_builtin_nvh8_nvb4_v64_lb8, dim3(grid), dim3(block), 0, stream,
                         q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
                     }
                 } else {
