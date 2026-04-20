@@ -3,9 +3,13 @@
 #include <cstdlib>
 
 static int gdn_sort_threshold() {
+    // BS=128 with sorted path under-saturates HBM (~1.62 TB/s -> 79us).
+    // The unsorted path at BS=128 hits ~2.16 TB/s -> 59us (-25% kernel time, +30% vs FlyDSL).
+    // Sort still helps at BS=256 (97us vs 103us). Setting threshold=192 keeps sort only for
+    // BS in [192, +inf), so BS=128 uses the faster unsorted kernel and BS=256 keeps sort.
     static int t = []() {
         const char* e = std::getenv("HIP_GDN_SORT_IDX_BS");
-        return e ? std::atoi(e) : 64;
+        return e ? std::atoi(e) : 192;
     }();
     return t;
 }
@@ -317,6 +321,24 @@ void launch_gdn_decode_iasm_nvh8_dot2_opt(
     hipStream_t stream
 );
 
+void launch_gdn_decode_iasm_nvh8_dot2_nvb4_opt(
+    const void* query, const void* key, const void* value,
+    const void* a_input, const void* b_input, const void* dt_bias,
+    const void* A_log, const void* indices,
+    void* state, void* output,
+    int batch_size, float scale,
+    hipStream_t stream
+);
+
+void launch_gdn_decode_iasm_nvh8_dot2_nvb4_opt_lb6(
+    const void* query, const void* key, const void* value,
+    const void* a_input, const void* b_input, const void* dt_bias,
+    const void* A_log, const void* indices,
+    void* state, void* output,
+    int batch_size, float scale,
+    hipStream_t stream
+);
+
 void launch_gdn_decode_iasm_nvh8_streaming(
     const void* query, const void* key, const void* value,
     const void* a_input, const void* b_input, const void* dt_bias,
@@ -399,6 +421,24 @@ void launch_gdn_decode_iasm_nvh8_opt(
 );
 
 void launch_gdn_decode_iasm_nvh8_nvb2_opt(
+    const void* query, const void* key, const void* value,
+    const void* a_input, const void* b_input, const void* dt_bias,
+    const void* A_log, const void* indices,
+    void* state, void* output,
+    int batch_size, float scale,
+    hipStream_t stream
+);
+
+void launch_gdn_decode_builtin_nvh8_nvb2_v64_lb8(
+    const void* query, const void* key, const void* value,
+    const void* a_input, const void* b_input, const void* dt_bias,
+    const void* A_log, const void* indices,
+    void* state, void* output,
+    int batch_size, float scale,
+    hipStream_t stream
+);
+
+void launch_gdn_decode_builtin_nvh8_nvb2_v80_lb6(
     const void* query, const void* key, const void* value,
     const void* a_input, const void* b_input, const void* dt_bias,
     const void* A_log, const void* indices,
@@ -591,7 +631,43 @@ void launch_gdn_decode_iasm_nvh8_nvb4_opt_lb6_fusepost(
     hipStream_t stream
 );
 
+void launch_gdn_decode_builtin_nvh8_nvb4_v80_lb6_fusestore(
+    const void* query, const void* key, const void* value,
+    const void* a_input, const void* b_input, const void* dt_bias,
+    const void* A_log, const void* indices,
+    void* state, void* output,
+    int batch_size, float scale,
+    hipStream_t stream
+);
+
+void launch_gdn_decode_builtin_nvh8_nvb4_v64_lb8_fusestore(
+    const void* query, const void* key, const void* value,
+    const void* a_input, const void* b_input, const void* dt_bias,
+    const void* A_log, const void* indices,
+    void* state, void* output,
+    int batch_size, float scale,
+    hipStream_t stream
+);
+
 void launch_gdn_decode_iasm_nvh8_nvb4_opt_lb6_vmem(
+    const void* query, const void* key, const void* value,
+    const void* a_input, const void* b_input, const void* dt_bias,
+    const void* A_log, const void* indices,
+    void* state, void* output,
+    int batch_size, float scale,
+    hipStream_t stream
+);
+
+void launch_gdn_decode_iasm_nvh8_nvb4_opt_lb4_vmem(
+    const void* query, const void* key, const void* value,
+    const void* a_input, const void* b_input, const void* dt_bias,
+    const void* A_log, const void* indices,
+    void* state, void* output,
+    int batch_size, float scale,
+    hipStream_t stream
+);
+
+void launch_gdn_decode_iasm_nvh8_nvb4_opt_lb10v48_vmem(
     const void* query, const void* key, const void* value,
     const void* a_input, const void* b_input, const void* dt_bias,
     const void* A_log, const void* indices,
@@ -944,16 +1020,24 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     DEF_NVH8_VARIANT("hip_gdn_nvh8_bs16_nvb1_lb4_vm_fuse", launch_gdn_decode_iasm_nvh8_bs16_nvb1_lb4_vm_fuse);
     DEF_NVH8_VARIANT("hip_gdn_nvh8_bs16_nvb1_lb3_vm", launch_gdn_decode_iasm_nvh8_bs16_nvb1_lb3_vm);
     DEF_NVH8_VARIANT("hip_gdn_nvh8_dot2_opt", launch_gdn_decode_iasm_nvh8_dot2_opt);
+    DEF_NVH8_VARIANT("hip_gdn_nvh8_dot2_nvb4_opt", launch_gdn_decode_iasm_nvh8_dot2_nvb4_opt);
+    DEF_NVH8_VARIANT("hip_gdn_nvh8_dot2_nvb4_opt_lb6", launch_gdn_decode_iasm_nvh8_dot2_nvb4_opt_lb6);
     DEF_NVH8_VARIANT("hip_gdn_nvh8_streaming", launch_gdn_decode_iasm_nvh8_streaming);
     // Optimized variants: latency hiding
     DEF_NVH8_VARIANT("hip_gdn_nvh8_opt", launch_gdn_decode_iasm_nvh8_opt);
     DEF_NVH8_VARIANT("hip_gdn_nvh8_nvb2_opt", launch_gdn_decode_iasm_nvh8_nvb2_opt);
+    DEF_NVH8_VARIANT("hip_gdn_builtin_nvh8_nvb2_v64_lb8", launch_gdn_decode_builtin_nvh8_nvb2_v64_lb8);
+    DEF_NVH8_VARIANT("hip_gdn_builtin_nvh8_nvb2_v80_lb6", launch_gdn_decode_builtin_nvh8_nvb2_v80_lb6);
     DEF_NVH8_VARIANT("hip_gdn_nvh8_nvb4_opt", launch_gdn_decode_iasm_nvh8_nvb4_opt);
     DEF_NVH8_VARIANT("hip_gdn_nvh8_nvb4_memopt", launch_gdn_decode_iasm_nvh8_nvb4_memopt);
     DEF_NVH8_VARIANT("hip_gdn_nvh8_nvb4_opt_lb2", launch_gdn_decode_iasm_nvh8_nvb4_opt_lb2);
     DEF_NVH8_VARIANT("hip_gdn_nvh8_nvb4_opt_lb6", launch_gdn_decode_iasm_nvh8_nvb4_opt_lb6);
     DEF_NVH8_VARIANT("hip_gdn_nvh8_nvb4_opt_lb6_fusepost", launch_gdn_decode_iasm_nvh8_nvb4_opt_lb6_fusepost);
+    DEF_NVH8_VARIANT("hip_gdn_nvh8_builtin_nvb4_v80_lb6_fusestore", launch_gdn_decode_builtin_nvh8_nvb4_v80_lb6_fusestore);
+    DEF_NVH8_VARIANT("hip_gdn_nvh8_builtin_nvb4_v64_lb8_fusestore", launch_gdn_decode_builtin_nvh8_nvb4_v64_lb8_fusestore);
     DEF_NVH8_VARIANT("hip_gdn_nvh8_nvb4_opt_lb6_vmem", launch_gdn_decode_iasm_nvh8_nvb4_opt_lb6_vmem);
+    DEF_NVH8_VARIANT("hip_gdn_nvh8_nvb4_opt_lb4_vmem", launch_gdn_decode_iasm_nvh8_nvb4_opt_lb4_vmem);
+    DEF_NVH8_VARIANT("hip_gdn_nvh8_nvb4_opt_lb10v48_vmem", launch_gdn_decode_iasm_nvh8_nvb4_opt_lb10v48_vmem);
     DEF_NVH8_VARIANT("hip_gdn_nvh8_nvb4_sched_hint", launch_gdn_decode_iasm_nvh8_nvb4_sched_hint);
     DEF_NVH8_VARIANT("hip_gdn_nvh8_bs16_extreme", launch_gdn_decode_iasm_nvh8_bs16_extreme);
     DEF_NVH8_VARIANT("hip_gdn_nvh8_bs16_extreme_lb1", launch_gdn_decode_iasm_nvh8_bs16_extreme_lb1);
