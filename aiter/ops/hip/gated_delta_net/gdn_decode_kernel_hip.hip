@@ -416,6 +416,32 @@ __device__ __forceinline__ void store_state_f4_nt(float* __restrict__ p, float4 
     __builtin_nontemporal_store(vv, reinterpret_cast<v4f*>(p));
 }
 
+// Compile-time switchable load/store helpers for state.
+// Used by builtin body to opt into cache-bypass loads/stores per-kernel
+// without touching call sites of the existing kernels.
+template <bool NT>
+__device__ __forceinline__ float4 load_state_f4_maybent(const float* __restrict__ p) {
+    if constexpr (NT) {
+        typedef float v4f __attribute__((vector_size(16)));
+        v4f vv = __builtin_nontemporal_load(reinterpret_cast<const v4f*>(p));
+        float4 r; r.x = vv[0]; r.y = vv[1]; r.z = vv[2]; r.w = vv[3];
+        return r;
+    } else {
+        return *reinterpret_cast<const float4*>(p);
+    }
+}
+
+template <bool NT>
+__device__ __forceinline__ void store_state_f4_maybent(float* __restrict__ p, float4 t) {
+    if constexpr (NT) {
+        typedef float v4f __attribute__((vector_size(16)));
+        v4f vv = {t.x, t.y, t.z, t.w};
+        __builtin_nontemporal_store(vv, reinterpret_cast<v4f*>(p));
+    } else {
+        *reinterpret_cast<float4*>(p) = t;
+    }
+}
+
 __device__ __forceinline__ float buf_load_f32(__amdgpu_buffer_rsrc_t rsrc, int byte_offset) {
     return __uint_as_float(__builtin_amdgcn_raw_buffer_load_b32(rsrc, byte_offset, 0, 0));
 }
@@ -3123,7 +3149,8 @@ __device__ __forceinline__ void gdn_decode_kernel_iasm_sq1_body(
 // Gating is computed BEFORE state loads to maximize overlap.
 // Optional 4th template arg: fused interleaved output+state stores (NVB=4 fusestore sweep).
 // ============================================================
-template <int NKH, int NVH, int NUM_V_BLOCKS, bool BUILTIN_FUSESTORE = false>
+template <int NKH, int NVH, int NUM_V_BLOCKS, bool BUILTIN_FUSESTORE = false,
+          bool NT_STATE_LOAD = false, bool NT_STATE_STORE = false>
 __device__ __forceinline__ void gdn_decode_kernel_builtin_body(
     const __hip_bfloat16* __restrict__ query,
     const __hip_bfloat16* __restrict__ key,
@@ -3179,7 +3206,7 @@ __device__ __forceinline__ void gdn_decode_kernel_builtin_body(
         int gv = global_v_base + vi * WARP_GROUP_TILE_V;
         GDN_K_ITERS_UNROLL
         for (int ki = 0; ki < K_ITERS; ki++) {
-            float4 t = *reinterpret_cast<const float4*>(
+            float4 t = load_state_f4_maybent<NT_STATE_LOAD>(
                 sb + gv * HEAD_K_DIM + warp_k_vec_start + ki * WARP_TILE_K);
             S[vi][ki][0] = t.x; S[vi][ki][1] = t.y;
             S[vi][ki][2] = t.z; S[vi][ki][3] = t.w;
@@ -3314,7 +3341,8 @@ __device__ __forceinline__ void gdn_decode_kernel_builtin_body(
             GDN_K_ITERS_UNROLL
             for (int ki = 0; ki < K_ITERS; ki++) {
                 float4 t = {S[vi][ki][0], S[vi][ki][1], S[vi][ki][2], S[vi][ki][3]};
-                *reinterpret_cast<float4*>(sb + gv * HEAD_K_DIM + warp_k_vec_start + ki * WARP_TILE_K) = t;
+                store_state_f4_maybent<NT_STATE_STORE>(
+                    sb + gv * HEAD_K_DIM + warp_k_vec_start + ki * WARP_TILE_K, t);
             }
         }
     } else {
@@ -3330,7 +3358,8 @@ __device__ __forceinline__ void gdn_decode_kernel_builtin_body(
             GDN_K_ITERS_UNROLL
             for (int ki = 0; ki < K_ITERS; ki++) {
                 float4 t = {S[vi][ki][0], S[vi][ki][1], S[vi][ki][2], S[vi][ki][3]};
-                *reinterpret_cast<float4*>(sb + gv * HEAD_K_DIM + warp_k_vec_start + ki * WARP_TILE_K) = t;
+                store_state_f4_maybent<NT_STATE_STORE>(
+                    sb + gv * HEAD_K_DIM + warp_k_vec_start + ki * WARP_TILE_K, t);
             }
         }
     }
@@ -6137,8 +6166,47 @@ DEF_NVH8_NVB4_BUILTIN_V(_v36_lb16, 16, 16, 16, 36)
 DEF_NVH8_NVB4_BUILTIN_V(_v112_lb2, 2, 2, 2, 112)
 DEF_NVH8_NVB4_BUILTIN_V(_v128_lb2, 2, 2, 2, 128)
 
+// ── BS=2 cache-bypass variants ──
+// In `online` mode the GDN kernel sits between in_proj/conv (which thrash L2) and
+// rmsnorm/out_proj (which read GDN output). For BS=2 the state working-set per
+// XCD is ~256KB and gets evicted by companion ops between captured-graph replays.
+// Mark state float4 load/store as nontemporal so they bypass L2 entirely (HBM
+// streaming) and stop polluting the small lines that companion needs warm.
+// The DATA LAYOUT is unchanged — only memory-policy bits differ.
+#define DEF_NVH8_NVB4_BUILTIN_V_NT(SUFFIX, LB, WPE_LO, WPE_HI, VGPR, NT_LD, NT_ST) \
+__global__ \
+__launch_bounds__(BLOCK_THREADS, LB) \
+__attribute__((amdgpu_waves_per_eu(WPE_LO, WPE_HI))) \
+__attribute__((amdgpu_num_vgpr(VGPR))) \
+void gdn_decode_kernel_builtin_nvh8_nvb4##SUFFIX( \
+    const __hip_bfloat16* __restrict__ query, \
+    const __hip_bfloat16* __restrict__ key, \
+    const __hip_bfloat16* __restrict__ value, \
+    const __hip_bfloat16* __restrict__ a_input, \
+    const __hip_bfloat16* __restrict__ b_input, \
+    const __hip_bfloat16* __restrict__ dt_bias, \
+    const float* __restrict__ A_log, \
+    const int* __restrict__ indices, \
+    float* __restrict__ state, \
+    __hip_bfloat16* __restrict__ output, \
+    int batch_size, float scale \
+) { \
+    gdn_decode_kernel_builtin_body<2, 8, 4, false, NT_LD, NT_ST>( \
+        query, key, value, a_input, b_input, dt_bias, A_log, indices, \
+        state, output, batch_size, scale); \
+}
+
+DEF_NVH8_NVB4_BUILTIN_V_NT(_v52_lb10_ntload,         10, 10, 10, 52, true,  false)
+DEF_NVH8_NVB4_BUILTIN_V_NT(_v52_lb10_ntstore,        10, 10, 10, 52, false, true)
+DEF_NVH8_NVB4_BUILTIN_V_NT(_v52_lb10_ntboth,         10, 10, 10, 52, true,  true)
+DEF_NVH8_NVB4_BUILTIN_V_NT(_v48_lb10_ntload,         10, 10, 10, 48, true,  false)
+DEF_NVH8_NVB4_BUILTIN_V_NT(_v48_lb10_ntboth,         10, 10, 10, 48, true,  true)
+DEF_NVH8_NVB4_BUILTIN_V_NT(_v56_lb9_ntload,           9,  9,  9, 56, true,  false)
+DEF_NVH8_NVB4_BUILTIN_V_NT(_v56_lb9_ntboth,           9,  9,  9, 56, true,  true)
+
 #undef DEF_NVH8_NVB4_BUILTIN
 #undef DEF_NVH8_NVB4_BUILTIN_V
+#undef DEF_NVH8_NVB4_BUILTIN_V_NT
 
 // ── exp2 gating path (explicit v_exp_f32 + log2-domain log1p), variants 110–115 ──
 #define DEF_NVH8_NVB4_EXP2(SUFFIX, LB, WPE_LO, WPE_HI) \
@@ -7216,7 +7284,35 @@ void launch_gdn_decode_iasm(
                         q, k, v, a, b, dt, al, idx, st, o, batch_perm, batch_size, scale);
                 }
             } else {
-                if (batch_size <= 4) {
+                if (batch_size == 2) {
+                    // BS=2 cache-bypass dispatch.
+                    // In `online` GDN sits between in_proj/conv (heavy L2 footprint) and
+                    // rmsnorm/out_proj.  Without bypass, our 1MB state read/write thrashes
+                    // L2 ↔ companion ops, costing ~0.5us/replay.  Marking state load+store
+                    // nontemporal (HBM streaming) keeps L2 lines for companion and gives
+                    // ~+8% over FlyDSL (vs ~6% baseline) without changing data layout.
+                    //
+                    // Default V=3 = _v52_lb10 + NT load + NT store (best stable choice;
+                    // V=5/V=7 share identical median but show occasional tail outliers).
+                    // V=0 falls back to the original cached-load kernel.
+                    static int bs2v = -1;
+                    if (bs2v < 0) {
+                        const char* e = getenv("GDN_BS2_VARIANT");
+                        bs2v = e ? atoi(e) : 3;
+                    }
+                    dim3 block(BLOCK_THREADS);
+                    dim3 grid_nvb4(batch_size * 8 * 4);
+                    switch (bs2v) {
+                        case 0: hipLaunchKernelGGL(gdn_decode_kernel_builtin_nvh8_nvb4_v52_lb10,         dim3(grid_nvb4), block, 0, stream, q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
+                        case 1: hipLaunchKernelGGL(gdn_decode_kernel_builtin_nvh8_nvb4_v52_lb10_ntload,  dim3(grid_nvb4), block, 0, stream, q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
+                        case 2: hipLaunchKernelGGL(gdn_decode_kernel_builtin_nvh8_nvb4_v52_lb10_ntstore, dim3(grid_nvb4), block, 0, stream, q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
+                        case 4: hipLaunchKernelGGL(gdn_decode_kernel_builtin_nvh8_nvb4_v48_lb10_ntload,  dim3(grid_nvb4), block, 0, stream, q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
+                        case 5: hipLaunchKernelGGL(gdn_decode_kernel_builtin_nvh8_nvb4_v48_lb10_ntboth,  dim3(grid_nvb4), block, 0, stream, q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
+                        case 6: hipLaunchKernelGGL(gdn_decode_kernel_builtin_nvh8_nvb4_v56_lb9_ntload,   dim3(grid_nvb4), block, 0, stream, q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
+                        case 7: hipLaunchKernelGGL(gdn_decode_kernel_builtin_nvh8_nvb4_v56_lb9_ntboth,   dim3(grid_nvb4), block, 0, stream, q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
+                        default: hipLaunchKernelGGL(gdn_decode_kernel_builtin_nvh8_nvb4_v52_lb10_ntboth, dim3(grid_nvb4), block, 0, stream, q, k, v, a, b, dt, al, idx, st, o, batch_size, scale);
+                    }
+                } else if (batch_size <= 4) {
                     static int bs4v = -1;
                     if (bs4v < 0) {
                         const char* e = getenv("GDN_BS4_VARIANT");
