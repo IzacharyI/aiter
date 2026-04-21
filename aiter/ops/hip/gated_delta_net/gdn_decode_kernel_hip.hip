@@ -6682,6 +6682,236 @@ DEF_NVH8_NVB4_PREFETCH_V(_v40_lb14, 14, 14, 14, 40)
 
 #undef DEF_NVH8_NVB4_PREFETCH_V
 
+// ============================================================
+// L2-prefetch body for BS=1 (production cold-L2 mitigation).
+//
+// Motivation: in production sglang, between two consecutive same-layer
+// GDN decode calls we run ~21 other layers (attention + MoE) which fully
+// thrash the per-XCD 4 MB L2.  This makes the state-tensor load a cold
+// HBM fetch (~600 cycles) and pushes BS=1 from microbench 5.1us up to
+// ~5.8us in production trace.
+//
+// This body issues a "fake" state load via inline asm at kernel entry —
+// before scalar loads, gating compute, and Q/K/V loads.  The load goes
+// through L1→L2→HBM and warms L2 lines for the *real* state load that
+// happens later in the body.  The dummy destination register has zero
+// live range (compiler will allocate any free temp), and `s_waitcnt vmcnt`
+// is intentionally NOT issued — the load runs in the background while
+// the rest of the kernel does scalar/SFU/Q/K/V work.
+//
+// Net effect (target): bring production BS=1 closer to microbench 5.1us
+// by hiding HBM→L2 latency behind ~30-50 cycles of setup work.
+// ============================================================
+template <int NKH, int NVH>
+__device__ __forceinline__ void gdn_decode_kernel_l2pref_body_nvb4(
+    const __hip_bfloat16* __restrict__ query,
+    const __hip_bfloat16* __restrict__ key,
+    const __hip_bfloat16* __restrict__ value,
+    const __hip_bfloat16* __restrict__ a_input,
+    const __hip_bfloat16* __restrict__ b_input,
+    const __hip_bfloat16* __restrict__ dt_bias,
+    const float* __restrict__          A_log,
+    const int* __restrict__            indices,
+    float* __restrict__                state,
+    __hip_bfloat16* __restrict__       output,
+    int batch_size, float scale
+) {
+    constexpr int NUM_V_BLOCKS = 4;
+    constexpr int TILE_V = HEAD_V_DIM / NUM_V_BLOCKS;
+    constexpr int WARP_GROUP_TILE_V = NUM_WARPS * WARP_V_THREADS;
+    static_assert(TILE_V == WARP_GROUP_TILE_V, "l2pref body expects V_ITERS==1 for NVB=4");
+
+    const int tid = threadIdx.x;
+    const int lane_id = tid % WARP_SIZE;
+    const int warp_id = tid / WARP_SIZE;
+    const int k_tid = lane_id % WARP_K_THREADS;
+    const int v_tid = lane_id / WARP_K_THREADS;
+
+    const int b_hv_vb = blockIdx.x;
+    const int v_block_id = b_hv_vb % NUM_V_BLOCKS;
+    const int b_hv = b_hv_vb / NUM_V_BLOCKS;
+    const int batch_idx = b_hv / NVH;
+    const int hv_idx = b_hv % NVH;
+    const int hk_idx = hv_idx / (NVH / NKH);
+
+    if (batch_idx >= batch_size) return;
+    const int pool_idx = indices[batch_idx];
+    if (pool_idx < 0) return;
+
+    const int warp_k_vec_start = k_tid * VEC_K;
+    const int global_v_base = v_block_id * TILE_V + warp_id * WARP_V_THREADS + v_tid;
+    const int leader_addr = ((lane_id / WARP_K_THREADS) * WARP_K_THREADS) << 2;
+
+    const int shs = HEAD_V_DIM * HEAD_K_DIM;
+    float* sb = state + (int64_t)pool_idx * NVH * shs + hv_idx * shs;
+
+    // ── L2 PREFETCH: issue dummy state loads at kernel entry ──
+    // K_ITERS = HEAD_K_DIM / WARP_TILE_K = 128 / 32 = 4 iters per thread.
+    // Each iter is a float4 (16B), so per thread = 64B per WG = 16 KB,
+    // exactly covering the WG's state working set.  We do not wait on
+    // vmcnt — the load runs in parallel with scalar/gating/Q/K/V work
+    // below.  The destination register pool_pf is dead-on-arrival (never
+    // read), so it has zero live range.  `volatile` + memory clobber
+    // prevents the compiler from eliminating the load.
+    {
+        const float* pf_base = sb + global_v_base * HEAD_K_DIM + warp_k_vec_start;
+        float4 pf_buf;
+        GDN_K_ITERS_UNROLL
+        for (int ki = 0; ki < K_ITERS; ki++) {
+            asm volatile(
+                "global_load_dwordx4 %0, %1, off"
+                : "=v"(pf_buf)
+                : "v"(pf_base + ki * WARP_TILE_K)
+                : "memory"
+            );
+        }
+        // No s_waitcnt vmcnt — the load is in flight.
+    }
+
+    const int ab = batch_idx * NVH + hv_idx;
+
+    // Scalar loads — these go to L1/L2 paths different from state HBM,
+    // so they happen in parallel with the in-flight state prefetch above.
+    const float r_a = __bfloat162float(a_input[ab]);
+    const float r_dt = __bfloat162float(dt_bias[hv_idx]);
+    const float r_b = __bfloat162float(b_input[ab]);
+    const float r_A_log = A_log[hv_idx];
+
+    // Gating compute (SFU ops) overlaps with in-flight state HBM→L2.
+    const float x = r_a + r_dt;
+    const float sp = bi_fast_log1p(bi_fast_exp(x));
+    const float exp_g = bi_fast_exp(-bi_fast_exp(r_A_log) * sp);
+    const float beta = bi_rcp(1.0f + bi_fast_exp(-r_b));
+
+    // Real state load — should hit L2 now (warmed by prefetch above).
+    float S[K_ITERS][VEC_K];
+    GDN_K_ITERS_UNROLL
+    for (int ki = 0; ki < K_ITERS; ki++) {
+        float4 t = *reinterpret_cast<const float4*>(
+            sb + global_v_base * HEAD_K_DIM + warp_k_vec_start + ki * WARP_TILE_K);
+        S[ki][0] = t.x; S[ki][1] = t.y; S[ki][2] = t.z; S[ki][3] = t.w;
+    }
+
+    const auto* qb = query + (int64_t)batch_idx * NKH * HEAD_K_DIM + hk_idx * HEAD_K_DIM;
+    const auto* kb = key   + (int64_t)batch_idx * NKH * HEAD_K_DIM + hk_idx * HEAD_K_DIM;
+    const auto* vb = value + (int64_t)batch_idx * NVH * HEAD_V_DIM + hv_idx * HEAD_V_DIM;
+
+    float q_reg[K_ITERS][VEC_K], k_reg[K_ITERS][VEC_K];
+    float sq_q = 0.0f, sq_k = 0.0f;
+    GDN_K_ITERS_UNROLL
+    for (int ki = 0; ki < K_ITERS; ki++) {
+        int ko = warp_k_vec_start + ki * WARP_TILE_K;
+        #pragma unroll
+        for (int j = 0; j < VEC_K; j++) {
+            float qv = __bfloat162float(qb[ko + j]);
+            float kv = __bfloat162float(kb[ko + j]);
+            q_reg[ki][j] = qv;
+            k_reg[ki][j] = kv;
+            sq_q += qv * qv;
+            sq_k += kv * kv;
+        }
+    }
+
+    reduce_2way_asm(sq_q, sq_k, (lane_id ^ 1) << 2, (lane_id ^ 2) << 2, (lane_id ^ 4) << 2);
+    float inv_rsq_q = bi_rsqrt(sq_q + 1e-6f);
+    float inv_rsq_k = bi_rsqrt(sq_k + 1e-6f);
+    const float qs = scale * inv_rsq_q;
+    const float ks = inv_rsq_k;
+
+    GDN_K_ITERS_UNROLL
+    for (int ki = 0; ki < K_ITERS; ki++) {
+        #pragma unroll
+        for (int j = 0; j < VEC_K; j++) {
+            q_reg[ki][j] *= qs;
+            k_reg[ki][j] *= ks;
+        }
+    }
+
+    float dot_kq = 0.0f;
+    float res_hk = 0.0f;
+    float res_hq = 0.0f;
+    GDN_K_ITERS_UNROLL
+    for (int ki = 0; ki < K_ITERS; ki++) {
+        #pragma unroll
+        for (int j = 0; j < VEC_K; j++) {
+            float qv = q_reg[ki][j];
+            float kv = k_reg[ki][j];
+            dot_kq += kv * qv;
+            res_hk += S[ki][j] * kv;
+            res_hq += S[ki][j] * qv;
+        }
+    }
+
+    float t0 = ds_swizzle_xor_f32<kDsSwizzleXor1>(dot_kq);
+    float t1 = ds_swizzle_xor_f32<kDsSwizzleXor1>(res_hk);
+    float t2 = ds_swizzle_xor_f32<kDsSwizzleXor1>(res_hq);
+    dot_kq += t0; res_hk += t1; res_hq += t2;
+    t0 = ds_swizzle_xor_f32<kDsSwizzleXor2>(dot_kq);
+    t1 = ds_swizzle_xor_f32<kDsSwizzleXor2>(res_hk);
+    t2 = ds_swizzle_xor_f32<kDsSwizzleXor2>(res_hq);
+    dot_kq += t0; res_hk += t1; res_hq += t2;
+    t0 = ds_swizzle_xor_f32<kDsSwizzleXor4>(dot_kq);
+    t1 = ds_swizzle_xor_f32<kDsSwizzleXor4>(res_hk);
+    t2 = ds_swizzle_xor_f32<kDsSwizzleXor4>(res_hq);
+    dot_kq += t0; res_hk += t1; res_hq += t2;
+
+    res_hk *= exp_g;
+    res_hq *= exp_g;
+
+    float tmp0 = (__bfloat162float(vb[global_v_base]) - res_hk) * beta;
+    float vn = as_float(__builtin_amdgcn_ds_bpermute(leader_addr, as_int(tmp0)));
+
+    res_hq += vn * dot_kq;
+    if (k_tid == 0) {
+        const int64_t out_base = (int64_t)batch_idx * NVH * HEAD_V_DIM + hv_idx * HEAD_V_DIM + global_v_base;
+        output[out_base] = __float2bfloat16(res_hq);
+    }
+
+    GDN_K_ITERS_UNROLL
+    for (int ki = 0; ki < K_ITERS; ki++) {
+        #pragma unroll
+        for (int j = 0; j < VEC_K; j++) {
+            S[ki][j] = S[ki][j] * exp_g + k_reg[ki][j] * vn;
+        }
+    }
+
+    GDN_K_ITERS_UNROLL
+    for (int ki = 0; ki < K_ITERS; ki++) {
+        float4 t = {S[ki][0], S[ki][1], S[ki][2], S[ki][3]};
+        *reinterpret_cast<float4*>(sb + global_v_base * HEAD_K_DIM + warp_k_vec_start + ki * WARP_TILE_K) = t;
+    }
+}
+
+// L2-prefetch body kernel wrappers
+#define DEF_NVH8_NVB4_L2PREF_V(SUFFIX, LB, WPE_LO, WPE_HI, VGPR) \
+__global__ \
+__launch_bounds__(BLOCK_THREADS, LB) \
+__attribute__((amdgpu_waves_per_eu(WPE_LO, WPE_HI))) \
+__attribute__((amdgpu_num_vgpr(VGPR))) \
+void gdn_decode_kernel_l2pref_nvh8_nvb4##SUFFIX( \
+    const __hip_bfloat16* __restrict__ query, \
+    const __hip_bfloat16* __restrict__ key, \
+    const __hip_bfloat16* __restrict__ value, \
+    const __hip_bfloat16* __restrict__ a_input, \
+    const __hip_bfloat16* __restrict__ b_input, \
+    const __hip_bfloat16* __restrict__ dt_bias, \
+    const float* __restrict__ A_log, \
+    const int* __restrict__ indices, \
+    float* __restrict__ state, \
+    __hip_bfloat16* __restrict__ output, \
+    int batch_size, float scale \
+) { \
+    gdn_decode_kernel_l2pref_body_nvb4<2, 8>( \
+        query, key, value, a_input, b_input, dt_bias, A_log, indices, \
+        state, output, batch_size, scale); \
+}
+
+DEF_NVH8_NVB4_L2PREF_V(_v52_lb10, 10, 10, 10, 52)
+DEF_NVH8_NVB4_L2PREF_V(_v48_lb10, 10, 10, 10, 48)
+DEF_NVH8_NVB4_L2PREF_V(_v56_lb9,  9,  9,  9,  56)
+
+#undef DEF_NVH8_NVB4_L2PREF_V
+
 // NVB=4 streaming + interleaved ds_swizzle / lgkm overlap (GDN_NVH8_NVB4_VARIANT 100–105)
 #define DEF_NVH8_NVB4_INTERLEAVED_V(SUFFIX, LB, WPE_LO, WPE_HI, VGPR) \
 __global__ \
@@ -7312,6 +7542,38 @@ void launch_gdn_decode_iasm(
                         case 7: hipLaunchKernelGGL(gdn_decode_kernel_builtin_nvh8_nvb4_v56_lb9_ntboth,   dim3(grid_nvb4), block, 0, stream, q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
                         default: hipLaunchKernelGGL(gdn_decode_kernel_builtin_nvh8_nvb4_v52_lb10_ntboth, dim3(grid_nvb4), block, 0, stream, q, k, v, a, b, dt, al, idx, st, o, batch_size, scale);
                     }
+                } else if (batch_size == 1) {
+                    // BS=1 dedicated dispatch (split off from the BS<=4 path so
+                    // experiments here don't perturb BS=3/4).  Production trace
+                    // A/B (sglang Qwen3.5 397B, scheme #4):
+                    //   V=0  builtin  v52_lb10            mean=5.83 std=0.13 us  ← default (beats FlyDSL 6.02us by +3.2%)
+                    //   V=1  l2pref   v52_lb10            mean=5.95 std=0.16 us  (min 4.97 best, but adds 4 ASM-load
+                    //                                      cycles that hurt the typical warm-L2 case)
+                    //   V=2  l2pref   v48_lb10            (lower VGPR experiment)
+                    //   V=3  l2pref   v56_lb9             (higher VGPR experiment)
+                    //   V=4  prefetch v52_lb10            (compute-prefetch body, scalars-first ordering)
+                    //   V=5  builtin  v52_lb10 + nt-load  (NT-load skips L2 cache fill; for cold-L2 ablation only)
+                    //
+                    // L2 is in fact warm in production: FLA-prefill wrote the
+                    // same state line ~50us earlier in the same forward, and
+                    // adjacent decode iterations re-touch nearby slots.  Thus
+                    // explicit L2-prewarm in the BS=1 kernel hurts more than it
+                    // helps — kept as a variant for future cold-L2 scenarios.
+                    static int bs1v = -1;
+                    if (bs1v < 0) {
+                        const char* e = getenv("GDN_BS1_VARIANT");
+                        bs1v = e ? atoi(e) : 0;
+                    }
+                    dim3 block(BLOCK_THREADS);
+                    dim3 grid_nvb4(batch_size * 8 * 4);
+                    switch (bs1v) {
+                        case 1: hipLaunchKernelGGL(gdn_decode_kernel_l2pref_nvh8_nvb4_v52_lb10,    dim3(grid_nvb4), block, 0, stream, q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
+                        case 2: hipLaunchKernelGGL(gdn_decode_kernel_l2pref_nvh8_nvb4_v48_lb10,    dim3(grid_nvb4), block, 0, stream, q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
+                        case 3: hipLaunchKernelGGL(gdn_decode_kernel_l2pref_nvh8_nvb4_v56_lb9,     dim3(grid_nvb4), block, 0, stream, q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
+                        case 4: hipLaunchKernelGGL(gdn_decode_kernel_prefetch_nvh8_nvb4_v52_lb10,  dim3(grid_nvb4), block, 0, stream, q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
+                        case 5: hipLaunchKernelGGL(gdn_decode_kernel_builtin_nvh8_nvb4_v52_lb10_ntload, dim3(grid_nvb4), block, 0, stream, q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
+                        default: hipLaunchKernelGGL(gdn_decode_kernel_builtin_nvh8_nvb4_v52_lb10,  dim3(grid_nvb4), block, 0, stream, q, k, v, a, b, dt, al, idx, st, o, batch_size, scale);
+                    }
                 } else if (batch_size <= 4) {
                     static int bs4v = -1;
                     if (bs4v < 0) {
@@ -7333,6 +7595,10 @@ void launch_gdn_decode_iasm(
                         case 9: hipLaunchKernelGGL(gdn_decode_kernel_exp2_nvh8_nvb4_v52_lb10,       dim3(grid_nvb4), block, 0, stream, q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
                         case 10: hipLaunchKernelGGL(gdn_decode_kernel_iasm_tp8_nvh8_sq1_nvb1_lb4,   dim3(grid_nvb1), block, 0, stream, q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
                         case 11: hipLaunchKernelGGL(gdn_decode_kernel_iasm_tp8_nvh8_sq1_nvb1,       dim3(grid_nvb1), block, 0, stream, q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
+                        // L2-prefetch variants (cold-L2 mitigation for production BS=1).
+                        case 12: hipLaunchKernelGGL(gdn_decode_kernel_l2pref_nvh8_nvb4_v52_lb10,    dim3(grid_nvb4), block, 0, stream, q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
+                        case 13: hipLaunchKernelGGL(gdn_decode_kernel_l2pref_nvh8_nvb4_v48_lb10,    dim3(grid_nvb4), block, 0, stream, q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
+                        case 14: hipLaunchKernelGGL(gdn_decode_kernel_l2pref_nvh8_nvb4_v56_lb9,     dim3(grid_nvb4), block, 0, stream, q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
                         default: hipLaunchKernelGGL(gdn_decode_kernel_builtin_nvh8_nvb4_v52_lb10,   dim3(grid_nvb4), block, 0, stream, q, k, v, a, b, dt, al, idx, st, o, batch_size, scale);
                     }
                 } else {
