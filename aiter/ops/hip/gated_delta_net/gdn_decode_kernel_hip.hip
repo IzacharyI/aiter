@@ -7217,16 +7217,50 @@ void launch_gdn_decode_iasm(
                 }
             } else {
                 if (batch_size <= 4) {
-                    dim3 grid(batch_size * 8 * 4);
+                    static int bs4v = -1;
+                    if (bs4v < 0) {
+                        const char* e = getenv("GDN_BS4_VARIANT");
+                        bs4v = e ? atoi(e) : 0;
+                    }
                     dim3 block(BLOCK_THREADS);
-                    hipLaunchKernelGGL(gdn_decode_kernel_builtin_nvh8_nvb4_v52_lb10, dim3(grid), dim3(block), 0, stream,
-                        q, k, v, a, b, dt, al, idx, st, o, batch_size, scale);
+                    dim3 grid_nvb4(batch_size * 8 * 4);
+                    dim3 grid_nvb1(batch_size * 8);
+                    switch (bs4v) {
+                        case 1: hipLaunchKernelGGL(gdn_decode_kernel_builtin_nvh8_nvb4_v48_lb10,    dim3(grid_nvb4), block, 0, stream, q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
+                        case 2: hipLaunchKernelGGL(gdn_decode_kernel_builtin_nvh8_nvb4_v56_lb9,     dim3(grid_nvb4), block, 0, stream, q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
+                        case 3: hipLaunchKernelGGL(gdn_decode_kernel_builtin_nvh8_nvb4_v44_lb12,    dim3(grid_nvb4), block, 0, stream, q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
+                        case 4: hipLaunchKernelGGL(gdn_decode_kernel_builtin_nvh8_nvb4_v60_lb9,     dim3(grid_nvb4), block, 0, stream, q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
+                        case 5: hipLaunchKernelGGL(gdn_decode_kernel_pureasm_nvh8_nvb4_v52_lb10,    dim3(grid_nvb4), block, 0, stream, q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
+                        case 6: hipLaunchKernelGGL(gdn_decode_kernel_nowait_nvh8_nvb4_v52_lb10,     dim3(grid_nvb4), block, 0, stream, q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
+                        case 7: hipLaunchKernelGGL(gdn_decode_kernel_prefetch_nvh8_nvb4_v52_lb10,   dim3(grid_nvb4), block, 0, stream, q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
+                        case 8: hipLaunchKernelGGL(gdn_decode_kernel_pkfma_nvh8_nvb4_v52_lb10,      dim3(grid_nvb4), block, 0, stream, q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
+                        case 9: hipLaunchKernelGGL(gdn_decode_kernel_exp2_nvh8_nvb4_v52_lb10,       dim3(grid_nvb4), block, 0, stream, q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
+                        case 10: hipLaunchKernelGGL(gdn_decode_kernel_iasm_tp8_nvh8_sq1_nvb1_lb4,   dim3(grid_nvb1), block, 0, stream, q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
+                        case 11: hipLaunchKernelGGL(gdn_decode_kernel_iasm_tp8_nvh8_sq1_nvb1,       dim3(grid_nvb1), block, 0, stream, q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
+                        default: hipLaunchKernelGGL(gdn_decode_kernel_builtin_nvh8_nvb4_v52_lb10,   dim3(grid_nvb4), block, 0, stream, q, k, v, a, b, dt, al, idx, st, o, batch_size, scale);
+                    }
                 } else {
                     dim3 grid(batch_size * 8);
                     dim3 block(BLOCK_THREADS);
                     if (batch_size == 16) {
-                        hipLaunchKernelGGL(gdn_decode_kernel_iasm_tp8_nvh8_bs16_nvb1_lb3, dim3(grid), dim3(block), 0, stream,
-                            q, k, v, a, b, dt, al, idx, st, o, batch_size, scale);
+                        static int bs16v = -1;
+                        if (bs16v < 0) {
+                            const char* e = getenv("GDN_BS16_VARIANT");
+                            bs16v = e ? atoi(e) : 9;
+                        }
+                        switch (bs16v) {
+                            case 1: hipLaunchKernelGGL(gdn_decode_kernel_iasm_tp8_nvh8_sq1_nvb1,                grid, block, 0, stream, q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
+                            case 2: hipLaunchKernelGGL(gdn_decode_kernel_iasm_tp8_nvh8_sq1_nvb1_lb4,            grid, block, 0, stream, q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
+                            case 3: hipLaunchKernelGGL(gdn_decode_kernel_iasm_tp8_nvh8_bs16_nvb1_lb2_fixedbs,   grid, block, 0, stream, q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
+                            case 4: hipLaunchKernelGGL(gdn_decode_kernel_iasm_tp8_nvh8_bs16_nvb1_lb3_fixedbs,   grid, block, 0, stream, q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
+                            case 5: hipLaunchKernelGGL(gdn_decode_kernel_iasm_tp8_nvh8_bs16_nvb1_lb4_fixedbs,   grid, block, 0, stream, q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
+                            case 6: hipLaunchKernelGGL(gdn_decode_kernel_iasm_tp8_nvh8_bs16_nvb1_lb6_fixedbs,   grid, block, 0, stream, q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
+                            case 7: hipLaunchKernelGGL(gdn_decode_kernel_bs16_extreme,                          grid, block, 0, stream, q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
+                            case 8: hipLaunchKernelGGL(gdn_decode_kernel_bs16_extreme_lb2,                      grid, block, 0, stream, q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
+                            case 9: hipLaunchKernelGGL(gdn_decode_kernel_bs16_extreme_lb3,                      grid, block, 0, stream, q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
+                            case 10: hipLaunchKernelGGL(gdn_decode_kernel_bs16_extreme_lb6,                     grid, block, 0, stream, q, k, v, a, b, dt, al, idx, st, o, batch_size, scale); break;
+                            default: hipLaunchKernelGGL(gdn_decode_kernel_iasm_tp8_nvh8_bs16_nvb1_lb3,          grid, block, 0, stream, q, k, v, a, b, dt, al, idx, st, o, batch_size, scale);
+                        }
                     } else if (batch_size <= 14) {
                         hipLaunchKernelGGL(gdn_decode_kernel_iasm_tp8_nvh8_sq1_nvb1, dim3(grid), dim3(block), 0, stream,
                             q, k, v, a, b, dt, al, idx, st, o, batch_size, scale);
