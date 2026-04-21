@@ -18,6 +18,11 @@ from flydsl.utils.smem_allocator import SmemAllocator
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl._mlir.dialects import scf
 
+# flydsl >= 0.1.4 shadows `vector.ReductionOp` with an `enum.Enum` re-exported
+# from `flydsl.expr.typing`. Import the underlying MLIR op class directly so
+# this kernel keeps working across 0.1.2 / 0.1.3 / 0.1.4+.
+from flydsl._mlir.dialects._vector_ops_gen import ReductionOp as _VectorReductionOp
+
 from .tensor_shim import (
     get_dtype_in_kernel,
     GTensor,
@@ -237,10 +242,10 @@ def create_shuffle_gdr_decode_kernel(
                         sum_k_partial_vec = (
                             sum_k_partial_vec + sk_vecs[ki] * sk_vecs[ki]
                         )
-                        sum_q_partial = vector.ReductionOp(
+                        sum_q_partial = _VectorReductionOp(
                             T.f32, vector.CombiningKind.ADD, sum_q_partial_vec
                         ).dest
-                        sum_k_partial = vector.ReductionOp(
+                        sum_k_partial = _VectorReductionOp(
                             T.f32, vector.CombiningKind.ADD, sum_k_partial_vec
                         ).dest
                     for offset in WARP_THREADS_K_SHFL_OFFSETS:
@@ -300,7 +305,7 @@ def create_shuffle_gdr_decode_kernel(
                             state_vecs[vi * WARP_TILE_K_ITERS + ki], sk_vecs[ki], sum_hk
                         ).result
 
-                    sum_hk = vector.ReductionOp(
+                    sum_hk = _VectorReductionOp(
                         T.f32, vector.CombiningKind.ADD, sum_hk
                     ).dest
 
@@ -333,7 +338,7 @@ def create_shuffle_gdr_decode_kernel(
                         state_vecs[vi * WARP_TILE_K_ITERS + ki] = h_new
                         sum_hq = vector.FMAOp(h_new, r_q_val, sum_hq).result
 
-                    sum_hq = vector.ReductionOp(
+                    sum_hq = _VectorReductionOp(
                         T.f32, vector.CombiningKind.ADD, sum_hq
                     ).dest
 
