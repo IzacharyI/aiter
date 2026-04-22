@@ -849,9 +849,12 @@ if __name__ == '__main__':
         parser.add_argument("--mode", choices=["default", "online"], default="default",
                             help="default = isolated kernel; online = realistic UT "
                                  "(real pool + companion matmul + CUDA graph) that mirrors sglang trace")
+        parser.add_argument("--show-minmax", action="store_true",
+                            help="show min/max in sweep progress and summary table")
         cli_args = parser.parse_args()
         bs_list = cli_args.bs
         mode = cli_args.mode
+        show_minmax = cli_args.show_minmax
         kernels = ["triton", "flydsl", "hip"]
 
         gpu = os.environ.get("HIP_VISIBLE_DEVICES", "0")
@@ -867,23 +870,36 @@ if __name__ == '__main__':
                 stats, passed, output = run_worker(bs, kernel, mode=mode)
                 status = "PASS" if passed else "FAIL"
                 if stats is not None:
-                    sys.stdout.write(
-                        f"med={stats['med']:6.2f}  min={stats['min']:6.2f}  "
-                        f"max={stats['max']:6.2f} μs  [{status}]\n"
-                    )
+                    if show_minmax:
+                        sys.stdout.write(
+                            f"med={stats['med']:6.2f}  min={stats['min']:6.2f}  "
+                            f"max={stats['max']:6.2f} μs  [{status}]\n"
+                        )
+                    else:
+                        sys.stdout.write(
+                            f"med={stats['med']:6.2f} μs  [{status}]\n"
+                        )
                 else:
                     sys.stdout.write(f"    N/A     [{status}]\n")
                     print(f"    --- output tail ---\n{output[-500:]}\n")
                 results[bs][kernel] = {"stats": stats, "passed": passed}
 
-        # Compact per-kernel format: "med [min~max]"
+        # Compact per-kernel format: either "med" or "med [min~max]"
+        col_w = 19 if show_minmax else 10
+
         def cell(s):
             if s is None:
-                return "        N/A      "
-            return f"{s['med']:5.2f} [{s['min']:5.2f}~{s['max']:5.2f}]"
+                txt = "N/A"
+            elif show_minmax:
+                txt = f"{s['med']:5.2f} [{s['min']:5.2f}~{s['max']:5.2f}]"
+            else:
+                txt = f"{s['med']:5.2f}"
+            return f"{txt:<{col_w}s}"
 
-        col_w = 19
-        header_kernel = lambda name: f"{name + ' med [min~max]':<{col_w}s}"
+        if show_minmax:
+            header_kernel = lambda name: f"{name + ' med [min~max]':<{col_w}s}"
+        else:
+            header_kernel = lambda name: f"{name + ' med':<{col_w}s}"
 
         print(f"\n{'='*94}")
         print(f"GPU {gpu} | mode={mode}  (units: μs)")
