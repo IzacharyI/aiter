@@ -174,13 +174,14 @@ def fused_allreduce_rmsnorm_quant_(
     eps: float,
     group_name: str,
     prefill_support: bool = False,
+    use_old_ca: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
     return group._fused_allreduce_rmsnorm_quant_out_place(
-        inp, res_inp, w, eps, prefill_support
+        inp, res_inp, w, eps, prefill_support, use_old_ca=use_old_ca
     )
 
 
@@ -443,7 +444,26 @@ class GroupCoordinator:
         weight_: torch.Tensor,
         eps: float,
         prefill_support: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        emit_bf16: bool = False,
+        use_old_ca: bool = False,
+    ):
+        # When the caller wants the bf16 mirror, bypass the
+        # ``torch_compile_guard``-wrapped dispatcher (its torch.library schema
+        # only describes the legacy 3-tuple return) and call directly into the
+        # device communicator, mirroring the per-group path. The ``use_old_ca``
+        # flag is threaded down so SGLANG_USE_AITER_NEW_CA=false swaps the
+        # internal AR half of the fused kernel for the legacy custom_all_reduce
+        # primitive without disturbing the add+rmsnorm+quant epilogue.
+        if emit_bf16:
+            return self._fused_allreduce_rmsnorm_quant_out_place(
+                input_,
+                residual_inp_,
+                weight_,
+                eps,
+                prefill_support,
+                emit_bf16=True,
+                use_old_ca=use_old_ca,
+            )
         return fused_allreduce_rmsnorm_quant_(
             input_,
             residual_inp_,
@@ -451,6 +471,24 @@ class GroupCoordinator:
             eps,
             group_name=self.unique_name,
             prefill_support=prefill_support,
+            use_old_ca=use_old_ca,
+        )
+
+    def fused_allreduce_rmsnorm_quant_per_group(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+        group_size: int = 128,
+        prefill_support: bool = False,
+        emit_bf16: bool = False,
+    ):
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.fused_allreduce_rmsnorm_quant_per_group(
+            input_, residual_inp_, weight_, eps, group_size, prefill_support,
+            emit_bf16=emit_bf16,
         )
 
     def _fused_allreduce_rmsnorm_out_place(
@@ -478,7 +516,9 @@ class GroupCoordinator:
         weight_: torch.Tensor,
         eps: float,
         prefill_support: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        emit_bf16: bool = False,
+        use_old_ca: bool = False,
+    ):
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
         return self.device_communicator.fused_allreduce_rmsnorm_quant(
@@ -487,6 +527,8 @@ class GroupCoordinator:
             weight_,
             eps,
             prefill_support,
+            emit_bf16=emit_bf16,
+            use_old_ca=use_old_ca,
         )
 
     def _all_gather_out_place(self, input_: torch.Tensor, dim: int = 0) -> torch.Tensor:
