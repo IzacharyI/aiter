@@ -19,6 +19,24 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.flydsl.utils import is_flydsl_available
 from aiter import fused_dynamic_mxfp4_quant_moe_sort, mxfp4_moe_sort_fwd
 
+# Lazy availability probe for the optional pyhip MoE GEMM fast path.
+# Older pyhip releases shipped ``pyhip.kernels.moe.moe_gemm_batch`` /
+# ``moe_gemm_batch1`` for the AITER_MOE_SMALL_BATCH=1 small-batch shortcut
+# in fused_moe(). Newer pyhip drops the ``pyhip.kernels`` submodule, so we
+# probe once at import time and gate the fast path on availability instead
+# of crashing with NameError when the env flag is set.
+_PYHIP_MOE_AVAILABLE = False
+try:
+    import pyhip  # noqa: F401
+
+    import pyhip.kernels.moe as _pyhip_moe  # noqa: F401
+
+    _PYHIP_MOE_AVAILABLE = hasattr(_pyhip_moe, "moe_gemm_batch") and hasattr(
+        _pyhip_moe, "moe_gemm_batch1"
+    )
+except Exception:
+    _PYHIP_MOE_AVAILABLE = False
+
 BLOCK_SIZE_M = 32
 
 _USE_OPUS_MOE_SORTING = os.environ.get("AITER_USE_OPUS_MOE_SORTING", "0") == "1"
@@ -142,8 +160,9 @@ def fused_moe(
     bias2=None,
     splitk=0,
 ):
-    # fast path for small batches
-    if os.environ.get('AITER_MOE_SMALL_BATCH', '0') == '1' and hidden_states.shape[0] <= 16 and hidden_states.dtype == torch.bfloat16 and expert_mask is None and activation == ActivationType.Silu and \
+    # fast path for small batches; gated on pyhip.kernels.moe availability
+    # because the kernels submodule was removed in newer pyhip releases.
+    if _PYHIP_MOE_AVAILABLE and os.environ.get('AITER_MOE_SMALL_BATCH', '0') == '1' and hidden_states.shape[0] <= 16 and hidden_states.dtype == torch.bfloat16 and expert_mask is None and activation == ActivationType.Silu and \
         ((quant_type == QuantType.No and w1.dtype == torch.bfloat16) or (quant_type == QuantType.per_Token and w1.dtype == torch.float8_e4m3fnuz)):
         B = hidden_states.shape[0]
         E, N1, K1 = w1.shape
