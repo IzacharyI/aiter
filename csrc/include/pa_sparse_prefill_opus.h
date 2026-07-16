@@ -847,7 +847,6 @@ __device__ void pa_prefill_accum_pipelined(pa_sparse_prefill_kargs kargs,
         s_waitcnt_lgkmcnt(number<T::k_ds_read_insts>{});
         s_waitcnt_vmcnt(number<T::kv_buffer_load_insts + 1>{});
         __builtin_amdgcn_sched_barrier(0);
-        __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
 
         // Cluster 1:
@@ -860,7 +859,6 @@ __device__ void pa_prefill_accum_pipelined(pa_sparse_prefill_kargs kargs,
         sched_compute_qk<0>();
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
-        __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
 
         // Cluster 2:
@@ -904,7 +902,6 @@ __device__ void pa_prefill_accum_pipelined(pa_sparse_prefill_kargs kargs,
         s_waitcnt_lgkmcnt(number<T::k_ds_read_insts>{});
         s_waitcnt_vmcnt(number<T::kv_buffer_load_insts + 1>{});
         __builtin_amdgcn_sched_barrier(0);
-        __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
 
         // Cluster 5:
@@ -917,7 +914,6 @@ __device__ void pa_prefill_accum_pipelined(pa_sparse_prefill_kargs kargs,
         sched_compute_qk<0>();
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
-        __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
 
         // Cluster 6:
@@ -979,7 +975,6 @@ __device__ void pa_prefill_accum_pipelined(pa_sparse_prefill_kargs kargs,
         sched_compute_qk<0>();
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
-        __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
 
         // Cluster 2:
@@ -1027,7 +1022,6 @@ __device__ void pa_prefill_accum_pipelined(pa_sparse_prefill_kargs kargs,
         sched_compute_qk<0>();
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
-        __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
 
         // Cluster 6:
@@ -1087,7 +1081,6 @@ __device__ void pa_prefill_accum_pipelined(pa_sparse_prefill_kargs kargs,
         s_waitcnt_lgkmcnt(number<T::k_ds_read_insts>{});
         s_waitcnt_vmcnt(number<T::kv_buffer_load_insts + 1>{});
         __builtin_amdgcn_sched_barrier(0);
-        __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
 
         // Cluster 1:
@@ -1100,7 +1093,6 @@ __device__ void pa_prefill_accum_pipelined(pa_sparse_prefill_kargs kargs,
         sched_compute_qk<0>();
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
-        __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
 
         // Cluster 2:
@@ -1151,7 +1143,6 @@ __device__ void pa_prefill_accum_pipelined(pa_sparse_prefill_kargs kargs,
         sched_compute_qk<0>();
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
-        __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
 
         // Cluster 6:
@@ -1199,7 +1190,6 @@ __device__ void pa_prefill_accum_pipelined(pa_sparse_prefill_kargs kargs,
         sched_compute_qk<0>();
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
-        __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
 
         // Cluster 10:
@@ -1262,7 +1252,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
     using D_ATTN = typename T::D_ATTN;
     using D_ACC = typename T::D_ACC;
 
-    const int q_token_idx = block_id_x();
+    const int q_token_idx = kargs.N - 1 - block_id_x();  // load-balance: heavy (late-causal) tokens dispatch first
     const int h_block_idx = block_id_y();
 
     const int lane_id = thread_id_x() % T::WARP_SIZE;
