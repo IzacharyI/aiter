@@ -28,6 +28,17 @@ def _wrap(v):
     return v
 
 
+def _raw(v):
+    return v.ir_value() if hasattr(v, "ir_value") else v
+
+
+def _same_int_const_like(v, n):
+    raw = _raw(v)
+    if hasattr(raw, "type") and isinstance(raw.type, ir.IndexType):
+        return arith.index(int(n))
+    return arith.constant(int(n), type=T.i32)
+
+
 def _is_pow2(n):
     """Return True when *n* is a positive power of two."""
     return n > 0 and (n & (n - 1)) == 0
@@ -41,7 +52,7 @@ def _div_pow2(val, divisor):
     """
     shift = _math.log2(divisor)
     assert shift == int(shift), f"{divisor} is not a power of 2"
-    return arith.shrui(val, arith.index(int(shift)))
+    return arith.shrui(_raw(val), _same_int_const_like(val, int(shift)))
 
 
 def _mod_pow2(val, modulus):
@@ -49,7 +60,7 @@ def _mod_pow2(val, modulus):
 
     Emits ``arith.andi`` (1 VALU cycle) instead of ``arith.remui``.
     """
-    return arith.andi(val, arith.index(modulus - 1))
+    return arith.andi(_raw(val), _same_int_const_like(val, modulus - 1))
 
 
 def _parse_dim(tok):

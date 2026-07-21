@@ -67,14 +67,21 @@ def _buffer_load_vec(
     """Load vec_elems elements via buffer_load dwordx[1,2,4] + bitcast."""
     from flydsl.expr import arith as _ld_arith
 
+    def _raw_ir_value(value):
+        return value.ir_value() if hasattr(value, "ir_value") else value
+
     elem_size = int(elem_bytes)
     load_bytes = int(vec_elems) * elem_size
     vec_width = load_bytes // 4
 
     if offset_in_bytes:
-        idx_i32 = _ld_arith.shrui(idx, _ld_arith.index(2))
+        idx_i32 = _ld_arith.shrui(
+            _raw_ir_value(idx), _raw_ir_value(_ld_arith.constant(2, type=T.i32))
+        )
     elif elem_bytes == 2:
-        idx_i32 = _ld_arith.shrui(idx, _ld_arith.index(1))
+        idx_i32 = _ld_arith.shrui(
+            _raw_ir_value(idx), _raw_ir_value(_ld_arith.constant(1, type=T.i32))
+        )
     else:
         idx_i32 = idx
 
