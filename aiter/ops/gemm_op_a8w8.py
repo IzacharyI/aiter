@@ -153,6 +153,127 @@ def gemm_a8w8_bpreshuffle_flydsl(
     return Out
 
 
+def _parse_flydsl_blockscale_kernel_name(kernel_name: str):
+    """Parse tile config from a flydsl *blockscale* bpreshuffle kernelName.
+
+    Format::
+
+        flydsl_blockscale_bpreshuffle_{tm}x{tn}x{tk}_sbk{sbk}_{csh}x{acp}x{wpe}x{xcd}x{fp}
+
+    Returns ``(tile_m, tile_n, tile_k, scale_block_k, use_cshuffle_epilog,
+    use_async_copy, waves_per_eu, xcd_swizzle, fused_promote)`` or None.
+    """
+    import re
+
+    m = re.match(
+        r"flydsl_blockscale_bpreshuffle_(\d+)x(\d+)x(\d+)_sbk(\d+)_"
+        r"(\d+)x(\d+)x(\d+)x(\d+)x(\d+)",
+        kernel_name,
+    )
+    if m is None:
+        return None
+    return tuple(int(m.group(i)) for i in range(1, 10))
+
+
+def _parse_flydsl_blockscale_8w_kernel_name(kernel_name: str):
+    """Parse config from a flydsl *8-wave* blockscale bpreshuffle kernelName.
+
+    Format::
+
+        flydsl8w_blockscale_bpreshuffle_{bm}x{bn}_wpe{wpe}_xcd{xcd}
+
+    Returns ``(block_m, block_n, waves_per_eu, use_xcd_remap)`` or None.
+    """
+    import re
+
+    m = re.match(
+        r"flydsl8w_blockscale_bpreshuffle_(\d+)x(\d+)_wpe(\d+)_xcd(\d+)",
+        kernel_name,
+    )
+    if m is None:
+        return None
+    return tuple(int(m.group(i)) for i in range(1, 5))
+
+
+def gemm_a8w8_blockscale_bpreshuffle_flydsl(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    Out: Tensor,
+    config: dict,
+) -> Tensor:
+    from .flydsl.gemm_kernels import flydsl_blockscale_preshuffle_gemm_a8
+
+    kernel_name = config.get("kernelName", "")
+    parsed = _parse_flydsl_blockscale_kernel_name(str(kernel_name))
+    if parsed is None:
+        return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Out)
+
+    # The FlyDSL blockscale kernel indexes the C tensor with i32 offsets, so it
+    # silently returns wrong results once M*N reaches 2**31 (e.g. M=32768,
+    # N=65536). The tuned CSV never routes such shapes here, but guard against a
+    # future mis-tuned row by falling back to the CK path.
+    if XQ.shape[0] * WQ.shape[0] >= (1 << 31):
+        return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Out)
+
+    tm, tn, tk, sbk, csh, acp, wpe, xcd, fp = parsed
+
+    flydsl_blockscale_preshuffle_gemm_a8(
+        XQ.contiguous(),
+        WQ.contiguous(),
+        x_scale,
+        w_scale,
+        Out,
+        tm,
+        tn,
+        tk,
+        sbk,
+        csh,
+        acp,
+        wpe,
+        xcd,
+        fp,
+    )
+    return Out
+
+
+def gemm_a8w8_blockscale_bpreshuffle_flydsl_8w(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    Out: Tensor,
+    config: dict,
+) -> Tensor:
+    """Dispatch to the 8-wave blockscale ping-pong kernel.
+
+    WQ is the SAME preshuffled B as the CK/4-wave path -- ``preshuffle_b(W)`` is
+    byte-identical to ``shuffle_weight(W, (16,16))`` for K%64==0 -- so no separate
+    weight layout is needed. Falls back to CK if the name doesn't parse or the
+    kernel indexes past the i32 C offset limit (M*N >= 2**31).
+    """
+    from .flydsl.gemm_kernels import flydsl_fp8_gemm_8wave_blockscale_a8
+
+    parsed = _parse_flydsl_blockscale_8w_kernel_name(str(config.get("kernelName", "")))
+    if parsed is None or XQ.shape[0] * WQ.shape[0] >= (1 << 31):
+        return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Out)
+
+    block_m, block_n, wpe, xcd = parsed
+    flydsl_fp8_gemm_8wave_blockscale_a8(
+        XQ.contiguous(),
+        WQ.contiguous(),
+        x_scale,
+        w_scale,
+        Out,
+        block_m=block_m,
+        block_n=block_n,
+        waves_per_eu=wpe,
+        use_xcd_remap=bool(xcd),
+    )
+    return Out
+
+
 @compile_ops(
     "module_gemm_a8w8_asm",
     fc_name="gemm_a8w8_asm",
@@ -799,6 +920,14 @@ def gemm_a8w8_blockscale_bpreshuffle(
             splitK = config["splitK"]
             return gemm_a8w8_blockscale_bpreshuffle_asm(
                 XQ, WQ, Y, x_scale, w_scale, splitK=splitK, kernelName=kernelName
+            )
+        elif libtype == "flydsl" and is_flydsl_available():
+            return gemm_a8w8_blockscale_bpreshuffle_flydsl(
+                XQ, WQ, x_scale, w_scale, Y, config
+            )
+        elif libtype == "flydsl8w" and is_flydsl_available():
+            return gemm_a8w8_blockscale_bpreshuffle_flydsl_8w(
+                XQ, WQ, x_scale, w_scale, Y, config
             )
     try:
         return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)

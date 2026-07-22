@@ -33,6 +33,50 @@ from gemm_a8w8_blockscale_cktile_instance import (
     BLOCK_PER_CU_MAX,
 )
 
+# flydsl (blockscale bpreshuffle) — guarded so the tuner still works when the
+# FlyDSL candidate module or runtime is unavailable.
+try:
+    from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_bpreshuffle_common import (
+        kernel_instance_estimated_lds_bytes,
+        kernels_list as kernels_list_flydsl_blockscale,
+        get_tune_kernels_list as get_flydsl_blockscale_tune_kernels,
+        max_lds_bytes_for_tune,
+        kernels_list_8w as kernels_list_flydsl_blockscale_8w,
+        get_tune_kernels_list_8w as get_flydsl_blockscale_8w_tune_kernels,
+    )
+except ImportError:
+    print(
+        "[FlyDSL] flydsl_gemm_a8w8_blockscale_bpreshuffle_common.py not found, "
+        "flydsl blockscale tuning disabled"
+    )
+    kernels_list_flydsl_blockscale = {}
+    kernels_list_flydsl_blockscale_8w = {}
+
+    def kernel_instance_estimated_lds_bytes(_ki):
+        return 0
+
+    def max_lds_bytes_for_tune():
+        return 1 << 30
+
+    def get_flydsl_blockscale_tune_kernels():
+        return {}
+
+    def get_flydsl_blockscale_8w_tune_kernels():
+        return {}
+
+
+from aiter.ops.flydsl.utils import is_flydsl_available
+
+if is_flydsl_available():
+    from aiter.ops.flydsl.gemm_kernels import flydsl_blockscale_preshuffle_gemm_a8
+
+    try:
+        from aiter.ops.flydsl.gemm_kernels import (
+            flydsl_fp8_gemm_8wave_blockscale_a8,
+        )
+    except ImportError:
+        pass
+
 block_shape = (128, 128)
 
 
@@ -46,6 +90,18 @@ def get_valid_asm_splitK_list(K: int, max_splitK: int, tile_k: int = 128):
         if actual_ksplit == sk:
             valid.append(sk)
     return valid if valid else [1]
+
+
+def _get_padded_m(M: int) -> int:
+    """Rounded-up M used to validate flydsl tile_m divisibility (matches dispatch)."""
+    if M <= 256:
+        return (M + 15) // 16 * 16
+    elif M <= 1024:
+        return (M + 31) // 32 * 32
+    elif M <= 4096:
+        return (M + 63) // 64 * 64
+    else:
+        return (M + 127) // 128 * 128
 
 
 """
@@ -148,6 +204,60 @@ def run_gemm_a8w8_blockscale_asm(
     )
 
 
+def run_gemm_a8w8_blockscale_flydsl(x, weight_shuffle, x_scale_t, w_scale, out, kernel_id):
+    """
+    Run gemm a8w8 blockscale tuned kernel for flydsl type (preshuffleB only).
+
+    kernel_id -> kernelInstance whose fields are the exact wrapper args, so the
+    tuned kernelName round-trips back to this same launch config at dispatch.
+    """
+
+    ki = kernels_list_flydsl_blockscale[kernel_id]
+    flydsl_blockscale_preshuffle_gemm_a8(
+        x,
+        weight_shuffle,
+        x_scale_t,
+        w_scale,
+        out,
+        ki.tile_m,
+        ki.tile_n,
+        ki.tile_k,
+        ki.scale_block_k,
+        ki.use_cshuffle_epilog,
+        ki.use_async_copy,
+        ki.waves_per_eu,
+        ki.xcd_swizzle,
+        ki.fused_promote,
+    )
+    return out
+
+
+def run_gemm_a8w8_blockscale_flydsl_8w(
+    x, weight_shuffle, x_scale_t, w_scale, out, kernel_id
+):
+    """Run the 8-wave blockscale ping-pong kernel (flydsl8w libtype).
+
+    ``kernel_id`` indexes ``kernels_list_flydsl_blockscale_8w`` (a distinct id
+    space from the 4-wave list). The kernelInstance8w fields are the exact wrapper
+    args, so the tuned kernelName round-trips back to this launch config at
+    dispatch. B is the SAME ``shuffle_weight(16,16)`` bytes as the 4-wave/CK path.
+    """
+
+    ki = kernels_list_flydsl_blockscale_8w[kernel_id]
+    flydsl_fp8_gemm_8wave_blockscale_a8(
+        x,
+        weight_shuffle,
+        x_scale_t,
+        w_scale,
+        out,
+        block_m=ki.block_m,
+        block_n=ki.block_n,
+        waves_per_eu=ki.waves_per_eu,
+        use_xcd_remap=bool(ki.use_xcd_remap),
+    )
+    return out
+
+
 def generate_data(m, n, k, seed, device="cuda"):
     """
     Generate random data for testing the gemm a8w8 blockscale kernel.
@@ -221,9 +331,9 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             "--libtype",
             type=str,
             default="all",
-            choices=["ck", "cktile", "asm", "all", "both"],
+            choices=["ck", "cktile", "asm", "flydsl", "all", "both"],
             required=False,
-            help="CK gemm a8w8 blockscale type to tune: ck, cktile, asm, both or all (covers all supported backends across standard/preshuffleB modes)",
+            help="CK gemm a8w8 blockscale type to tune: ck, cktile, asm, flydsl, both or all (covers all supported backends across standard/preshuffleB modes)",
         )
 
         self.parser.add_argument(
@@ -263,6 +373,14 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         elif libType == "cktile":
             # kernel_list = candidate_kernels_bpreshuffle_cktile_dict if preshuffleB else candidate_kernels_cktile_dict
             kernel_list = candidate_kernels_cktile_dict
+        elif libType == "flydsl":
+            if kernelId not in kernels_list_flydsl_blockscale:
+                return None
+            return kernels_list_flydsl_blockscale[kernelId].name
+        elif libType == "flydsl8w":
+            if kernelId not in kernels_list_flydsl_blockscale_8w:
+                return None
+            return kernels_list_flydsl_blockscale_8w[kernelId].name
         else:
             return None
 
@@ -580,6 +698,181 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                     asm_kernel_id += 1
         return tasks_asm
 
+    def get_gemm_a8w8_blockscale_flydsl_tune_task(
+        self,
+        info_keys,
+        seed,
+        preshuffleB,
+        run_kwargs,
+    ):
+        """Build FlyDSL blockscale-bpreshuffle candidate tasks for one shape.
+
+        FlyDSL blockscale is preshuffleB-only and targets gfx95x (scaled-MFMA +
+        fused_promote). Candidates are filtered per shape by LDS budget, tile
+        divisibility, CTA count and the i32 index guard so only launchable,
+        dispatch-round-trippable configs reach the profiler.
+        """
+
+        gfx, cu_num, M, N, K = info_keys
+
+        # FlyDSL blockscale kernel requires a preshuffled B and the gfx95x
+        # scaled-MFMA path; skip otherwise so ck/cktile/asm still tune normally.
+        if not preshuffleB:
+            return []
+        if not str(gfx).startswith("gfx95"):
+            return []
+        if (not kernels_list_flydsl_blockscale) or (
+            "flydsl_blockscale_preshuffle_gemm_a8" not in globals()
+        ):
+            return []
+
+        # Guard against i32 element indexing overflow inside the kernel
+        # (M*N must stay < 2^31); dispatch falls back to ck/cktile/asm here.
+        if int(M) * int(N) >= (1 << 31):
+            return []
+
+        gemm_flydsl_keys = ["x", "weight_shuffle", "x_scale_t", "w_scale", "out"]
+        ref_keys = ["x", "weight", "x_scale", "w_scale"]
+        tasks = []
+        lds_limit = max_lds_bytes_for_tune()
+        padded_m = _get_padded_m(M)
+        min_ctas = max(4, min(16, N // 64))
+        # Full 608-config sweep by default; FLYDSL_BS_TUNE_FOCUSED=1 selects the
+        # curated ~75-config subset (ids are a subset of the full list, so the
+        # runner/getKernelName lookups below stay valid).
+        tune_kernels = get_flydsl_blockscale_tune_kernels()
+        for i in sorted(tune_kernels.keys()):
+            ki = tune_kernels[i]
+            if kernel_instance_estimated_lds_bytes(ki) > lds_limit:
+                continue
+            if N % ki.tile_n != 0 or K % ki.tile_k != 0:
+                continue
+            if K % ki.scale_block_k != 0:
+                continue
+            if padded_m % ki.tile_m != 0:
+                continue
+            num_ctas = ((M + ki.tile_m - 1) // ki.tile_m) * (N // ki.tile_n)
+            if num_ctas < min_ctas:
+                continue
+            if M >= 8192 and ki.tile_m < 64:
+                continue
+            if M >= 4096 and ki.tile_m < 32:
+                continue
+            if M >= 2048 and ki.tile_m == 16 and ki.tile_n <= 128:
+                continue
+            # XCD workgroup swizzle needs enough workgroups to be meaningful;
+            # skip xcd>0 on shapes with <64 CTAs (matches non-blockscale flydsl).
+            if getattr(ki, "xcd_swizzle", 0) > 0 and num_ctas < 64:
+                continue
+            kernel_name = ki.name
+            info = (info_keys, i, 0, kernel_name, "flydsl", preshuffleB)
+            tasks.append(
+                (
+                    info,
+                    generate_data,
+                    (M, N, K, seed),
+                    run_gemm_a8w8_blockscale_flydsl,
+                    (
+                        gemm_flydsl_keys,
+                        i,
+                    ),
+                    dict(run_kwargs),
+                    run_torch,
+                    (
+                        ref_keys,
+                        None,
+                        dtypes.bf16,
+                    ),
+                    {},
+                    None,
+                    1e-2,
+                    0.01,
+                    None,
+                    None,
+                    ("out",),
+                )
+            )
+        return tasks
+
+    def get_gemm_a8w8_blockscale_flydsl_8w_tune_task(
+        self,
+        info_keys,
+        seed,
+        preshuffleB,
+        run_kwargs,
+    ):
+        """Build 8-wave blockscale-bpreshuffle candidate tasks for one shape.
+
+        Same family as the 4-wave builder (preshuffleB-only, gfx95x, i32-guarded)
+        but for ``compile_fp8_gemm_8w_blockscale``. Candidates carry the distinct
+        ``flydsl8w`` libtype + kernelName so the runtime dispatcher routes them to
+        the 8-wave wrapper. B is the SAME ``shuffle_weight(16,16)`` bytes.
+        """
+
+        gfx, cu_num, M, N, K = info_keys
+
+        if not preshuffleB:
+            return []
+        if not str(gfx).startswith("gfx95"):
+            return []
+        if (not kernels_list_flydsl_blockscale_8w) or (
+            "flydsl_fp8_gemm_8wave_blockscale_a8" not in globals()
+        ):
+            return []
+        # Guard against i32 element indexing overflow (M*N must stay < 2^31);
+        # dispatch falls back to ck/cktile/asm here.
+        if int(M) * int(N) >= (1 << 31):
+            return []
+
+        gemm_flydsl_keys = ["x", "weight_shuffle", "x_scale_t", "w_scale", "out"]
+        ref_keys = ["x", "weight", "x_scale", "w_scale"]
+        tasks = []
+        padded_m = _get_padded_m(M)
+        min_ctas = max(4, min(16, N // 64))
+        tune_kernels = get_flydsl_blockscale_8w_tune_kernels()
+        for i in sorted(tune_kernels.keys()):
+            ki = tune_kernels[i]
+            # BLOCK_N is locked to 256; scale block K is 128 (== preshuffle_b K%64).
+            if N % ki.block_n != 0 or K % 128 != 0:
+                continue
+            if padded_m % ki.block_m != 0:
+                continue
+            num_ctas = ((M + ki.block_m - 1) // ki.block_m) * (N // ki.block_n)
+            if num_ctas < min_ctas:
+                continue
+            # XCD workgroup swizzle needs enough workgroups to be meaningful.
+            if ki.use_xcd_remap and num_ctas < 64:
+                continue
+            kernel_name = ki.name
+            info = (info_keys, i, 0, kernel_name, "flydsl8w", preshuffleB)
+            tasks.append(
+                (
+                    info,
+                    generate_data,
+                    (M, N, K, seed),
+                    run_gemm_a8w8_blockscale_flydsl_8w,
+                    (
+                        gemm_flydsl_keys,
+                        i,
+                    ),
+                    dict(run_kwargs),
+                    run_torch,
+                    (
+                        ref_keys,
+                        None,
+                        dtypes.bf16,
+                    ),
+                    {},
+                    None,
+                    1e-2,
+                    0.01,
+                    None,
+                    None,
+                    ("out",),
+                )
+            )
+        return tasks
+
     def tune(
         self,
         untunedf,
@@ -639,9 +932,30 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                         run_kwargs,
                     )
                 )
+            if lib in ("flydsl", "all"):
+                task.extend(
+                    self.get_gemm_a8w8_blockscale_flydsl_tune_task(
+                        info_keys,
+                        seed,
+                        isPreshuffleB,
+                        run_kwargs,
+                    )
+                )
+                task.extend(
+                    self.get_gemm_a8w8_blockscale_flydsl_8w_tune_task(
+                        info_keys,
+                        seed,
+                        isPreshuffleB,
+                        run_kwargs,
+                    )
+                )
             shape_kernel_nums = len(task) - prev_task_count
 
-            tasks_data.append((shape_kernel_nums, ()))
+            # A shape may yield zero candidates (e.g. flydsl-only tuning where a
+            # small shape fails every feasibility/min-CTA filter). Skip it so the
+            # shape_grouped in_datas count stays equal to the task-group count.
+            if shape_kernel_nums > 0:
+                tasks_data.append((shape_kernel_nums, ()))
         ret = []
         if task:
             ret = mp_tuner(

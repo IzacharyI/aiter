@@ -1071,3 +1071,219 @@ def flydsl_preshuffle_gemm_a8(
         Out.copy_(out_contig)
 
     return Out
+
+
+# ---------------------------------------------------------------------------
+# FlyDSL a8w8 *blockscale* (per-128-block) preshuffle GEMM kernel management
+# ---------------------------------------------------------------------------
+
+_flydsl_blockscale_compile_fn = None
+_flydsl_blockscale_import_done = False
+
+
+def _get_blockscale_compile_fn():
+    """Lazy-import compile_blockscale_preshuffle_gemm (cached) so this module
+    imports even when FlyDSL is unavailable."""
+    global _flydsl_blockscale_compile_fn, _flydsl_blockscale_import_done
+    if _flydsl_blockscale_import_done:
+        return _flydsl_blockscale_compile_fn
+    _flydsl_blockscale_import_done = True
+    if not is_flydsl_available():
+        logger.info("[FlyDSL] not available, will fall back to CK/CKTile")
+        return None
+    try:
+        from .kernels.blockscale_preshuffle_gemm import (
+            compile_blockscale_preshuffle_gemm,
+        )
+
+        _flydsl_blockscale_compile_fn = functools.lru_cache(maxsize=1024)(
+            compile_blockscale_preshuffle_gemm
+        )
+        logger.info("[FlyDSL] loaded blockscale preshuffle GEMM compiler")
+    except Exception as e:
+        logger.info(
+            f"[FlyDSL] blockscale preshuffle GEMM not available, will fall back to CK/CKTile: {e}"
+        )
+    return _flydsl_blockscale_compile_fn
+
+
+def flydsl_blockscale_preshuffle_gemm_a8(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    Out: Tensor,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    scale_block_k: int = 128,
+    use_cshuffle_epilog: int = 0,
+    use_async_copy: int = 0,
+    waves_per_eu: int = 0,
+    xcd_swizzle: int = 0,
+    fused_promote: int = 0,
+) -> Tensor:
+    """Compile (cached) and run the FlyDSL a8w8 blockscale preshuffle GEMM.
+
+    Input layout matches ``gemm_a8w8_blockscale_bpreshuffle`` (see
+    ``op_tests/test_gemm_a8w8_blockscale.py``):
+      XQ      : [M, K] fp8, row-major (not preshuffled)
+      WQ      : [N, K] fp8 preshuffled via ``shuffle_weight(layout=(16, 16))``
+      x_scale : [M, scale_k] holding transposed ([scale_k, M]) memory, i.e.
+                ``x_scale.transpose(0, 1).contiguous().view(M, scale_k)``
+      w_scale : [scale_n, scale_k] row-major
+    """
+    compile_fn = _get_blockscale_compile_fn()
+    if compile_fn is None:
+        raise RuntimeError("[FlyDSL] blockscale compile function not available")
+    dtypes = _get_dtypes()
+
+    m, k = XQ.shape[0], XQ.shape[-1]
+    n = WQ.shape[0]
+
+    if n % tile_n != 0:
+        raise RuntimeError(
+            f"[FlyDSL] N ({n}) is not a multiple of tile_n ({tile_n}). Skipping gemm!"
+        )
+    if k % tile_k != 0:
+        raise RuntimeError(
+            f"[FlyDSL] K ({k}) is not a multiple of tile_k ({tile_k}). Skipping gemm!"
+        )
+
+    if XQ.dtype != dtypes.fp8:
+        raise ValueError(
+            f"[FlyDSL] blockscale preshuffle GEMM expects fp8 input, got {XQ.dtype}"
+        )
+
+    if Out.dtype == torch.bfloat16:
+        out_dtype = "bf16"
+    elif Out.dtype == torch.float16:
+        out_dtype = "fp16"
+    else:
+        raise ValueError(
+            f"[FlyDSL] unsupported output dtype {Out.dtype}; expected bf16 or fp16"
+        )
+
+    wpe = None if waves_per_eu <= 0 else waves_per_eu
+
+    exe = compile_fn(
+        M=m,
+        N=n,
+        K=k,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        scale_block_k=scale_block_k,
+        out_dtype=out_dtype,
+        use_cshuffle_epilog=bool(use_cshuffle_epilog),
+        use_async_copy=bool(use_async_copy),
+        waves_per_eu=wpe,
+        xcd_swizzle=int(xcd_swizzle),
+        fused_promote=bool(fused_promote),
+    )
+
+    out_contig = Out.contiguous()
+    _run_compiled(
+        exe,
+        out_contig,
+        XQ.contiguous(),
+        WQ.contiguous(),
+        x_scale.contiguous().view(-1),
+        w_scale.contiguous().view(-1),
+        m,
+        n,
+        fx.Stream(torch.cuda.current_stream()),
+    )
+    if out_contig is not Out:
+        Out.copy_(out_contig)
+
+    return Out
+
+
+# ---------------------------------------------------------------------------
+# FlyDSL 8-wave a8w8 blockscale GEMM (experimental, NOT auto-dispatched)
+# ---------------------------------------------------------------------------
+# NOTE: this kernel preshuffles B with ``fp8_gemm_utils.preshuffle_b`` (a
+# different layout from ``shuffle_weight(layout=(16, 16))`` used by the CK
+# blockscale-bpreshuffle path), and per its own module docstring does not beat
+# the 4-wave blockscale+xcd kernel above. It is provided as a directly-callable
+# API for experimentation; it is intentionally not wired into the tuned
+# auto-dispatch in gemm_op_a8w8.py.
+
+_flydsl_8w_blockscale_compile_fn = None
+_flydsl_8w_blockscale_import_done = False
+
+
+def _get_8w_blockscale_compile_fn():
+    global _flydsl_8w_blockscale_compile_fn, _flydsl_8w_blockscale_import_done
+    if _flydsl_8w_blockscale_import_done:
+        return _flydsl_8w_blockscale_compile_fn
+    _flydsl_8w_blockscale_import_done = True
+    if not is_flydsl_available():
+        return None
+    try:
+        from .kernels.fp8_gemm_8wave_blockscale import compile_fp8_gemm_8w_blockscale
+
+        _flydsl_8w_blockscale_compile_fn = functools.lru_cache(maxsize=256)(
+            compile_fp8_gemm_8w_blockscale
+        )
+        logger.info("[FlyDSL] loaded 8-wave blockscale GEMM compiler")
+    except Exception as e:
+        logger.info(f"[FlyDSL] 8-wave blockscale GEMM not available: {e}")
+    return _flydsl_8w_blockscale_compile_fn
+
+
+def flydsl_fp8_gemm_8wave_blockscale_a8(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    Out: Tensor,
+    block_m: int = 256,
+    block_n: int = 256,
+    waves_per_eu: int = 2,
+    use_xcd_remap: bool = True,
+) -> Tensor:
+    """Compile (cached) and run the experimental 8-wave a8w8 blockscale GEMM.
+
+    Expected layout (see ``tests/kernels/test_fp8_gemm_8wave_blockscale.py``):
+      XQ      : [M, K] fp8
+      WQ      : preshuffled via ``fp8_gemm_utils.preshuffle_b(weight)``
+      x_scale : [M, scale_k] transposed ([scale_k, M]) memory, flattened here
+      w_scale : [scale_n, scale_k] row-major
+    """
+    compile_fn = _get_8w_blockscale_compile_fn()
+    if compile_fn is None:
+        raise RuntimeError("[FlyDSL] 8-wave blockscale compile function not available")
+
+    m, k = XQ.shape[0], XQ.shape[-1]
+    n = WQ.shape[0] if WQ.dim() > 1 else Out.shape[-1]
+
+    def _as_i8(t):
+        return t.view(torch.int8) if "float8" in str(t.dtype) else t
+
+    exe = compile_fn(
+        K=k,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        b_preshuffled=True,
+        waves_per_eu=waves_per_eu,
+        use_xcd_remap=use_xcd_remap,
+    )
+
+    out_contig = Out.contiguous()
+    _run_compiled(
+        exe,
+        _as_i8(XQ).contiguous().view(-1),
+        _as_i8(WQ).contiguous().view(-1),
+        out_contig.view(-1),
+        x_scale.contiguous().view(-1),
+        w_scale.contiguous().view(-1),
+        m,
+        Out.shape[-1],
+        fx.Stream(torch.cuda.current_stream()),
+    )
+    if out_contig is not Out:
+        Out.copy_(out_contig)
+
+    return Out

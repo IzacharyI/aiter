@@ -37,7 +37,12 @@ if is_flydsl_available():
             f"got `{installed_flydsl_version}`."
         )
 
-    from .gemm_kernels import flydsl_hgemm, flydsl_preshuffle_gemm_a8
+    from .gemm_kernels import (
+        flydsl_hgemm,
+        flydsl_preshuffle_gemm_a8,
+        flydsl_blockscale_preshuffle_gemm_a8,
+        flydsl_fp8_gemm_8wave_blockscale_a8,
+    )
     from .moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
     from .fmha_kernels import flydsl_flash_attn_func
     from .kernels.qk_norm_rope_quant import flydsl_qk_norm_rope_quant
@@ -46,6 +51,8 @@ if is_flydsl_available():
 
     __all__ += [
         "flydsl_preshuffle_gemm_a8",
+        "flydsl_blockscale_preshuffle_gemm_a8",
+        "flydsl_fp8_gemm_8wave_blockscale_a8",
         "flydsl_moe_stage1",
         "flydsl_moe_stage2",
         "flydsl_hgemm",
