@@ -227,6 +227,60 @@ def e8m0_shuffle(scale):
     return shuffle_scale(scale)
 
 
+def shuffle_weight_w4(src: torch.Tensor, NLane: int, gate_up: bool, moe_gemm: bool) -> torch.Tensor:
+    """Shuffle packed MXFP4 weights for W4 preshuffle GEMM layouts."""
+    src_type = src.dtype
+    if hasattr(torch, "float4_e2m1fn_x2") and src_type == torch.float4_e2m1fn_x2:
+        src = src.view(torch.uint8)
+    if moe_gemm:
+        experts_cnt, n, k_pk = src.shape
+        if gate_up:
+            n = n // 2
+        k_pack = 16
+        k_lane = 64 // NLane
+        n0 = n // NLane
+        k0 = k_pk // (k_lane * k_pack)
+        if gate_up:
+            src_reshaped = src.view(experts_cnt, 2, n0, NLane, k0, k_lane, k_pack)
+            interleaved = src_reshaped.permute(0, 2, 1, 4, 5, 3, 6).contiguous().view(*src.shape)
+        else:
+            src_reshaped = src.view(experts_cnt, n0, NLane, k0, k_lane, k_pack)
+            interleaved = src_reshaped.permute(0, 1, 3, 4, 2, 5).contiguous().view(*src.shape)
+        return interleaved.contiguous().view(src_type)
+
+    n, k_pk = src.shape
+    k_pack = 16
+    k_lane = 64 // NLane
+    n0 = n // NLane
+    k0 = k_pk // (k_lane * k_pack)
+    src_reshaped = src.view(n0, NLane, k0, k_lane, k_pack)
+    interleaved = src_reshaped.permute(0, 2, 3, 1, 4).contiguous().view(*src.shape)
+    return interleaved.contiguous().view(src_type)
+
+
+def shuffle_scale_w4(src: torch.Tensor, experts_cnt: int, gate_up: bool) -> torch.Tensor:
+    """Shuffle e8m0 MXFP4 scales to match ``shuffle_weight_w4`` layouts."""
+    n_experts, k_ = src.shape
+    n_ = n_experts // experts_cnt
+    k_pack = 2
+    n_pack = 2
+    n_lane = 16
+    k_lane = 64 // n_lane
+
+    k1 = k_ // k_pack // k_lane
+    n1 = n_ // n_lane // n_pack
+    real_k = 32 * k_ * k_pack * k_lane
+    assert real_k >= 256, f"K {real_k} must be larger than Tile_K(256)"
+
+    if gate_up:
+        shfl_scale = src.view(experts_cnt, n_pack, n1, n_lane, k1, k_pack, k_lane)
+        shfl_scale = shfl_scale.permute(0, 2, 4, 6, 3, 5, 1).contiguous()
+    else:
+        shfl_scale = src.view(experts_cnt, n1, n_pack, n_lane, k1, k_pack, k_lane)
+        shfl_scale = shfl_scale.permute(0, 1, 4, 6, 3, 5, 2).contiguous()
+    return shfl_scale.view(*src.shape).contiguous()
+
+
 def down_size(size):
     assert size[-1] % 2 == 0, f"{size} last dim not divisible by two"
     return (*size[:-1], size[-1] // 2)
