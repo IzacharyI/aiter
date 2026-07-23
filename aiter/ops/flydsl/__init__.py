@@ -37,6 +37,21 @@ if is_flydsl_available():
             f"got `{installed_flydsl_version}`."
         )
 
+    # Compatibility shim for FlyDSL releases whose ``ArithValue`` does not
+    # provide ``.ir_value()``. Some kernels call ``.ir_value()`` uniformly on
+    # FlyDSL values; for ``ArithValue`` the underlying MLIR value is ``self``.
+    try:
+        from flydsl.expr.arith import ArithValue as _ArithValue
+
+        if not hasattr(_ArithValue, "ir_value"):
+
+            def _arith_ir_value(self, *, loc=None, ip=None):
+                return self
+
+            _ArithValue.ir_value = _arith_ir_value
+    except Exception:
+        pass
+
     from .gemm_kernels import (
         flydsl_hgemm,
         flydsl_preshuffle_gemm_a8,
@@ -46,6 +61,10 @@ if is_flydsl_available():
     from .moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
     from .fmha_kernels import flydsl_flash_attn_func
     from .kernels.qk_norm_rope_quant import flydsl_qk_norm_rope_quant
+    try:
+        from .mega_moe import MegaMoE, MegaMoeStage1, MegaMoeStage2, Stage1Output
+    except ImportError:
+        MegaMoE = MegaMoeStage1 = MegaMoeStage2 = Stage1Output = None
 
     # from .linear_attention_kernels import flydsl_gdr_decode
 
@@ -60,3 +79,10 @@ if is_flydsl_available():
         "flydsl_qk_norm_rope_quant",
         # "flydsl_gdr_decode",
     ]
+    if MegaMoE is not None:
+        __all__ += [
+            "MegaMoE",
+            "MegaMoeStage1",
+            "MegaMoeStage2",
+            "Stage1Output",
+        ]
