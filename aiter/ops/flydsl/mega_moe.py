@@ -847,6 +847,14 @@ class MegaMoeStage1:
         # default; disable with AITER_MEGA_S1_DEDUP=0.
         _dd_env = os.environ.get("AITER_MEGA_S1_DEDUP", "1").strip()
         self._dedup = (_dd_env != "0") and self.atom_contract and (not self.compact)
+        # The op stubs rx_em iff it was built with dedup_payload matching this decision. A mismatch
+        # would mean rx_em is a stub while the megakernel expects the full expert-major buffer (or
+        # vice-versa) -> silent corruption; fail loudly instead.
+        _op_ded = getattr(self.op, "dedup_payload", None)
+        if _op_ded is not None:
+            assert bool(_op_ded) == bool(self._dedup), (
+                f"op.dedup_payload={_op_ded} != stage1._dedup={self._dedup} "
+                f"(mtpr={self.mtpr} compact={self.compact}); rx_em stub/full mismatch")
         if os.environ.get("AITER_MEGA_DEBUG_OPT", "0") == "1" and self.rank == 0:
             print(f"[megaopt] rank0 mtpr={self.mtpr} compact={self.compact} "
                   f"atom_contract={self.atom_contract} b_nt={self._b_nt} "
@@ -913,9 +921,16 @@ class MegaMoeStage1:
         self.p2p_rx_tok = None
         if self._dedup:
             _op = self.op
-            self._rx_tok = _op._sym((self.nvm * _op.row_bytes,), torch.int8)
+            # rx_tok is token-major, indexed ONLY by src_global = src_rank*mtpr + src_tok, which is
+            # bounded by npes*mtpr = ll_cap (each src rank writes its own [rank*mtpr,(rank+1)*mtpr)
+            # band; padding slots use sentinel row = npes*mtpr whose output is discarded). It does
+            # NOT need num_valid_max (= epr*ll_cap+256) rows like the expert-major rx_em -> sizing to
+            # ll_cap shrinks the dedup buffer ~epr-fold (48x for DSV4-Pro). +unit_size keeps the
+            # sentinel row (index npes*mtpr) inside the physical alloc so its gather reads a real 0.
+            _rows_tok = int(self.cap) + int(self.unit_size)   # self.cap = op.ll_cap = npes*mtpr (unit-aligned)
+            self._rx_tok = _op._sym((_rows_tok * _op.row_bytes,), torch.int8)
             _rt = (self._rx_tok.view(torch.float4_e2m1fn_x2) if self.a_dtype == "fp4"
-                   else self._rx_tok.view(_op.dtype)).view(self.nvm, _op.row_view)
+                   else self._rx_tok.view(_op.dtype)).view(_rows_tok, _op.row_view)
             self._rx = _rt
             self.p2p_rx_tok = _op._p2p_table(self._rx_tok)
         self._scale_i32 = v["scale_em_i32"]
@@ -1190,6 +1205,14 @@ class MegaMoE:
             gm_unit_size=self._s1cfg["unit_size"],
             gm_scheme=mega_scheme,
             gm_compact=self._s1cfg["compact"],
+            # rx_em stub intent: MUST match MegaMoeStage1._dedup (= env & atom_contract(always True)
+            # & not compact). When dedup is active, rx_em is dead (megakernel uses rx_tok) so the op
+            # allocates it as a stub instead of nvm rows. Stage1 asserts op.dedup_payload==_dedup.
+            gm_dedup_payload=(
+                _gm_on
+                and (os.environ.get("AITER_MEGA_S1_DEDUP", "1").strip() != "0")
+                and (not self._s1cfg["compact"])
+            ),
         )
         # ywx: allow sharing one dispatch/combine op (and its mori symmetric-heap
         # buffers) across many identically-configured MegaMoE layers. Layers run

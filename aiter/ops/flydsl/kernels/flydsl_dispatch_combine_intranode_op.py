@@ -262,6 +262,10 @@ class FlyDSLDispatchCombineConfig:
     gm_unit_size: int = 0
     gm_scheme: str = "fixedslot"
     gm_compact: bool = False
+    # payload-dedup intent for the group-major op. When True the megakernel uses the token-major
+    # rx_tok and rx_em becomes a DEAD buffer -> the op allocates rx_em as a tiny stub (saves the
+    # epr*ll_cap*row_bytes footprint). MUST match MegaMoeStage1._dedup (= env & not gm_compact).
+    gm_dedup_payload: bool = False
 
     @property
     def dispatch_is_fp4(self):
@@ -347,6 +351,10 @@ class FlyDSLDispatchGroupMajorOp:
         # prefix-sum base (compact_base[le]), Phase-2 writes payload precisely.  Cuts num_valid_max
         # from epr*cap (=epr*npes*mtpr, OOMs at large bs) to ~npes*mtpr*topk -> scales to full bs.
         self.compact = bool(compact and scheme == "fixedslot")
+        # payload-dedup intent (mirrors mega_moe MegaMoeStage1._dedup = env & atom_contract(always
+        # True) & not compact, fixedslot only). When set, the megakernel writes/reads the token-major
+        # rx_tok and rx_em is a DEAD buffer -> _alloc gives rx_em a tiny stub instead of nvm rows.
+        self.dedup_payload = bool(dedup_payload) and (scheme == "fixedslot") and (not self.compact)
         self.rank = rank
         self.npes = world_size
         self.hidden = hidden_dim
@@ -424,7 +432,12 @@ class FlyDSLDispatchGroupMajorOp:
         # copies running->ll_count then folds running back to 0 (no separate reset launch).
         self.running = self._sym((epr,), torch.int32)
         self.ll_count = self._sym((epr,), torch.int32)
-        self.rx_em = self._sym((nvm * self.row_bytes,), torch.int8)
+        # rx_em = expert-major activation buffer (nvm * row_bytes). In payload-dedup the megakernel
+        # writes/reads the token-major rx_tok (owned by MegaMoeStage1) instead, so rx_em is DEAD ->
+        # allocate a tiny stub (unit rows) to keep p2p_rx_em / _ll_views references valid without the
+        # epr*ll_cap*row_bytes footprint.
+        self._rx_em_rows = self.unit if self.dedup_payload else nvm
+        self.rx_em = self._sym((self._rx_em_rows * self.row_bytes,), torch.int8)
         self.scale_em = self._sym((max(1, nvm * self.scale_n_i32),), torch.int32)
         self.idx_em = self._sym((nvm,), torch.int32)
         self.wts_em = self._sym((nvm,), torch.float32)
@@ -530,8 +543,11 @@ class FlyDSLDispatchGroupMajorOp:
         return self.ll_cap
 
     def _ll_views(self):
-        rx_em_view = self.rx_em.view(self.dtype).view(self.num_valid_max, self.row_view) \
-            if not _gm_is_fp4(self.dtype) else self.rx_em.view(torch.float4_e2m1fn_x2).view(self.num_valid_max, self.row_view)
+        # rx_em is viewed with its ACTUAL row count (_rx_em_rows): nvm normally, or the tiny stub
+        # under dedup (where MegaMoeStage1 overwrites self._rx with rx_tok, discarding this view).
+        _em_rows = getattr(self, "_rx_em_rows", self.num_valid_max)
+        rx_em_view = self.rx_em.view(self.dtype).view(_em_rows, self.row_view) \
+            if not _gm_is_fp4(self.dtype) else self.rx_em.view(torch.float4_e2m1fn_x2).view(_em_rows, self.row_view)
         scale_em_view = self.scale_em.view(torch.uint8).view(self.num_valid_max, max(1, self.scale_n_i32 * 4))[:, :self.scale_bytes]
         scale_em_i32 = self.scale_em.view(self.num_valid_max, max(1, self.scale_n_i32))
         return dict(rx_em=rx_em_view, scale_em=scale_em_view, scale_em_i32=scale_em_i32,
@@ -642,6 +658,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
                 data_type=config.dispatch_dtype, unit_size=config.gm_unit_size,
                 scale_dim=config.scale_dim, scale_type_size=config.scale_type_size,
                 scheme=config.gm_scheme, compact=config.gm_compact,
+                dedup_payload=getattr(config, "gm_dedup_payload", False),
             )
             # Unify total_recv: the fused dispatch prologue accumulates distinct-recv into
             # the SAME buffer combine reads (self.total_recv), so no host/device bridge.
