@@ -72,6 +72,23 @@ def get_dtype_bytes(dtype: str):
         return 2
 
 
+def ptr_arg(t: torch.Tensor):
+    """Wrap a torch.Tensor as an fx.Pointer."""
+    import flydsl.expr as fx
+
+    type_name = type(t).__name__
+    module_name = type(t).__module__
+    if type_name == "FakeTensor" or "fake_tensor" in module_name:
+        return flyc.from_c_void_p(fx.Uint8, 0)
+    return flyc.from_c_void_p(fx.Uint8, t.data_ptr())
+
+
+def ptr_rsrc(ptr):
+    """Convert an fx.Pointer kernel arg to a buffer resource."""
+    addr_i64 = arith.index_cast(T.i64, ptrtoint(ptr))
+    return buffer_ops.create_buffer_resource_from_addr(addr_i64)
+
+
 class TensorView:
     def __init__(self, dtype, shape, stride, base_offset, load_impl, store_impl):
         self.dtype = dtype
