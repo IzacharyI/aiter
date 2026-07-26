@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import os
 import sys
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -287,6 +288,86 @@ def generate_data(m, n, k, seed, device="cuda"):
     }
 
 
+def generate_production_data(m, n, k, seed, dtype=dtypes.bf16, device="cuda"):
+    """Build the production boundary used for backend E2E comparison.
+
+    This deliberately matches ``tune_mxscale_preshuffle``'s production data:
+    activation A remains BF16, B is an already-quantized/preshuffled checkpoint
+    payload, and the checkpoint block-128 B scale contains exact powers of two.
+    The production dispatcher therefore owns the single activation quantization
+    step selected by the tuned backend.
+    """
+    if n % 128 != 0 or k % 128 != 0:
+        raise ValueError(
+            f"production blockscale E2E requires N/K divisible by 128, got "
+            f"N={n}, K={k}"
+        )
+
+    torch.manual_seed(seed)
+    a_bf16 = torch.randn((m, k), dtype=dtype, device=device) * 0.25
+    b_q = (
+        torch.randn((n, k), dtype=torch.float32, device=device) * 0.25
+    ).to(dtypes.fp8)
+    b_kernel = shuffle_weight(b_q.contiguous(), layout=(16, 16))
+    exponents = torch.randint(
+        low=-6,
+        high=2,
+        size=(n // 128, k // 128),
+        device=device,
+    )
+    b_scale = torch.pow(2.0, exponents.float())
+    return {
+        "A": a_bf16,
+        "B": b_kernel,
+        "B_logical": b_q,
+        "a_scale": None,
+        "b_scale": b_scale,
+    }
+
+
+def calculate_error_metrics(actual, reference, *, atol=1e-2, rtol=1e-2):
+    """Return threshold ratio plus scale-independent and absolute metrics."""
+    actual_f32 = actual.to(torch.float32)
+    reference_f32 = reference.to(torch.float32)
+    abs_delta = (actual_f32 - reference_f32).abs()
+    mismatch = abs_delta > (atol + rtol * reference_f32.abs())
+    reference_l2 = torch.linalg.vector_norm(reference_f32).item()
+    delta_l2 = torch.linalg.vector_norm(abs_delta).item()
+    return {
+        "err_ratio": float(mismatch.count_nonzero().item() / actual.numel()),
+        "rel_l2": float(delta_l2 / reference_l2 if reference_l2 else delta_l2),
+        "mean_abs": float(abs_delta.mean().item()),
+        "max_abs": float(abs_delta.max().item()),
+    }
+
+
+def measure_single_call(function, *arguments):
+    """Measure one synchronized production call on device and host clocks."""
+    torch.cuda.synchronize()
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    wall_start = time.perf_counter()
+    start_event.record()
+    output = function(*arguments)
+    end_event.record()
+    end_event.synchronize()
+    wall_us = (time.perf_counter() - wall_start) * 1_000_000.0
+    device_us = start_event.elapsed_time(end_event) * 1_000.0
+    return output, float(device_us), float(wall_us)
+
+
+def measure_steady_wall(function, arguments, iterations):
+    """Measure amortized synchronized wall time while keeping static B fixed."""
+    torch.cuda.synchronize()
+    wall_start = time.perf_counter()
+    output = None
+    for _ in range(iterations):
+        output = function(*arguments)
+    torch.cuda.synchronize()
+    wall_us = (time.perf_counter() - wall_start) * 1_000_000.0 / iterations
+    return output, float(wall_us)
+
+
 class GemmA8W8BlockScaleTuner(GemmCommonTuner):
     ARG_DEFAULTS = {
         **GemmCommonTuner.ARG_DEFAULTS,
@@ -306,6 +387,12 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         super().__init__(name, keys, resultList, description)
 
     def run(self, args, fast_mode=False):
+        if getattr(args, "production_e2e", False) and not args.run_config:
+            self.parser.error("--production-e2e requires --run_config")
+        if getattr(args, "production_e2e", False) and not args.preshuffle:
+            self.parser.error("--production-e2e requires --preshuffle")
+        if int(getattr(args, "max_shapes", 0)) < 0:
+            self.parser.error("--max-shapes must be non-negative")
         if getattr(args, "preshuffle", False):
             self.ARG_DEFAULTS["config_env_name"] = (
                 "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE"
@@ -331,9 +418,21 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             "--libtype",
             type=str,
             default="all",
-            choices=["ck", "cktile", "asm", "flydsl", "all", "both"],
+            choices=[
+                "ck",
+                "cktile",
+                "asm",
+                "flydsl",
+                "legacy",
+                "all",
+                "both",
+            ],
             required=False,
-            help="CK gemm a8w8 blockscale type to tune: ck, cktile, asm, flydsl, both or all (covers all supported backends across standard/preshuffleB modes)",
+            help=(
+                "A8W8 blockscale backend to tune: ck, cktile, asm, flydsl, "
+                "both (ck+cktile), legacy (ck+cktile+asm), or all (also "
+                "includes FlyDSL)"
+            ),
         )
 
         self.parser.add_argument(
@@ -348,6 +447,48 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             type=int,
             default=list(range(1, BLOCK_PER_CU_MAX + 1)),
             help="List of BlockPerCu values to tune (CKTile only)",
+        )
+
+        self.parser.add_argument(
+            "--production_e2e",
+            "--production-e2e",
+            action="store_true",
+            help=(
+                "With --run_config --preshuffle, benchmark the full production "
+                "BF16 A -> per-1x128 FP8 quant -> dispatcher -> CK/CKTile/ASM "
+                "GEMM path and report both native-quantized and BF16-reference "
+                "accuracy. Without this flag, preserve the historical "
+                "pre-quantized run_config behavior."
+            ),
+        )
+        self.parser.add_argument(
+            "--run_config_output",
+            "--run-config-output",
+            default="",
+            help=(
+                "Optional resumable CSV checkpoint written by "
+                "--production-e2e --run_config."
+            ),
+        )
+        self.parser.add_argument(
+            "--num_rotate_args",
+            "--num-rotate-args",
+            type=int,
+            default=1,
+            help=(
+                "Number of GPU argument copies used by production E2E "
+                "perftest; use 1 to keep checkpoint B identity/static."
+            ),
+        )
+        self.parser.add_argument(
+            "--max_shapes",
+            "--max-shapes",
+            type=int,
+            default=0,
+            help=(
+                "Process at most this many pending production-E2E shapes "
+                "(0 means all)."
+            ),
         )
 
     def calculate(self, results, bpes=(1, 1, 2)):
@@ -556,7 +697,364 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                 )
         return tasks_ck
 
+    def run_production_e2e(self, args):
+        """Benchmark legacy blockscale winners from the real BF16 boundary.
+
+        The timed operation is the public production dispatcher, not a tune
+        wrapper.  A native reference independently applies the same per-1x128
+        FP8+FP32 activation format; a second reference keeps A in BF16.  This
+        separates backend/dispatcher correctness from intrinsic quantization
+        loss using the same protocol as the MXFP8 FlyDSL production report.
+        """
+        if not args.preshuffle:
+            raise ValueError("--production-e2e currently requires --preshuffle")
+        if not args.run_config:
+            raise ValueError("--production-e2e requires --run_config")
+        if int(args.num_rotate_args) != 1:
+            raise ValueError(
+                "production E2E requires --num-rotate-args 1 so static B "
+                "retains its identity across calls"
+            )
+        if int(args.max_shapes) < 0:
+            raise ValueError("--max-shapes must be non-negative")
+
+        from aiter.jit import core as jit_core
+        from aiter.ops import gemm_op_a8w8 as gemm_op
+        from aiter.ops.quant import per_group_quant_hip
+        from aiter.test_common import run_perftest
+
+        production_op = gemm_op.gemm_a8w8_blockscale_bpreshuffle
+        tuned_file = (
+            jit_core.AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE
+        )
+        checkpoint_path = str(args.run_config_output or "").strip()
+        checkpoint_columns = [
+            "gfx",
+            "cu_num",
+            "M",
+            "N",
+            "K",
+            "libtype",
+            "kernelId",
+            "splitK",
+            "kernel_only_us",
+            "warmup",
+            "iters",
+            "num_rotate_args",
+            "allowed_error",
+            "cold_device_us",
+            "cold_wall_us",
+            "e2e_us",
+            "e2e_wall_us",
+            "native_err_ratio",
+            "native_rel_l2",
+            "native_mean_abs",
+            "native_max_abs",
+            "bf16_err_ratio",
+            "bf16_rel_l2",
+            "bf16_mean_abs",
+            "bf16_max_abs",
+            "status",
+        ]
+        resume_columns = [
+            "gfx",
+            "cu_num",
+            "M",
+            "N",
+            "K",
+            "libtype",
+            "kernelId",
+            "splitK",
+            "warmup",
+            "iters",
+            "num_rotate_args",
+            "allowed_error",
+        ]
+
+        checkpoint = pd.DataFrame(columns=checkpoint_columns)
+        if checkpoint_path and os.path.exists(checkpoint_path):
+            checkpoint = pd.read_csv(checkpoint_path)
+            missing = sorted(set(checkpoint_columns) - set(checkpoint.columns))
+            if missing:
+                raise ValueError(
+                    f"run-config checkpoint {checkpoint_path!r} is missing "
+                    f"columns: {missing}"
+                )
+            checkpoint = checkpoint[checkpoint_columns]
+
+        def config_value(config, name, default):
+            if config is None:
+                return default
+            value = config.get(name, default)
+            return default if pd.isna(value) else value
+
+        def normalized_int(config, name, default):
+            return int(config_value(config, name, default))
+
+        def resume_key(
+            *, gfx, cu_num, M, N, K, libtype, kernel_id, split_k, allowed_error
+        ):
+            return (
+                str(gfx),
+                int(cu_num),
+                int(M),
+                int(N),
+                int(K),
+                str(libtype),
+                int(kernel_id),
+                int(split_k),
+                int(args.warmup),
+                int(args.iters),
+                int(args.num_rotate_args),
+                float(allowed_error),
+            )
+
+        completed = set()
+        if not checkpoint.empty:
+            passed = checkpoint[checkpoint["status"] == "ok"]
+            for row in passed.itertuples(index=False):
+                completed.add(
+                    (
+                        str(row.gfx),
+                        int(row.cu_num),
+                        int(row.M),
+                        int(row.N),
+                        int(row.K),
+                        str(row.libtype),
+                        int(row.kernelId),
+                        int(row.splitK),
+                        int(row.warmup),
+                        int(row.iters),
+                        int(row.num_rotate_args),
+                        float(row.allowed_error),
+                    )
+                )
+
+        def persist(record):
+            nonlocal checkpoint
+            if not checkpoint_path:
+                return
+            checkpoint = pd.concat(
+                [checkpoint, pd.DataFrame([record], columns=checkpoint_columns)],
+                ignore_index=True,
+            )
+            checkpoint = checkpoint.drop_duplicates(
+                subset=resume_columns,
+                keep="last",
+            )
+            directory = os.path.dirname(os.path.abspath(checkpoint_path))
+            os.makedirs(directory, exist_ok=True)
+            temporary = os.path.join(
+                directory,
+                f".{os.path.basename(checkpoint_path)}.{os.getpid()}.tmp",
+            )
+            checkpoint.to_csv(temporary, index=False)
+            os.replace(temporary, checkpoint_path)
+
+        results = []
+        pending_processed = 0
+        gfx = self.get_gfx()
+        cu_num = self.get_cu_num()
+        for i in range(len(self.untunedf)):
+            shape_row = self.untunedf.iloc[i]
+            M, N, K = (
+                int(shape_row["M"]),
+                int(shape_row["N"]),
+                int(shape_row["K"]),
+            )
+            shape = f"({M}, {N}, {K})"
+            config = gemm_op.get_CKGEMM_config(M, N, K, tuned_file)
+            libtype = str(config_value(config, "libtype", "missing")).lower()
+            kernel_id = normalized_int(config, "kernelId", -1)
+            split_k = normalized_int(config, "splitK", 0)
+            kernel_only_us = float(config_value(config, "us", float("nan")))
+            allowed_error, allowed_error_desc = (
+                self._get_run_config_err_ratio_limit(config, args)
+            )
+            key = resume_key(
+                gfx=gfx,
+                cu_num=cu_num,
+                M=M,
+                N=N,
+                K=K,
+                libtype=libtype,
+                kernel_id=kernel_id,
+                split_k=split_k,
+                allowed_error=allowed_error,
+            )
+            if key in completed:
+                continue
+            if args.max_shapes and pending_processed >= int(args.max_shapes):
+                break
+            pending_processed += 1
+
+            record = {
+                "gfx": str(gfx),
+                "cu_num": int(cu_num),
+                "M": M,
+                "N": N,
+                "K": K,
+                "libtype": libtype,
+                "kernelId": kernel_id,
+                "splitK": split_k,
+                "kernel_only_us": kernel_only_us,
+                "warmup": int(args.warmup),
+                "iters": int(args.iters),
+                "num_rotate_args": int(args.num_rotate_args),
+                "allowed_error": float(allowed_error),
+                "cold_device_us": -1.0,
+                "cold_wall_us": -1.0,
+                "e2e_us": -1.0,
+                "e2e_wall_us": -1.0,
+                "native_err_ratio": float("nan"),
+                "native_rel_l2": float("nan"),
+                "native_mean_abs": float("nan"),
+                "native_max_abs": float("nan"),
+                "bf16_err_ratio": float("nan"),
+                "bf16_rel_l2": float("nan"),
+                "bf16_mean_abs": float("nan"),
+                "bf16_max_abs": float("nan"),
+                "status": "not-run",
+            }
+            try:
+                if config is None:
+                    raise ValueError(
+                        f"no tuned config for M={M}, N={N}, K={K} in "
+                        f"{tuned_file}"
+                    )
+                if libtype not in {"ck", "cktile", "asm"}:
+                    raise ValueError(
+                        "legacy production E2E requires a CK/CKTile/ASM "
+                        f"winner, got libtype={libtype!r} for {shape}"
+                    )
+
+                data = generate_production_data(M, N, K, 0)
+                production_args = (
+                    data["A"],
+                    data["B"],
+                    None,
+                    data["b_scale"],
+                )
+
+                # Compile and initialize first. The measured cold call retains
+                # compiled kernels but includes config lookup, activation quant,
+                # dispatcher overhead, and the selected GEMM backend.
+                production_op(*production_args)
+                torch.cuda.synchronize()
+                self._clear_op_caches()
+                _, cold_device_us, cold_wall_us = measure_single_call(
+                    production_op, *production_args
+                )
+
+                out, e2e_us = run_perftest(
+                    production_op,
+                    *production_args,
+                    num_warmup=args.warmup,
+                    num_iters=args.iters,
+                    num_rotate_args=args.num_rotate_args,
+                )
+                out, e2e_wall_us = measure_steady_wall(
+                    production_op,
+                    production_args,
+                    args.iters,
+                )
+
+                # Independent legacy-native reference: quantize the original A
+                # once to per-1x128 E4M3+FP32, undo the CK scale transpose as a
+                # view, and GEMM against the same dequantized checkpoint B.
+                a_native_q, a_native_scale_t = per_group_quant_hip(
+                    data["A"],
+                    quant_dtype=dtypes.fp8,
+                    group_size=128,
+                    transpose_scale=True,
+                )
+                groups = K // 128
+                a_native_scale = a_native_scale_t.contiguous().view(groups, M).T
+                a_native_deq = (
+                    a_native_q.float().view(M, groups, 128)
+                    * a_native_scale.unsqueeze(-1)
+                ).view(M, K)
+                b_deq = data["B_logical"].float() * data[
+                    "b_scale"
+                ].repeat_interleave(128, dim=0).repeat_interleave(128, dim=1)
+                native_reference = (a_native_deq @ b_deq.T).to(dtypes.bf16)
+                native_metrics = calculate_error_metrics(
+                    out.to(dtypes.bf16), native_reference
+                )
+                del (
+                    a_native_q,
+                    a_native_scale_t,
+                    a_native_scale,
+                    a_native_deq,
+                    native_reference,
+                )
+
+                bf16_reference = (data["A"].float() @ b_deq.T).to(dtypes.bf16)
+                bf16_metrics = calculate_error_metrics(
+                    out.to(dtypes.bf16), bf16_reference
+                )
+                del b_deq, bf16_reference
+
+                status = (
+                    "ok"
+                    if native_metrics["err_ratio"] <= allowed_error
+                    else "mismatch:native_err_ratio="
+                    f"{native_metrics['err_ratio']:.6g}"
+                    f"(>{allowed_error_desc})"
+                )
+                record.update(
+                    {
+                        "cold_device_us": cold_device_us,
+                        "cold_wall_us": cold_wall_us,
+                        "e2e_us": float(e2e_us),
+                        "e2e_wall_us": e2e_wall_us,
+                        "native_err_ratio": native_metrics["err_ratio"],
+                        "native_rel_l2": native_metrics["rel_l2"],
+                        "native_mean_abs": native_metrics["mean_abs"],
+                        "native_max_abs": native_metrics["max_abs"],
+                        "bf16_err_ratio": bf16_metrics["err_ratio"],
+                        "bf16_rel_l2": bf16_metrics["rel_l2"],
+                        "bf16_mean_abs": bf16_metrics["mean_abs"],
+                        "bf16_max_abs": bf16_metrics["max_abs"],
+                        "status": status,
+                    }
+                )
+                results.append(
+                    {
+                        "shape": shape,
+                        "kernel_us": kernel_only_us,
+                        "e2e_us": float(e2e_us),
+                        "status": status,
+                    }
+                )
+                print(
+                    f"[production-e2e] {shape} backend={libtype} "
+                    f"kernel={kernel_only_us:.4f}us steady_device={e2e_us:.4f}us "
+                    f"wall={e2e_wall_us:.4f}us "
+                    f"native_err={native_metrics['err_ratio']:.6%} "
+                    f"bf16_rel_l2={bf16_metrics['rel_l2']:.6%}",
+                    flush=True,
+                )
+            except Exception as error:
+                status = f"error:{error}"
+                record["status"] = status
+                results.append(
+                    {
+                        "shape": shape,
+                        "kernel_us": kernel_only_us,
+                        "e2e_us": -1,
+                        "status": status,
+                    }
+                )
+            finally:
+                persist(record)
+                torch.cuda.empty_cache()
+        return results
+
     def run_config(self, args):
+        if getattr(args, "production_e2e", False):
+            return self.run_production_e2e(args)
+
         from aiter.ops.gemm_op_a8w8 import (
             gemm_a8w8_blockscale,
             gemm_a8w8_blockscale_bpreshuffle,
@@ -901,7 +1399,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             prev_task_count = len(task)
             info_keys = (gfx, cu_num, M, N, K)
             lib = args.libtype
-            if lib in ("ck", "both", "all"):
+            if lib in ("ck", "both", "legacy", "all"):
                 task.extend(
                     self.get_gemm_a8w8_blockscale_tune_task(
                         info_keys,
@@ -911,7 +1409,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                         run_kwargs,
                     )
                 )
-            if lib in ("cktile", "both", "all"):
+            if lib in ("cktile", "both", "legacy", "all"):
                 task.extend(
                     self.get_gemm_a8w8_blockscale_cktile_tune_task(
                         info_keys,
@@ -922,7 +1420,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                         run_kwargs,
                     )
                 )
-            if lib in ("asm", "all"):
+            if lib in ("asm", "legacy", "all"):
                 task.extend(
                     self.get_gemm_a8w8_blockscale_asm_tune_task(
                         info_keys,
