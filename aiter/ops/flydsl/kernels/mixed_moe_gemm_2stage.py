@@ -2784,6 +2784,7 @@ def compile_mixed_moe_gemm2(
     b_nt: int = 2,
     xcd_swizzle: int = 0,
     mfma_variant: str | None = None,
+    partial_fp8: bool = False,
 ):
     """Compile stage2 kernel (`moe_gemm2`) and return the compiled executable.
 
@@ -3014,10 +3015,26 @@ def compile_mixed_moe_gemm2(
     def out_elem():
         return T.f32 if out_is_f32 else (T.bf16 if out_is_bf16 else T.f16)
 
+    # fp8-partial traffic-halving: when accumulate=False AND partial_fp8, the
+    # per-(token,slot) partials are stored as fp8_e4m3 (1 byte) instead of bf16
+    # (2 bytes). This halves the mfma_moe2 partial-write traffic AND the
+    # downstream moe_reduction read (both dominant memory terms). The LDS
+    # CShuffle path stays bf16; only the FINAL global store converts to fp8.
+    # The reduced output `out` remains bf16.
+    _partial_fp8 = bool(partial_fp8) and (not bool(accumulate))
+    # Symmetric descale applied before the fp8 partial store (and its reciprocal
+    # in the reduction) so large down-proj partials stay within fp8_e4m3 range
+    # (~448). Overridable via AITER_FLYDSL_PF8_SCALE.
+    _PF8_STORE_SCALE = float(os.environ.get("AITER_FLYDSL_PF8_SCALE", "0.0007"))
+
+    def _fp8_elem():
+        ty = T.f8
+        return ty() if callable(ty) else ty
+
     def _load_bias_scalar(bias_rsrc, offset):
         return buffer_ops.buffer_load(bias_rsrc, offset, vec_width=1, dtype=T.f32)
 
-    epilog_tag = "cshuffle"
+    epilog_tag = "cshuffle" + ("_pf8" if _partial_fp8 else "")
     # IMPORTANT: include tiling in the module name to avoid accidentally reusing a compiled
     # binary for a different (tile_m, tile_n, tile_k) configuration.
     # See stage1 note: include ABI tag to prevent binary reuse across signature changes.
@@ -3236,7 +3253,8 @@ def compile_mixed_moe_gemm2(
             w_rsrc = _ptr_buffer_resource(arg_w, w_nbytes)
 
             # OUT: [tokens, model_dim] -> clamp to descriptor max (i32 bytes) to avoid overflow on huge tokens.
-            out_elem_bytes = 4 if out_is_f32 else 2
+            # partial_fp8: per-(token,slot) partials are 1 byte (fp8_e4m3).
+            out_elem_bytes = 1 if _partial_fp8 else (4 if out_is_f32 else 2)
             out_nbytes_idx = (
                 tokens_in * n_in * arith.constant(out_elem_bytes, index=True)
             )
@@ -4766,14 +4784,77 @@ def compile_mixed_moe_gemm2(
                             out_elem_bytes, index=True
                         )
                         ptr_addr_idx = row_byte_base + byte_off_col
-                        out_ptr_v = _idx_to_llvm_ptr(ptr_addr_idx)
-                        frag_v = frag._value if hasattr(frag, "_value") else frag
-                        llvm.StoreOp(
-                            frag_v,
-                            out_ptr_v,
-                            alignment=_e_vec * out_elem_bytes,
-                            nontemporal=True,
-                        )
+                        if const_expr(_partial_fp8):
+                            # Convert the bf16 CShuffle frag -> fp8_e4m3 (1 byte/elem)
+                            # before the global store. gfx950 has no direct vector
+                            # bf16->f8 truncf lowering, so pack via rocdl.cvt_pk_fp8_f32
+                            # (2 f32 -> 2 fp8 per word_sel) into i32 words, then store.
+                            _f32_ty = ir.F32Type.get()
+                            # Descale before fp8 quant so large down-proj partials do
+                            # not overflow fp8_e4m3 (max ~448 -> nan). The reduce kernel
+                            # multiplies by the reciprocal (PF8_STORE_SCALE) after unpack.
+                            _pf8_store_scale = arith.constant(
+                                float(_PF8_STORE_SCALE), type=_f32_ty
+                            )
+                            _pf8_store_scale = (
+                                _pf8_store_scale._value
+                                if hasattr(_pf8_store_scale, "_value")
+                                else _pf8_store_scale
+                            )
+                            # Clamp to the fp8_e4m3 finite range (±448) AFTER the descale
+                            # so a rare outlier saturates instead of producing a NaN byte
+                            # that would poison the reduce.
+                            _pf8_hi = arith.constant(440.0, type=_f32_ty)
+                            _pf8_hi = _pf8_hi._value if hasattr(_pf8_hi, "_value") else _pf8_hi
+                            _pf8_lo = arith.constant(-440.0, type=_f32_ty)
+                            _pf8_lo = _pf8_lo._value if hasattr(_pf8_lo, "_value") else _pf8_lo
+                            _scalars = []
+                            for _li in range_constexpr(_e_vec):
+                                _bf = vector.extract(
+                                    frag, static_position=[_li], dynamic_position=[]
+                                )
+                                _bf_v = _bf._value if hasattr(_bf, "_value") else _bf
+                                _f32 = arith.extf(_f32_ty, _bf_v)
+                                _f32v = _f32._value if hasattr(_f32, "_value") else _f32
+                                _f32v = arith.mulf(_f32v, _pf8_store_scale)
+                                _f32v = arith.minnumf(_f32v, _pf8_hi)
+                                _f32v = arith.maxnumf(_f32v, _pf8_lo)
+                                _scalars.append(
+                                    _f32v._value if hasattr(_f32v, "_value") else _f32v
+                                )
+                            _c0_i32 = arith.constant(0, type=T.i32)
+                            _c0_raw = (
+                                _c0_i32._value if hasattr(_c0_i32, "_value") else _c0_i32
+                            )
+                            _num_words = _e_vec // 4
+                            for _w in range_constexpr(_num_words):
+                                _b = _w * 4
+                                _pk = rocdl.cvt_pk_fp8_f32(
+                                    T.i32, _scalars[_b], _scalars[_b + 1], _c0_raw, 0
+                                )
+                                _pk = rocdl.cvt_pk_fp8_f32(
+                                    T.i32, _scalars[_b + 2], _scalars[_b + 3], _pk, 1
+                                )
+                                _pk_raw = _pk._value if hasattr(_pk, "_value") else _pk
+                                _w_addr = ptr_addr_idx + arith.constant(
+                                    _w * 4, index=True
+                                )
+                                _w_ptr = _idx_to_llvm_ptr(_w_addr)
+                                llvm.StoreOp(
+                                    _pk_raw,
+                                    _w_ptr,
+                                    alignment=4,
+                                    nontemporal=True,
+                                )
+                        else:
+                            out_ptr_v = _idx_to_llvm_ptr(ptr_addr_idx)
+                            frag_v = frag._value if hasattr(frag, "_value") else frag
+                            llvm.StoreOp(
+                                frag_v,
+                                out_ptr_v,
+                                alignment=_e_vec * out_elem_bytes,
+                                nontemporal=True,
+                            )
                     else:
                         # ---- accumulate=True: 64-bit global atomic path ----
                         col_idx = col_g0

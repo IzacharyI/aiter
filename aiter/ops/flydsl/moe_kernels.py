@@ -435,6 +435,7 @@ def compile_flydsl_moe_stage2(
     xcd_swizzle: int = 0,
     enable_bias: bool = False,
     mfma_variant: Optional[str] = None,
+    partial_fp8: bool = False,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
     if b_dtype == "fp4":
@@ -461,6 +462,7 @@ def compile_flydsl_moe_stage2(
             xcd_swizzle=xcd_swizzle,
             enable_bias=enable_bias,
             mfma_variant=mfma_variant,
+            partial_fp8=partial_fp8,
         )
     elif a_dtype == "bf16" and b_dtype == "int4":
         # a16wi4: bf16 activations, int4 weights with groupwise scale
@@ -1145,6 +1147,20 @@ def flydsl_moe_stage2(
 
     accumulate = mode != "reduce"
 
+    # fp8-partial traffic-halving (opt-in): store the per-(token,slot) stage-2
+    # partials as fp8_e4m3 (1 byte) instead of bf16 (2 bytes) and read them back
+    # in the topk reduction. Halves the dominant partial write+read traffic
+    # (the stage-2 reduce kernel is ~2x faster with fp8 partials). Only for the
+    # fp4-weight reduce path with bf16 output and tile_n%128==0 (so the CShuffle
+    # vector width _e_vec is a multiple of 4 for the fp8 pack/store).
+    _partial_fp8 = (
+        (not accumulate)
+        and os.environ.get("AITER_FLYDSL_MOE2_PARTIAL_FP8", "0") == "1"
+        and b_dtype == "fp4"
+        and out_dtype == "bf16"
+        and (tile_n % 128 == 0)
+    )
+
     if a_dtype == "fp4":
         inter_dim = inter_dim * 2
 
@@ -1207,7 +1223,7 @@ def flydsl_moe_stage2(
         target = torch.empty(
             (token_num * topk * model_dim,),
             device=out.device,
-            dtype=out.dtype,
+            dtype=torch.float8_e4m3fn if _partial_fp8 else out.dtype,
         )
 
     if is_fp4:
@@ -1266,6 +1282,7 @@ def flydsl_moe_stage2(
         xcd_swizzle=xcd_swizzle,
         enable_bias=(bias is not None),
         mfma_variant=mfma_variant,
+        partial_fp8=_partial_fp8,
     )
     _run_compiled(exe, args)
 
@@ -1292,6 +1309,7 @@ def flydsl_moe_stage2(
                 topk=topk,
                 model_dim=model_dim,
                 dtype_str=_reduce_dtype_str,
+                in_dtype_str=("fp8" if _partial_fp8 else None),
                 use_mask=use_mask,
                 # expert_mask is sized by global expert count (≠ w2.shape[0] under EP).
                 num_experts=int(expert_mask.numel()) if use_mask else 0,

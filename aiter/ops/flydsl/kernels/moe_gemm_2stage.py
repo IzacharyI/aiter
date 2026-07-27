@@ -3592,6 +3592,7 @@ def compile_moe_reduction(
     topk: int,
     model_dim: int,
     dtype_str: str = "f16",
+    in_dtype_str: str = None,
     use_mask: bool = False,
     num_experts: int = 0,
 ):
@@ -3612,8 +3613,11 @@ def compile_moe_reduction(
     ir.ShapedType.get_dynamic_size()
 
     # Kernel Config
-    BLOCK_SIZE = 256
-    VEC_WIDTH = 8
+    # Wide block+vector config: bs1024/vw16 matches the fix3 launch geometry
+    # (single WG per token along model_dim, 128b*n_sub vector loads) and is
+    # ~8% faster than the legacy bs256/vw8 for the memory-bound topk reduction.
+    BLOCK_SIZE = 1024
+    VEC_WIDTH = 16
 
     if dtype_str == "f32":
         elem_type_tag = "f32"
@@ -3623,6 +3627,18 @@ def compile_moe_reduction(
         elem_type_tag = "bf16"
     else:
         raise ValueError(f"Unsupported dtype: {dtype_str}")
+
+    # Input (partial) dtype may differ from output (final) dtype.  fp8-partial
+    # traffic-halving stores the topk partials as fp8_e4m3 (1 byte) while the
+    # reduced output stays bf16 for the LM head.  Default: same as output.
+    _in_tag = in_dtype_str if in_dtype_str is not None else elem_type_tag
+    in_is_fp8 = _in_tag in ("fp8", "f8", "fp8_e4m3", "e4m3")
+    # Reciprocal of the descale mfma_moe2 applied before the fp8 partial store.
+    # Must match AITER_FLYDSL_PF8_SCALE used there. Applied once on the reduced
+    # accumulator (linear, so post-sum rescale == per-partial rescale).
+    import os as _os
+    _pf8_store_scale = float(_os.environ.get("AITER_FLYDSL_PF8_SCALE", "0.0007"))
+    _pf8_rescale = (1.0 / _pf8_store_scale) if in_is_fp8 else 1.0
 
     def compute_type():
         return T.f32
@@ -3641,16 +3657,31 @@ def compile_moe_reduction(
         )
         return ty() if callable(ty) else ty
 
+    def in_elem_type():
+        if in_is_fp8:
+            ty = T.f8
+            return ty() if callable(ty) else ty
+        return elem_type()
+
+    def in_load_type():
+        # fp8 is not a valid buffer_load result type on this backend; load the
+        # raw bytes as i8 and bitcast to f8 before the extf to f32.
+        if in_is_fp8:
+            ty = T.i8
+            return ty() if callable(ty) else ty
+        return in_elem_type()
+
     module_name = (
         f"moe_reduction_kernel_{'masked' if use_mask else 'plain'}"
-        f"_{dtype_str}_topk{topk}_md{model_dim}"
+        f"_{dtype_str}_in{_in_tag}_topk{topk}_md{model_dim}_bs{BLOCK_SIZE}_vw{VEC_WIDTH}"
     )
 
     elem_bytes_c = (32 if dtype_str == "f32" else 16) // 8
+    in_elem_bytes_c = 1 if in_is_fp8 else elem_bytes_c
 
     if True:
 
-        @flyc.kernel(name=module_name)
+        @flyc.kernel(name=module_name, known_block_size=[BLOCK_SIZE, 1, 1])
         def moe_reduction_kernel(
             X: fx.Pointer,
             Y: fx.Pointer,
@@ -3688,7 +3719,7 @@ def compile_moe_reduction(
             # base address (computed in i64). The in-kernel voffsets then only
             # need to address one token's slab.
             slab_elems_x = c_topk * c_model_dim
-            x_slab_nbytes = slab_elems_x * fx.Index(elem_bytes_c)
+            x_slab_nbytes = slab_elems_x * fx.Index(in_elem_bytes_c)
             y_slab_nbytes = c_model_dim * fx.Index(elem_bytes_c)
             x_base_off_i64 = fx.Int64(token_idx * x_slab_nbytes)
             y_base_off_i64 = fx.Int64(token_idx * c_model_dim * fx.Index(elem_bytes_c))
@@ -3736,7 +3767,12 @@ def compile_moe_reduction(
                         # (8 elems for bf16/f16 = 128b; 4 elems for f32 = 128b).
                         # n_sub iterations cover the full VEC_WIDTH stride.
                         vec_type_c = T.vec(copy_vec_width, compute_type())
-                        vec_type_e = T.vec(copy_vec_width, elem_type())
+                        vec_type_e = T.vec(copy_vec_width, in_elem_type())
+                        # fp8 partials are loaded as raw i8 bytes (f8 is not a
+                        # valid buffer_load result type on this backend), then
+                        # unpacked via cvt_f32_fp8 before the extf to f32.
+                        vec_type_load = T.vec(copy_vec_width, in_load_type())
+                        _in_is_narrow = in_is_fp8 or (elem_bits < 32)
 
                         acc_vecs = [
                             vector.broadcast(vec_type_c, fx.Float32(0.0).ir_value())
@@ -3771,31 +3807,81 @@ def compile_moe_reduction(
                                 off_elems_i32 = fx.Int32(
                                     k_off_elems + fx.Index(si * copy_vec_width)
                                 )
+                                if const_expr(in_is_fp8):
+                                    # fp8 partials are stored as raw i32 words (4
+                                    # fp8/word) by mfma_moe2's cvt_pk_fp8_f32 store.
+                                    # Load them back as i32 words (offset in fp8
+                                    # units is div-by-4 since model_dim & col_base
+                                    # are), unpack each byte via cvt_f32_fp8.
+                                    _nw = copy_vec_width // 4
+                                    off_words_i32 = fx.Int32(
+                                        (k_off_elems + fx.Index(si * copy_vec_width))
+                                        / fx.Index(4)
+                                    )
+                                    vec_i32 = buffer_ops.buffer_load(
+                                        x_rsrc,
+                                        off_words_i32,
+                                        vec_width=_nw,
+                                        dtype=i32_type(),
+                                    )
+                                    _lanes = []
+                                    for _w in range_constexpr(_nw):
+                                        _word = vector.extract(
+                                            vec_i32,
+                                            static_position=[_w],
+                                            dynamic_position=[],
+                                        )
+                                        _word_v = (
+                                            _word._value
+                                            if hasattr(_word, "_value")
+                                            else _word
+                                        )
+                                        for _bsel in range_constexpr(4):
+                                            _sc = rocdl.cvt_f32_fp8(
+                                                T.f32, _word_v, _bsel
+                                            )
+                                            _lanes.append(_sc)
+                                    vec_c = vector.from_elements(vec_type_c, _lanes)
+                                    if const_expr(use_mask):
+                                        zero_c = vector.broadcast(
+                                            vec_type_c, fx.Float32(0.0).ir_value()
+                                        )
+                                        vec_c = mv_ok.select(vec_c, zero_c)
+                                    acc_vecs[si] = acc_vecs[si] + vec_c
+                                    continue
+
                                 vec_e = buffer_ops.buffer_load(
                                     x_rsrc,
                                     off_elems_i32,
                                     vec_width=copy_vec_width,
-                                    dtype=elem_type(),
+                                    dtype=in_load_type(),
                                 )
 
-                                if const_expr(use_mask):
-                                    zero_e = vector.broadcast(
-                                        vec_type_e,
-                                        arith.constant(0.0, type=elem_type()),
-                                    )
-                                    vec_e = mv_ok.select(vec_e, zero_e)
-
-                                if const_expr(elem_bits < 32):
+                                if const_expr(_in_is_narrow):
                                     vec_c = vec_e.extf(vec_type_c)
                                 else:
                                     vec_c = vec_e
+
+                                if const_expr(use_mask):
+                                    zero_c = vector.broadcast(
+                                        vec_type_c, fx.Float32(0.0).ir_value()
+                                    )
+                                    vec_c = mv_ok.select(vec_c, zero_c)
+
                                 acc_vecs[si] = acc_vecs[si] + vec_c
 
-                        # ── Store results ──
+                        # ── Store results ── (output stays bf16/f16/f32)
+                        vec_type_out = T.vec(copy_vec_width, elem_type())
                         for si in range_constexpr(n_sub):
                             out_vec = acc_vecs[si]
+                            if const_expr(in_is_fp8):
+                                _rs = vector.broadcast(
+                                    vec_type_c,
+                                    fx.Float32(_pf8_rescale).ir_value(),
+                                )
+                                out_vec = out_vec * _rs
                             if const_expr(elem_bits < 32):
-                                out_vec = out_vec.truncf(vec_type_e)
+                                out_vec = out_vec.truncf(vec_type_out)
                             y_off_elems_i32 = fx.Int32(
                                 col_base + fx.Index(si * copy_vec_width)
                             )
@@ -3827,27 +3913,83 @@ def compile_moe_reduction(
                                             vec_width=1,
                                             dtype=i32_type(),
                                         )
-                                        v = (valid_i32 != fx.Int32(0)).select(
-                                            buffer_ops.buffer_load(
+                                        if const_expr(in_is_fp8):
+                                            # scalar fp8: load byte -> i32 -> cvt_f32_fp8
+                                            _i8 = buffer_ops.buffer_load(
                                                 x_rsrc,
                                                 x_idx_i32,
                                                 vec_width=1,
-                                                dtype=elem_type(),
-                                            ),
-                                            arith.constant(0.0, type=elem_type()),
-                                        )
+                                                dtype=in_load_type(),
+                                            )
+                                            _i8v = (
+                                                _i8._value
+                                                if hasattr(_i8, "_value")
+                                                else _i8
+                                            )
+                                            _i32w = arith.extui(T.i32, _i8v)
+                                            _i32w = (
+                                                _i32w._value
+                                                if hasattr(_i32w, "_value")
+                                                else _i32w
+                                            )
+                                            _vf = rocdl.cvt_f32_fp8(T.f32, _i32w, 0)
+                                            v = (valid_i32 != fx.Int32(0)).select(
+                                                _vf,
+                                                arith.constant(
+                                                    0.0, type=compute_type()
+                                                ),
+                                            )
+                                        else:
+                                            v = (valid_i32 != fx.Int32(0)).select(
+                                                buffer_ops.buffer_load(
+                                                    x_rsrc,
+                                                    x_idx_i32,
+                                                    vec_width=1,
+                                                    dtype=in_elem_type(),
+                                                ),
+                                                arith.constant(
+                                                    0.0, type=in_elem_type()
+                                                ),
+                                            )
                                     else:
-                                        v = buffer_ops.buffer_load(
-                                            x_rsrc,
-                                            x_idx_i32,
-                                            vec_width=1,
-                                            dtype=elem_type(),
-                                        )
-                                    if const_expr(dtype_str in ("f16", "bf16")):
+                                        if const_expr(in_is_fp8):
+                                            _i8 = buffer_ops.buffer_load(
+                                                x_rsrc,
+                                                x_idx_i32,
+                                                vec_width=1,
+                                                dtype=in_load_type(),
+                                            )
+                                            _i8v = (
+                                                _i8._value
+                                                if hasattr(_i8, "_value")
+                                                else _i8
+                                            )
+                                            _i32w = arith.extui(T.i32, _i8v)
+                                            _i32w = (
+                                                _i32w._value
+                                                if hasattr(_i32w, "_value")
+                                                else _i32w
+                                            )
+                                            v = rocdl.cvt_f32_fp8(T.f32, _i32w, 0)
+                                        else:
+                                            v = buffer_ops.buffer_load(
+                                                x_rsrc,
+                                                x_idx_i32,
+                                                vec_width=1,
+                                                dtype=in_elem_type(),
+                                            )
+                                    if const_expr(
+                                        (not in_is_fp8)
+                                        and dtype_str in ("f16", "bf16")
+                                    ):
                                         v = v.extf(compute_type())
                                     a = a + v
 
                                 out = a
+                                if const_expr(in_is_fp8):
+                                    out = out * arith.constant(
+                                        _pf8_rescale, type=compute_type()
+                                    )
                                 if const_expr(dtype_str in ("f16", "bf16")):
                                     out = out.truncf(elem_type())
                                 y_idx_i32 = fx.Int32(col)
