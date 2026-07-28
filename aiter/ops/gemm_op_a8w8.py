@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
-from typing import Optional
+from typing import Optional, Tuple
 
 import pandas as pd
 import torch
@@ -875,22 +875,307 @@ def flatmm_a8w8_blockscale_ASM(
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
     return flatmm_a8w8_blockscale_asm(XQ, WQ, x_scale, w_scale, Y)
 
-
 def gemm_a8w8_blockscale_bpreshuffle_fake(
     XQ: Tensor,
     WQ: Tensor,
-    x_scale: Tensor,
+    x_scale: Optional[Tensor],
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
 ) -> Tensor:
     return torch.empty(XQ.shape[0], WQ.shape[0], dtype=dtype, device=XQ.device)
 
 
+def _is_e8m0_byte_tensor(tensor: Tensor) -> bool:
+    e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
+    return tensor.dtype == torch.uint8 or (
+        e8m0_dtype is not None and tensor.dtype == e8m0_dtype
+    )
+
+
+def _resolve_bpreshuffle_scale_transposed(
+    scale: Tensor,
+    *,
+    rows: int,
+    groups: int,
+) -> bool:
+    """Distinguish legacy storage from a materialized column-major scale.
+
+    Singleton dimensions are layout-equivalent and return ``False``.
+    """
+    expected_shape = (rows, groups)
+    if tuple(scale.shape) != expected_shape:
+        raise ValueError(
+            "bpreshuffle activation scale must have shape "
+            f"{expected_shape}, got {tuple(scale.shape)}"
+        )
+
+    row_major = scale.is_contiguous()
+    column_major = scale.t().is_contiguous()
+    if column_major:
+        return False
+    if row_major:
+        return True
+
+    raise ValueError(
+        "unsupported bpreshuffle activation scale layout: expected either "
+        "legacy contiguous metadata with physically transposed storage or "
+        "a materialized column-major logical tensor; got "
+        f"shape={tuple(scale.shape)}, stride={scale.stride()}"
+    )
+
+
+def _resolve_mxscale_flydsl_config(config: dict) -> dict:
+    """Parse a ``flydsl_mxpsh_*`` tuned row."""
+    import math
+
+    from .flydsl.mxscale_preshuffle_config import (
+        parse_kernel_name,
+    )
+
+    kernel_name = config.get("kernelName") or ""
+    resolved = parse_kernel_name(str(kernel_name))
+    if resolved is None:
+        raise ValueError(
+            "invalid FlyDSL MXScale tuned kernelName "
+            f"{kernel_name!r}; expected flydsl_mxpsh_*"
+        )
+
+    split_k = config.get("splitK", config.get("split_k", 1))
+    if split_k is None or (isinstance(split_k, float) and math.isnan(split_k)):
+        split_k = 1
+    else:
+        split_k = int(split_k)
+        split_k = 1 if split_k <= 0 else split_k
+    resolved["split_k"] = split_k
+    return resolved
+
+
+def _is_mxscale_flydsl_config(config: Optional[dict]) -> bool:
+    """Whether a shared A8W8 tuned row selects the MXFP8 FlyDSL path."""
+    return bool(
+        config is not None
+        and str(config.get("libtype", "")).lower() == "flydsl"
+        and str(config.get("kernelName", "")).startswith("flydsl_mxpsh_")
+    )
+
+
+def _gemm_a8w8_blockscale_bpreshuffle_mxfp8(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    Y: Tensor,
+    config: dict,
+) -> Tensor:
+    """Requantize legacy A8W8 inputs only for a FlyDSL winner."""
+    from .flydsl.mxscale_preshuffle_kernels import (
+        flydsl_mxscale_preshuffle_gemm,
+        fp32_scale_to_e8m0_exact,
+        prepare_block128_b_scale_e8m0_cached,
+        requantize_block128_a_fp8_to_mxfp8,
+    )
+
+    if not is_flydsl_available():
+        raise RuntimeError(
+            "libtype=flydsl for MXFP8 block-scale GEMM requires a compatible "
+            "flydsl installation"
+        )
+    if get_gfx() != "gfx950":
+        raise RuntimeError(
+            "AITER MXFP8 broadcast-scale GEMM is supported only on gfx950"
+        )
+    if XQ.ndim != 2 or WQ.ndim != 2:
+        raise ValueError(
+            "MXFP8 broadcast-scale GEMM expects 2D A/B tensors, got "
+            f"A={tuple(XQ.shape)}, B={tuple(WQ.shape)}"
+        )
+    if XQ.dtype != dtypes.fp8 or WQ.dtype != dtypes.fp8:
+        raise TypeError(
+            "MXFP8 broadcast-scale GEMM expects FP8 A/B payloads, got "
+            f"A={XQ.dtype}, B={WQ.dtype}"
+        )
+
+    M, K = int(XQ.shape[0]), int(XQ.shape[1])
+    N = int(WQ.shape[0])
+    if int(WQ.shape[1]) != K:
+        raise ValueError(f"A/B K mismatch: A K={K}, B K={int(WQ.shape[1])}")
+    if M <= 0 or N <= 0 or K <= 0 or N % 128 != 0 or K % 128 != 0:
+        raise ValueError(
+            "MXFP8 broadcast-scale GEMM requires M>0 and N/K divisible by "
+            f"128, got M={M}, N={N}, K={K}"
+        )
+
+    k32_padded = ((K // 32 + 7) // 8) * 8
+    prepared_a_shape = (((M + 31) // 32) * 32, k32_padded)
+    if _is_e8m0_byte_tensor(x_scale):
+        # Native quant already produced the packed A16W4 scale.
+        if tuple(x_scale.shape) != prepared_a_shape:
+            raise ValueError(
+                "native MXFP8 A scale must already be packed with shape "
+                f"{prepared_a_shape}, got {tuple(x_scale.shape)}"
+            )
+        if x_scale.device != XQ.device:
+            raise ValueError(
+                "native MXFP8 A payload and scale must share a device, got "
+                f"{XQ.device} and {x_scale.device}"
+            )
+        a_mxfp8 = XQ.contiguous()
+        a_scale_kernel = x_scale.contiguous()
+    elif x_scale.dtype == torch.float32:
+        # Convert a reusable block-128 activation only after backend selection.
+        scale_transposed = _resolve_bpreshuffle_scale_transposed(
+            x_scale,
+            rows=M,
+            groups=K // 128,
+        )
+        a_mxfp8, a_scale_kernel = requantize_block128_a_fp8_to_mxfp8(
+            XQ,
+            x_scale,
+            scale_transposed=scale_transposed,
+            # The dispatcher already validates the block-128 scale contract.
+            validate=False,
+            pack_scale_a16w4=True,
+        )
+    else:
+        raise TypeError(
+            "FlyDSL MXFP8 A scale must be a packed E8M0 byte tensor or the "
+            f"legacy FP32 block-128 scale, got {x_scale.dtype}"
+        )
+
+    logical_b_shape = (N // 128, K // 128)
+    prepared_b_shape = (N, k32_padded)
+    if tuple(w_scale.shape) == logical_b_shape:
+        # Cache the expanded checkpoint scale by tensor/version/stream.
+        b_scale_kernel = prepare_block128_b_scale_e8m0_cached(w_scale, N=N, K=K)
+    elif tuple(w_scale.shape) == prepared_b_shape:
+        if w_scale.dtype == torch.float32:
+            b_scale_kernel = fp32_scale_to_e8m0_exact(w_scale, name="w_scale")
+        elif _is_e8m0_byte_tensor(w_scale):
+            b_scale_kernel = w_scale.contiguous()
+        else:
+            raise TypeError(
+                "prepared MXFP8 B scale must be FP32 checkpoint values or "
+                f"raw E8M0 bytes, got {w_scale.dtype}"
+            )
+    else:
+        raise ValueError(
+            "unexpected MXFP8 B scale shape: expected logical "
+            f"{logical_b_shape} or prepared {prepared_b_shape}, got "
+            f"{tuple(w_scale.shape)}"
+        )
+
+    flydsl_config = _resolve_mxscale_flydsl_config(config)
+    expected_out_dtype = "bf16" if Y.dtype == dtypes.bf16 else "fp16"
+    if (
+        flydsl_config["a_dtype"] != "fp8"
+        or flydsl_config["b_dtype"] != "fp8"
+        or flydsl_config["out_dtype"] != expected_out_dtype
+    ):
+        raise ValueError(
+            "MXScale tuned config dtype mismatch: expected "
+            f"fp8/fp8/{expected_out_dtype}, got "
+            f"{flydsl_config['a_dtype']}/{flydsl_config['b_dtype']}/"
+            f"{flydsl_config['out_dtype']}"
+        )
+    return flydsl_mxscale_preshuffle_gemm(
+        a_mxfp8,
+        WQ.contiguous(),
+        a_scale_kernel,
+        b_scale_kernel,
+        Y,
+        a_dtype="fp8",
+        b_dtype="fp8",
+        tile_m=flydsl_config["tile_m"],
+        tile_n=flydsl_config["tile_n"],
+        tile_k=flydsl_config["tile_k"],
+        waves_per_eu=flydsl_config["waves_per_eu"],
+        xcd_swizzle=flydsl_config["xcd_swizzle"],
+        split_k=flydsl_config["split_k"],
+    )
+
+def quant_a8w8_blockscale_bpreshuffle(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Optional[Tensor] = None,
+) -> Tuple[Tensor, Tensor]:
+
+    if XQ.ndim != 2 or WQ.ndim != 2:
+        raise ValueError(
+            "bpreshuffle quant expects 2D tensors, "
+            f"got XQ={tuple(XQ.shape)}, WQ={tuple(WQ.shape)}"
+        )
+
+    m = XQ.shape[0]
+    n = WQ.shape[0]
+    k = XQ.shape[1]
+
+    if WQ.shape[1] != k:
+        raise ValueError(
+            f"A/B K mismatch: XQ K={k}, WQ K={WQ.shape[1]}"
+        )
+
+    config = get_CKGEMM_config(
+        m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE
+    )
+    mxscale_flydsl = _is_mxscale_flydsl_config(config)
+
+    if x_scale is None:
+        # Select the backend before quantizing the original activation once.
+        if XQ.dtype not in (dtypes.bf16, dtypes.fp16):
+            raise TypeError(
+                "x_scale=None requires an unquantized BF16/FP16 activation, "
+                f"got {XQ.dtype}"
+            )
+        if mxscale_flydsl:
+            from .quant import per_1x32_mx_quant_hip
+            from .flydsl.mxscale_preshuffle_kernels import (
+                prepare_block32_a_scale_e8m0,
+            )
+
+            XQ, x_scale = per_1x32_mx_quant_hip(
+                XQ,
+                quant_dtype=dtypes.fp8,
+                scale_type=dtypes.fp8_e8m0,
+                shuffle=False,
+            )
+
+            x_scale = prepare_block32_a_scale_e8m0(
+                x_scale,
+                M=m,
+                K=k,
+            )
+        else:
+            from .quant import per_group_quant_hip
+
+            XQ, x_scale = per_group_quant_hip(
+                XQ,
+                quant_dtype=dtypes.fp8,
+                group_size=128,
+                transpose_scale=False,
+            )
+            # Materialize the bpreshuffle scale layout expected by gfx95.
+            if x_scale.dim() == 2:
+                x_scale = x_scale.t().contiguous().t()
+    elif XQ.dtype in (dtypes.bf16, dtypes.fp16):
+        raise TypeError(
+            "an unquantized BF16/FP16 activation must pass x_scale=None; "
+            f"got x_scale dtype {x_scale.dtype}"
+        )
+
+    if _is_e8m0_byte_tensor(x_scale) and not mxscale_flydsl:
+        raise ValueError(
+            "packed MXFP8 activation input is only valid when the tuned "
+            "config selects a flydsl_mxpsh_* kernel"
+        )
+
+    return XQ, x_scale
+
+
 @torch_compile_guard(gen_fake=gemm_a8w8_blockscale_bpreshuffle_fake)
 def gemm_a8w8_blockscale_bpreshuffle(
     XQ: Tensor,
     WQ: Tensor,
-    x_scale: Tensor,
+    x_scale: Optional[Tensor],
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
 ) -> Tensor:
@@ -901,12 +1186,15 @@ def gemm_a8w8_blockscale_bpreshuffle(
     m = XQ.shape[0]
     n = WQ.shape[0]
     k = XQ.shape[1]
+    Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+
     config = get_CKGEMM_config(
         m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE
     )
-    Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+    mxscale_flydsl = _is_mxscale_flydsl_config(config)
+
     if config is not None:
-        libtype = config["libtype"]
+        libtype = str(config["libtype"]).lower()
         kernelName = str(config.get("kernelName", ""))
         if libtype == "cktile":
             return gemm_a8w8_blockscale_bpreshuffle_cktile(
@@ -921,10 +1209,16 @@ def gemm_a8w8_blockscale_bpreshuffle(
             return gemm_a8w8_blockscale_bpreshuffle_asm(
                 XQ, WQ, Y, x_scale, w_scale, splitK=splitK, kernelName=kernelName
             )
-        elif libtype == "flydsl" and is_flydsl_available():
-            return gemm_a8w8_blockscale_bpreshuffle_flydsl(
-                XQ, WQ, x_scale, w_scale, Y, config
-            )
+        elif libtype == "flydsl":
+            # Kernel-name prefixes distinguish legacy and MXScale FlyDSL rows.
+            if mxscale_flydsl:
+                return _gemm_a8w8_blockscale_bpreshuffle_mxfp8(
+                    XQ, WQ, x_scale, w_scale, Y, config
+                )
+            if is_flydsl_available():
+                return gemm_a8w8_blockscale_bpreshuffle_flydsl(
+                    XQ, WQ, x_scale, w_scale, Y, config
+                )
         elif libtype == "flydsl8w" and is_flydsl_available():
             return gemm_a8w8_blockscale_bpreshuffle_flydsl_8w(
                 XQ, WQ, x_scale, w_scale, Y, config

@@ -13,7 +13,7 @@ from packaging.version import Version
 from .utils import is_flydsl_available
 from .moe_common import GateMode
 
-_MIN_FLYDSL_VERSION = Version("0.1.8")
+_MIN_FLYDSL_VERSION = Version("0.2.0")
 
 __all__ = [
     "is_flydsl_available",
@@ -58,9 +58,22 @@ if is_flydsl_available():
         flydsl_blockscale_preshuffle_gemm_a8,
         flydsl_fp8_gemm_8wave_blockscale_a8,
     )
+    from .mxscale_preshuffle_kernels import (
+        flydsl_mxscale_preshuffle_gemm,
+        clear_mxfp8_b_scale_cache,
+        fp32_scale_to_e8m0_exact,
+        gemm_mxscale_preshuffle,
+        get_mxscale_preshuffle_config,
+        prepare_block128_a_scale_e8m0,
+        prepare_block32_a_scale_e8m0,
+        prepare_block128_b_scale_e8m0,
+        prepare_block128_b_scale_e8m0_cached,
+        requantize_block128_a_fp8_to_mxfp8,
+    )
     from .moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
     from .fmha_kernels import flydsl_flash_attn_func
     from .kernels.qk_norm_rope_quant import flydsl_qk_norm_rope_quant
+
     try:
         from .mega_moe import MegaMoE, MegaMoeStage1, MegaMoeStage2, Stage1Output
     except ImportError:
@@ -72,6 +85,16 @@ if is_flydsl_available():
         "flydsl_preshuffle_gemm_a8",
         "flydsl_blockscale_preshuffle_gemm_a8",
         "flydsl_fp8_gemm_8wave_blockscale_a8",
+        "flydsl_mxscale_preshuffle_gemm",
+        "clear_mxfp8_b_scale_cache",
+        "fp32_scale_to_e8m0_exact",
+        "gemm_mxscale_preshuffle",
+        "get_mxscale_preshuffle_config",
+        "prepare_block128_a_scale_e8m0",
+        "prepare_block32_a_scale_e8m0",
+        "prepare_block128_b_scale_e8m0",
+        "prepare_block128_b_scale_e8m0_cached",
+        "requantize_block128_a_fp8_to_mxfp8",
         "flydsl_moe_stage1",
         "flydsl_moe_stage2",
         "flydsl_hgemm",

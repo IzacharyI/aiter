@@ -455,12 +455,9 @@ def _dynamic_mxfp8_quant_kernel(
         )
 
 
-# Transcoder: (FP8 fnuz, fp32 1x128 scale) -> (FP8 fn, e8m0 1x32 scale).
-# Replaces the Python dequant+requant cascade (fp32 cast + multiply + bf16 cast
-# + per_1x32_mxfp8 quant) used in linear.py's MXFP8 fallback path for MLA wq_b
-# when q_norm emits the legacy fp8 fnuz + fp32 1x128 format.
+# Tiled native quant and legacy block-128-to-MXFP8 transcoder.
 #
-# In: x_fp8_fnuz (M, N) — fp8 e4m3fnuz bits (interpreted with bias 8 -> value)
+# In: x_fp8 (M, N) — source pointer dtype selects e4m3fn or e4m3fnuz decode
 #     x_scale_fp32 (M, N//128) — fp32 per-token-block scale
 # Out: y_fp8_fn (M, N) — fp8 e4m3fn bits (NV format, bias 7)
 #      y_scale_e8m0 (M, N//32) — uint8 e8m0 (1x32 MX scale)
@@ -468,7 +465,7 @@ def _dynamic_mxfp8_quant_kernel(
 
 @triton.jit
 def _fp8_legacy_to_mxfp8_kernel(
-    x_fnuz_ptr,
+    x_fp8_ptr,
     x_scale_fp32_ptr,
     y_fn_ptr,
     y_scale_e8m0_ptr,
@@ -485,12 +482,12 @@ def _fp8_legacy_to_mxfp8_kernel(
     BLOCK_SIZE_M: tl.constexpr,
     QUANT_BLOCK_SIZE: tl.constexpr,  # =32 (MXFP8 group)
     LEGACY_BLOCK_SIZE: tl.constexpr,  # =128 (input scale group)
+    SCALE_M_PAD: tl.constexpr,
+    SCALE_K_PAD: tl.constexpr,
+    PACK_SCALE_A16W4: tl.constexpr,
+    APPLY_LEGACY_SCALE: tl.constexpr,
 ):
-    """
-    One program per (BLOCK_SIZE_M rows, QUANT_BLOCK_SIZE-element column window).
-    For each 1x32 block, dequantize fnuz fp8 values using the corresponding
-    1x128 fp32 scale, derive the e8m0 (1x32) scale, then re-quantize to fp8 fn.
-    """
+    """Quantize one row tile and 32-column window to FP8/E8M0."""
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
 
@@ -498,19 +495,23 @@ def _fp8_legacy_to_mxfp8_kernel(
     offs_n = pid_n * QUANT_BLOCK_SIZE + tl.arange(0, QUANT_BLOCK_SIZE)
 
     x_offs = offs_m[:, None] * stride_xm + offs_n[None, :] * stride_xn
-    x_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    valid_scale_col = pid_n < (N // QUANT_BLOCK_SIZE)
+    x_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N) & valid_scale_col
 
-    # Load fp8 fnuz values; .to(fp32) decodes via fnuz bias 8 semantically.
-    x_fnuz = tl.load(x_fnuz_ptr + x_offs, mask=x_mask, other=0.0).to(tl.float32)
+    # The source pointer dtype makes .to(fp32) decode BF16/FP16/fn/fnuz.
+    x_values = tl.load(x_fp8_ptr + x_offs, mask=x_mask, other=0.0).to(tl.float32)
 
-    # Which legacy 1x128 group does this 1x32 block fall into?
-    legacy_n = (pid_n * QUANT_BLOCK_SIZE) // LEGACY_BLOCK_SIZE
-    xs_offs = offs_m * stride_xsm + legacy_n * stride_xsn
-    xs_mask = offs_m < M
-    x_scale = tl.load(x_scale_fp32_ptr + xs_offs, mask=xs_mask, other=1.0)
+    if APPLY_LEGACY_SCALE:
+        # Which legacy 1x128 group does this 1x32 block fall into?
+        legacy_n = (pid_n * QUANT_BLOCK_SIZE) // LEGACY_BLOCK_SIZE
+        xs_offs = offs_m * stride_xsm + legacy_n * stride_xsn
+        xs_mask = (offs_m < M) & valid_scale_col
+        x_scale = tl.load(x_scale_fp32_ptr + xs_offs, mask=xs_mask, other=1.0)
 
-    # Dequantize: bf16-equivalent reconstruction.
-    x_dq = x_fnuz * x_scale[:, None]
+        # Reconstruct the values represented by the legacy FP8+FP32 pair.
+        x_dq = x_values * x_scale[:, None]
+    else:
+        x_dq = x_values
 
     # Derive new e8m0 (1x32) scale from x_dq amax.
     scale_e8m0, quant_scale = _mxfp8_quant_op(x_dq, QUANT_AXIS=1)
@@ -522,9 +523,29 @@ def _fp8_legacy_to_mxfp8_kernel(
     y_offs = offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn
     tl.store(y_fn_ptr + y_offs, y, mask=x_mask)
 
-    s_offs = offs_m[:, None] * stride_ysm + pid_n * stride_ysn
-    s_mask = offs_m[:, None] < M
-    tl.store(y_scale_e8m0_ptr + s_offs, scale_e8m0, mask=s_mask)
+    if PACK_SCALE_A16W4:
+        # Write the inverse A16W4 mapping directly into the packed scale.
+        n1 = offs_m // 32
+        n_pack = (offs_m % 32) // 16
+        n_lane = offs_m % 16
+        k1 = pid_n // 8
+        k_pack = (pid_n % 8) // 4
+        k_lane = pid_n % 4
+        k1_count: tl.constexpr = SCALE_K_PAD // 8
+        packed_offs = (
+            ((((n1 * k1_count + k1) * 4 + k_lane) * 16 + n_lane) * 2 + k_pack) * 2
+        ) + n_pack
+        valid = (offs_m[:, None] < M) & valid_scale_col
+        packed_scale = tl.where(valid, scale_e8m0, 0x7F)
+        tl.store(
+            y_scale_e8m0_ptr + packed_offs[:, None],
+            packed_scale,
+            mask=offs_m[:, None] < SCALE_M_PAD,
+        )
+    else:
+        s_offs = offs_m[:, None] * stride_ysm + pid_n * stride_ysn
+        s_mask = (offs_m[:, None] < M) & valid_scale_col
+        tl.store(y_scale_e8m0_ptr + s_offs, scale_e8m0, mask=s_mask)
 
 
 @triton.heuristics(

@@ -27,6 +27,7 @@ __all__ = [
     "dynamic_mxfp4_quant",
     "_mxfp4_quant_op",
     "dynamic_mxfp8_quant",
+    "fp8_blockscale_to_mxfp8",
     "fp8_legacy_to_mxfp8",
     "_mxfp8_quant_op",
     "dynamic_nvfp4_quant",
@@ -236,21 +237,14 @@ def dynamic_mxfp8_quant(
     x: torch.Tensor,
     scale: Optional[torch.Tensor] = None,
     quant_dtype: torch.dtype = torch.float8_e4m3fn,
+    *,
+    pack_scale_a16w4: bool = False,
+    block_size_m: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Per-1x32 MXFP8 quantization (e8m0 scale + FP8 e4m3 values).
+    """Quantize per 1x32 to FP8 with E8M0 scales.
 
-    Args:
-        x: Input tensor (..., K). Typically bf16 or fp16. K % 32 == 0.
-        scale: Pre-allocated scale tensor (M, K // 32) uint8. Optional.
-        quant_dtype: FP8 dtype to cast quantized values to. On MI3xx
-            torch.float8_e4m3fnuz is the canonical FP8 e4m3 type. torch.float8_e4m3fn
-            is acceptable on hardware that supports it.
-
-    Returns:
-        Tuple of:
-            y: FP8 tensor of shape x.shape.
-            s: e8m0 (uint8) scale tensor of shape (..., K // 32).
+    ``pack_scale_a16w4=True`` writes the neutral-padded FlyDSL scale layout
+    ``(ceil(M/32)*32, ceil((K/32)/8)*8)`` directly.
     """
     assert x.dim() >= 2, f"x must be at least 2D, got {x.dim()}"
     orig_shape = x.shape
@@ -264,6 +258,65 @@ def dynamic_mxfp8_quant(
     Ns = K // _MXFP8_QUANT_BLOCK_SIZE  # number of scales per row
 
     y = torch.empty((M, K), dtype=quant_dtype, device=x.device)
+    if pack_scale_a16w4:
+        if x.dim() != 2:
+            raise ValueError(
+                "pack_scale_a16w4=True requires a 2D input, got "
+                f"shape {tuple(x.shape)}"
+            )
+        if quant_dtype != torch.float8_e4m3fn:
+            raise TypeError(
+                "packed FlyDSL MXFP8 quant requires torch.float8_e4m3fn, "
+                f"got {quant_dtype}"
+            )
+        scale_m_pad = (M + 31) // 32 * 32
+        scale_k_pad = (Ns + 7) // 8 * 8
+        expected_scale_shape = (scale_m_pad, scale_k_pad)
+        if scale is None:
+            scale = torch.empty(
+                expected_scale_shape, dtype=torch.uint8, device=x.device
+            )
+        else:
+            assert (
+                scale.shape == expected_scale_shape
+            ), f"scale shape {scale.shape} != {expected_scale_shape}"
+            assert scale.dtype == torch.uint8
+            assert scale.device == x.device
+
+        BLOCK_SIZE_M = 16 if block_size_m is None else int(block_size_m)
+        assert BLOCK_SIZE_M in (1, 2, 4, 8, 16)
+        grid = (
+            triton.cdiv(scale_m_pad, BLOCK_SIZE_M),
+            scale_k_pad,
+        )
+        # The scale pointer is unused for native quantization.
+        _fp8_legacy_to_mxfp8_kernel[grid](
+            x2d,
+            x2d,
+            y,
+            scale,
+            M,
+            K,
+            x2d.stride(0),
+            x2d.stride(1),
+            x2d.stride(0),
+            x2d.stride(1),
+            y.stride(0),
+            y.stride(1),
+            scale.stride(0),
+            scale.stride(1),
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            QUANT_BLOCK_SIZE=_MXFP8_QUANT_BLOCK_SIZE,
+            LEGACY_BLOCK_SIZE=_MXFP8_LEGACY_BLOCK_SIZE,
+            SCALE_M_PAD=scale_m_pad,
+            SCALE_K_PAD=scale_k_pad,
+            PACK_SCALE_A16W4=True,
+            APPLY_LEGACY_SCALE=False,
+        )
+        return y.view(*orig_shape[:-1], K), scale
+
+    if block_size_m is not None:
+        raise ValueError("block_size_m is only supported with pack_scale_a16w4=True")
     if scale is None:
         scale = torch.empty((M, Ns), dtype=torch.uint8, device=x.device)
     else:
@@ -296,28 +349,30 @@ def dynamic_mxfp8_quant(
     return y, s
 
 
-def fp8_legacy_to_mxfp8(
-    x_fnuz: torch.Tensor,
+def fp8_blockscale_to_mxfp8(
+    x_fp8: torch.Tensor,
     x_scale_fp32: torch.Tensor,
-    y_fn: Optional[torch.Tensor] = None,
+    y_fp8: Optional[torch.Tensor] = None,
     y_scale: Optional[torch.Tensor] = None,
+    *,
+    scale_transposed: bool = False,
+    pack_scale_a16w4: bool = False,
+    block_size_m: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Transcode (FP8 e4m3fnuz, fp32 1x128 scale) -> (FP8 e4m3fn, e8m0 1x32 scale)
-    in a single Triton launch. Replaces the Python dequant+requant cascade
-    used when MXFP8 path receives legacy-formatted (FP8 + fp32 1x128) inputs.
+    """Transcode FP8/FP32 block-128 input to per-32 FP8/E8M0.
 
-    Args:
-        x_fnuz: FP8 e4m3fnuz tensor of shape (M, N), N % 32 == 0.
-        x_scale_fp32: fp32 scale of shape (M, N // 128).
-        y_fn: optional preallocated output FP8 e4m3fn tensor.
-        y_scale: optional preallocated uint8 e8m0 scale tensor.
-
-    Returns:
-        y_fn (M, N) fp8 e4m3fn, y_scale (M, N // 32) uint8 e8m0.
+    The output payload is e4m3fn. ``scale_transposed`` selects the legacy CK
+    storage convention; ``pack_scale_a16w4`` writes the final FlyDSL layout.
     """
-    assert x_fnuz.dim() == 2, f"x must be 2D, got {x_fnuz.dim()}"
-    M, N = x_fnuz.shape
+    assert x_fp8.dim() == 2, f"x must be 2D, got {x_fp8.dim()}"
+    assert x_fp8.dtype in (
+        torch.float8_e4m3fn,
+        torch.float8_e4m3fnuz,
+    ), f"x must be FP8 e4m3fn/e4m3fnuz, got {x_fp8.dtype}"
+    assert x_scale_fp32.dtype == torch.float32
+    assert x_fp8.device == x_scale_fp32.device
+
+    M, N = x_fp8.shape
     assert N % _MXFP8_QUANT_BLOCK_SIZE == 0
     assert N % _MXFP8_LEGACY_BLOCK_SIZE == 0
     assert x_scale_fp32.shape == (
@@ -325,36 +380,85 @@ def fp8_legacy_to_mxfp8(
         N // _MXFP8_LEGACY_BLOCK_SIZE,
     ), f"x_scale_fp32 shape {x_scale_fp32.shape} != ({M},{N // _MXFP8_LEGACY_BLOCK_SIZE})"
 
-    Ns = N // _MXFP8_QUANT_BLOCK_SIZE
-    if y_fn is None:
-        y_fn = torch.empty((M, N), dtype=torch.float8_e4m3fn, device=x_fnuz.device)
-    if y_scale is None:
-        y_scale = torch.empty((M, Ns), dtype=torch.uint8, device=x_fnuz.device)
+    if scale_transposed:
+        # Expose legacy transposed storage as a strided logical view.
+        scale_storage = x_scale_fp32.contiguous()
+        x_scale_logical = scale_storage.view(N // _MXFP8_LEGACY_BLOCK_SIZE, M).T
+    else:
+        x_scale_logical = x_scale_fp32
 
-    BLOCK_SIZE_M = 1
-    grid = (triton.cdiv(M, BLOCK_SIZE_M), Ns)
+    Ns = N // _MXFP8_QUANT_BLOCK_SIZE
+    scale_m_pad = (M + 31) // 32 * 32 if pack_scale_a16w4 else M
+    scale_k_pad = (Ns + 7) // 8 * 8 if pack_scale_a16w4 else Ns
+    expected_scale_shape = (scale_m_pad, scale_k_pad)
+    if y_fp8 is None:
+        y_fp8 = torch.empty((M, N), dtype=torch.float8_e4m3fn, device=x_fp8.device)
+    else:
+        assert y_fp8.shape == (M, N)
+        assert y_fp8.dtype == torch.float8_e4m3fn
+        assert y_fp8.device == x_fp8.device
+    if y_scale is None:
+        y_scale = torch.empty(
+            expected_scale_shape, dtype=torch.uint8, device=x_fp8.device
+        )
+    else:
+        assert y_scale.shape == expected_scale_shape
+        assert y_scale.dtype == torch.uint8
+        assert y_scale.device == x_fp8.device
+
+    if block_size_m is None:
+        # Group rows for larger M to limit the program grid.
+        BLOCK_SIZE_M = 16 if pack_scale_a16w4 or M >= 8 else 1
+    else:
+        BLOCK_SIZE_M = int(block_size_m)
+        assert BLOCK_SIZE_M in (1, 2, 4, 8, 16)
+    grid = (
+        triton.cdiv(scale_m_pad if pack_scale_a16w4 else M, BLOCK_SIZE_M),
+        scale_k_pad if pack_scale_a16w4 else Ns,
+    )
 
     _fp8_legacy_to_mxfp8_kernel[grid](
-        x_fnuz,
-        x_scale_fp32,
-        y_fn,
+        x_fp8,
+        x_scale_logical,
+        y_fp8,
         y_scale,
         M,
         N,
-        x_fnuz.stride(0),
-        x_fnuz.stride(1),
-        x_scale_fp32.stride(0),
-        x_scale_fp32.stride(1),
-        y_fn.stride(0),
-        y_fn.stride(1),
+        x_fp8.stride(0),
+        x_fp8.stride(1),
+        x_scale_logical.stride(0),
+        x_scale_logical.stride(1),
+        y_fp8.stride(0),
+        y_fp8.stride(1),
         y_scale.stride(0),
         y_scale.stride(1),
         BLOCK_SIZE_M=BLOCK_SIZE_M,
         QUANT_BLOCK_SIZE=_MXFP8_QUANT_BLOCK_SIZE,
         LEGACY_BLOCK_SIZE=_MXFP8_LEGACY_BLOCK_SIZE,
+        SCALE_M_PAD=scale_m_pad,
+        SCALE_K_PAD=scale_k_pad,
+        PACK_SCALE_A16W4=pack_scale_a16w4,
+        APPLY_LEGACY_SCALE=True,
     )
 
-    return y_fn, y_scale
+    return y_fp8, y_scale
+
+
+def fp8_legacy_to_mxfp8(
+    x_fnuz: torch.Tensor,
+    x_scale_fp32: torch.Tensor,
+    y_fn: Optional[torch.Tensor] = None,
+    y_scale: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Backward-compatible e4m3fnuz wrapper for
+    :func:`fp8_blockscale_to_mxfp8`."""
+    return fp8_blockscale_to_mxfp8(
+        x_fnuz,
+        x_scale_fp32,
+        y_fn,
+        y_scale,
+        scale_transposed=False,
+    )
 
 
 def dynamic_nvfp4_quant(
