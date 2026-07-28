@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
-from typing import Optional
+from typing import Optional, Tuple
 
 import pandas as pd
 import torch
@@ -875,10 +875,6 @@ def flatmm_a8w8_blockscale_ASM(
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
     return flatmm_a8w8_blockscale_asm(XQ, WQ, x_scale, w_scale, Y)
 
-
-GEMM_A8W8_BPRESHUFFLE_SUPPORTS_UNQUANTIZED_INPUT = True
-
-
 def gemm_a8w8_blockscale_bpreshuffle_fake(
     XQ: Tensor,
     WQ: Tensor,
@@ -1097,23 +1093,26 @@ def _gemm_a8w8_blockscale_bpreshuffle_mxfp8(
         split_k=flydsl_config["split_k"],
     )
 
-
-@torch_compile_guard(gen_fake=gemm_a8w8_blockscale_bpreshuffle_fake)
-def gemm_a8w8_blockscale_bpreshuffle(
+def quant_a8w8_blockscale_bpreshuffle(
     XQ: Tensor,
     WQ: Tensor,
-    x_scale: Optional[Tensor],
-    w_scale: Tensor,
-    dtype: torch.dtype = dtypes.bf16,
-) -> Tensor:
-    assert dtype in [
-        dtypes.bf16,
-        dtypes.fp16,
-    ], f"Output {dtype=} is currently not supported in gemm_a8w8"
+    x_scale: Optional[Tensor] = None,
+) -> Tuple[Tensor, Tensor]:
+
+    if XQ.ndim != 2 or WQ.ndim != 2:
+        raise ValueError(
+            "bpreshuffle quant expects 2D tensors, "
+            f"got XQ={tuple(XQ.shape)}, WQ={tuple(WQ.shape)}"
+        )
+
     m = XQ.shape[0]
     n = WQ.shape[0]
     k = XQ.shape[1]
-    Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+
+    if WQ.shape[1] != k:
+        raise ValueError(
+            f"A/B K mismatch: XQ K={k}, WQ K={WQ.shape[1]}"
+        )
 
     config = get_CKGEMM_config(
         m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE
@@ -1128,12 +1127,22 @@ def gemm_a8w8_blockscale_bpreshuffle(
                 f"got {XQ.dtype}"
             )
         if mxscale_flydsl:
-            from .triton.quant import dynamic_mxfp8_quant
+            from .quant import per_1x32_mx_quant_hip
+            from .flydsl.mxscale_preshuffle_kernels import (
+                prepare_block32_a_scale_e8m0,
+            )
 
-            XQ, x_scale = dynamic_mxfp8_quant(
+            XQ, x_scale = per_1x32_mx_quant_hip(
                 XQ,
                 quant_dtype=dtypes.fp8,
-                pack_scale_a16w4=True,
+                scale_type=dtypes.fp8_e8m0,
+                shuffle=False,
+            )
+
+            x_scale = prepare_block32_a_scale_e8m0(
+                x_scale,
+                M=m,
+                K=k,
             )
         else:
             from .quant import per_group_quant_hip
@@ -1158,6 +1167,31 @@ def gemm_a8w8_blockscale_bpreshuffle(
             "packed MXFP8 activation input is only valid when the tuned "
             "config selects a flydsl_mxpsh_* kernel"
         )
+
+    return XQ, x_scale
+
+
+@torch_compile_guard(gen_fake=gemm_a8w8_blockscale_bpreshuffle_fake)
+def gemm_a8w8_blockscale_bpreshuffle(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Optional[Tensor],
+    w_scale: Tensor,
+    dtype: torch.dtype = dtypes.bf16,
+) -> Tensor:
+    assert dtype in [
+        dtypes.bf16,
+        dtypes.fp16,
+    ], f"Output {dtype=} is currently not supported in gemm_a8w8"
+    m = XQ.shape[0]
+    n = WQ.shape[0]
+    k = XQ.shape[1]
+    Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+
+    config = get_CKGEMM_config(
+        m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE
+    )
+    mxscale_flydsl = _is_mxscale_flydsl_config(config)
 
     if config is not None:
         libtype = str(config["libtype"]).lower()
