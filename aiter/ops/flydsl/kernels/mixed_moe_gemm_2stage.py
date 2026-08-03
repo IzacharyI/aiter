@@ -3676,10 +3676,25 @@ def compile_mixed_moe_gemm2(
                 # ---- X gmem->reg prefetch (match preshuffle GEMM mapping) ----
                 # Prefer 16B buffer-load (dwordx4). If the per-thread byte count isn't divisible by
                 # 16, fall back to 8B (dwordx2) or 4B (dword) loads. For fp16 we require 16B.
+                #
+                # bytes_per_thread_x is sized from x_tile_k_storage, which for
+                # fp4-A outside the tile_k=128 f8f6f4 path still counts K
+                # unpacked; the LDS buffer and its DMA are sized from the packed
+                # _eff_lds_stride. Taking the smaller of the two keeps this
+                # mapping in step with _dma_bytes / _num_dma_loads below --
+                # otherwise tiles that pack to <16B/thread (tile_m=16,
+                # tile_k=256) issue more DMA loads than there are chunk
+                # coordinates.
+                _lds_bytes_per_thread_x = (
+                    int(tile_m) * int(_eff_lds_stride) * int(a_elem_bytes)
+                ) // total_threads
+                _chunk_bytes_per_thread_x = min(
+                    bytes_per_thread_x, _lds_bytes_per_thread_x
+                )
                 if const_expr(is_f16_a):
-                    if const_expr(bytes_per_thread_x % 16 != 0):
+                    if const_expr(_chunk_bytes_per_thread_x % 16 != 0):
                         raise ValueError(
-                            f"[fp16] bytes_per_thread_x ({bytes_per_thread_x}) must be divisible by 16"
+                            f"[fp16] bytes_per_thread_x ({_chunk_bytes_per_thread_x}) must be divisible by 16"
                         )
                     x_load_bytes = 16
                 else:
@@ -3687,15 +3702,15 @@ def compile_mixed_moe_gemm2(
                     # for 4B (dword) and 16B (dwordx4) widths, not 8B. Skipping the
                     # 8B option keeps num_x_loads consistent with the DMA's
                     # _num_dma_loads for small (fp4 MFMA32x32x64) tiles.
-                    if const_expr(bytes_per_thread_x % 16 == 0):
+                    if const_expr(_chunk_bytes_per_thread_x % 16 == 0):
                         x_load_bytes = 16
-                    elif const_expr(bytes_per_thread_x % 4 == 0):
+                    elif const_expr(_chunk_bytes_per_thread_x % 4 == 0):
                         x_load_bytes = 4
                     else:
                         raise ValueError(
-                            f"bytes_per_thread_x ({bytes_per_thread_x}) must be divisible by 4 to use the dword-indexed load mapping."
+                            f"bytes_per_thread_x ({_chunk_bytes_per_thread_x}) must be divisible by 4 to use the dword-indexed load mapping."
                         )
-                num_x_loads = bytes_per_thread_x // x_load_bytes
+                num_x_loads = _chunk_bytes_per_thread_x // x_load_bytes
                 chunk_i32 = x_load_bytes // 4  # dwords per chunk (1/2/4)
                 vec4_i32 = T.vec(4, i32)
 
