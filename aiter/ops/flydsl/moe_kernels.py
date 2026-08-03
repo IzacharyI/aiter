@@ -603,8 +603,16 @@ def compile_flydsl_moe_stage2(
     inter_dim_pad: int = 0,
     xcd_swizzle: int = 0,
     enable_bias: bool = False,
+    partial_dtype: str | None = None,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
+    if partial_dtype not in (None, "fp8"):
+        raise ValueError(f"partial_dtype must be None or 'fp8', got {partial_dtype!r}")
+    if partial_dtype is not None and (a_dtype, b_dtype) != ("fp8", "fp4"):
+        raise ValueError(
+            "partial_dtype='fp8' currently supports only A8W4 (a_dtype='fp8', b_dtype='fp4'); "
+            f"got a_dtype={a_dtype!r}, b_dtype={b_dtype!r}"
+        )
     if a_dtype == "bf16" and b_dtype in ("fp4", "mxfp4"):
         from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm2_a16w4
 
@@ -644,6 +652,7 @@ def compile_flydsl_moe_stage2(
             a_dtype=a_dtype,
             b_dtype=b_dtype,
             out_dtype=out_dtype,
+            partial_dtype=partial_dtype,
             accumulate=accumulate,
             persist_m=persist_m,
             sort_block_m=sort_block_m,
@@ -901,6 +910,47 @@ def _run_compiled(exe, args):
         except Exception:  # noqa: BLE001,S110
             pass
         raise
+
+
+def _validate_stage2_partial_dtype(
+    *,
+    partial_dtype: str | None,
+    mode: str,
+    a_dtype: str,
+    b_dtype: str,
+    out_dtype: str,
+    model_dim: int,
+    model_dim_pad: int,
+    tile_n: int,
+    return_per_slot: bool,
+    expert_mask,
+    gfx: str,
+) -> bool:
+    if partial_dtype is None:
+        return False
+    if partial_dtype != "fp8":
+        raise ValueError(f"partial_dtype must be None or 'fp8', got {partial_dtype!r}")
+    if mode != "reduce":
+        raise ValueError("partial_dtype='fp8' requires stage2 reduce mode")
+    if (a_dtype, b_dtype) != ("fp8", "fp4"):
+        raise ValueError("partial_dtype='fp8' currently supports only A8W4")
+    if out_dtype not in ("bf16", "f16"):
+        raise ValueError("FP8 partial reduction output must be BF16 or FP16")
+    if model_dim % 256 != 0:
+        raise ValueError(f"model_dim must be divisible by 256, got {model_dim}")
+    if model_dim_pad != 0:
+        raise ValueError(
+            f"FP8 partial requires model_dim_pad == 0, got {model_dim_pad}"
+        )
+    if tile_n != 256:
+        raise ValueError(f"FP8 partial currently requires tile_n=256, got {tile_n}")
+    if return_per_slot:
+        raise ValueError("FP8 partial does not support return_per_slot=True")
+    if expert_mask is not None:
+        raise NotImplementedError("FP8 partial does not support expert_mask")
+    if gfx != "gfx950":
+        raise RuntimeError(f"FP8 partial requires gfx950, got {gfx}")
+    return True
 
 
 def _run_moe_reduction(
@@ -1679,6 +1729,7 @@ def flydsl_moe_stage2(
     a_dtype: str = "fp8",
     b_dtype: str = "fp4",
     out_dtype: str = "bf16",
+    partial_dtype: str | None = None,
     mode: str = "atomic",
     w2_scale: torch.Tensor | None = None,
     a2_scale: torch.Tensor | None = None,
@@ -1723,6 +1774,25 @@ def flydsl_moe_stage2(
     E = w2.shape[0]
     model_dim = w2.shape[1]
     inter_dim = inter_states.shape[2]
+    requested_mode = mode
+    use_fp8_partial = False
+    if partial_dtype is not None:
+        from aiter.jit.utils.chip_info import get_gfx
+
+        # Validate against caller intent before any auto mode rewrite.
+        use_fp8_partial = _validate_stage2_partial_dtype(
+            partial_dtype=partial_dtype,
+            mode=requested_mode,
+            a_dtype=a_dtype,
+            b_dtype=b_dtype,
+            out_dtype=out_dtype,
+            model_dim=model_dim,
+            model_dim_pad=model_dim_pad,
+            tile_n=tile_n,
+            return_per_slot=return_per_slot,
+            expert_mask=expert_mask,
+            gfx=get_gfx(),
+        )
 
     # Debug: force stage2 to use the masked reduce epilogue instead of atomic
     # accumulate. Enabled by default; set AITER_FLYDSL_FORCE_REDUCE=0 to opt out.
@@ -1759,6 +1829,11 @@ def flydsl_moe_stage2(
                 dtype=torch_out_dtype,
                 device=inter_states.device,
             )
+    elif use_fp8_partial and out.dtype != torch_out_dtype:
+        raise ValueError(
+            "partial_dtype='fp8' requires preallocated out dtype to match out_dtype "
+            f"({out_dtype}), got {out.dtype}"
+        )
     # NOTE: when ``accumulate=True`` (atomic mode), the caller is responsible
     # for ensuring ``out`` is zero-initialized. In the standard ``fused_moe``
     # dispatch path this is handled by ``moe_sorting_*_fwd`` which already
@@ -1807,6 +1882,12 @@ def flydsl_moe_stage2(
     if not accumulate:
         if return_per_slot:
             target = out.view(-1)
+        elif use_fp8_partial:
+            target = torch.empty(
+                (token_num * topk, model_dim + model_dim // 8),
+                device=out.device,
+                dtype=torch.uint8,
+            )
         else:
             target = torch.empty(
                 (token_num * topk * model_dim,),
@@ -1861,6 +1942,7 @@ def flydsl_moe_stage2(
         a_dtype=a_dtype,
         b_dtype=b_dtype,
         out_dtype=out_dtype,
+        partial_dtype=partial_dtype,
         accumulate=accumulate,
         persist_m=_persist_m,
         sort_block_m=sort_block_m,
@@ -1882,6 +1964,24 @@ def flydsl_moe_stage2(
                 "topk_ids is required when expert_mask is provided for reduce mode"
             )
     if not accumulate and not return_per_slot:
+        if use_fp8_partial:
+            from .kernels.moe_reduction_fp8 import compile_moe_reduction_fp8
+
+            reduce_exe = compile_moe_reduction_fp8(
+                topk=topk,
+                model_dim=model_dim,
+                out_dtype_str="bf16" if out.dtype == torch.bfloat16 else "f16",
+            )
+            _run_compiled(
+                reduce_exe,
+                (
+                    ptr_arg(target),
+                    ptr_arg(out),
+                    token_num,
+                    torch.cuda.current_stream(),
+                ),
+            )
+            return out
         _run_moe_reduction(
             target, out, token_num, topk, model_dim, expert_mask, topk_ids
         )
