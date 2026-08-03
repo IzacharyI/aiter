@@ -435,6 +435,7 @@ def compile_flydsl_moe_stage2(
     xcd_swizzle: int = 0,
     enable_bias: bool = False,
     mfma_variant: Optional[str] = None,
+    partial_fp8: bool = False,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
     if b_dtype == "fp4":
@@ -461,6 +462,7 @@ def compile_flydsl_moe_stage2(
             xcd_swizzle=xcd_swizzle,
             enable_bias=enable_bias,
             mfma_variant=mfma_variant,
+            partial_fp8=partial_fp8,
         )
     elif a_dtype == "bf16" and b_dtype == "int4":
         # a16wi4: bf16 activations, int4 weights with groupwise scale
@@ -1202,12 +1204,27 @@ def flydsl_moe_stage2(
     _n_in = model_dim
     _k_in = inter_dim
 
+    # Calibrated only for the DSV4 prefill shape. Other shapes retain bf16
+    # partials by default; the env toggle provides an explicit safe fallback.
+    _partial_fp8 = (
+        (not accumulate)
+        and out_dtype == "bf16"
+        and a_dtype == "fp8"
+        and b_dtype == "fp4"
+        and token_num == 16384
+        and model_dim == 7168
+        and inter_dim == 768
+        and E == 384
+        and topk == 6
+        and os.environ.get("AITER_FLYDSL_PARTIAL_FP8", "1") == "1"
+    )
+
     target = out
     if not accumulate:
         target = torch.empty(
             (token_num * topk * model_dim,),
             device=out.device,
-            dtype=out.dtype,
+            dtype=(torch.float8_e4m3fn if _partial_fp8 else out.dtype),
         )
 
     if is_fp4:
@@ -1266,6 +1283,7 @@ def flydsl_moe_stage2(
         xcd_swizzle=xcd_swizzle,
         enable_bias=(bias is not None),
         mfma_variant=mfma_variant,
+        partial_fp8=_partial_fp8,
     )
     _run_compiled(exe, args)
 
@@ -1286,16 +1304,28 @@ def flydsl_moe_stage2(
             _reduce_dtype_str = None
 
         if _reduce_dtype_str is not None:
-            from .kernels.moe_gemm_2stage import compile_moe_reduction
+            if _partial_fp8:
+                from .kernels.mixed_moe_gemm_2stage import compile_moe_reduction_fp8
 
-            reduce_exe = compile_moe_reduction(
-                topk=topk,
-                model_dim=model_dim,
-                dtype_str=_reduce_dtype_str,
-                use_mask=use_mask,
-                # expert_mask is sized by global expert count (≠ w2.shape[0] under EP).
-                num_experts=int(expert_mask.numel()) if use_mask else 0,
-            )
+                reduce_exe = compile_moe_reduction_fp8(
+                    topk=topk,
+                    model_dim=model_dim,
+                    dtype_str=_reduce_dtype_str,
+                    in_dtype_str="fp8",
+                    use_mask=use_mask,
+                    num_experts=int(expert_mask.numel()) if use_mask else 0,
+                )
+            else:
+                from .kernels.moe_gemm_2stage import compile_moe_reduction
+
+                reduce_exe = compile_moe_reduction(
+                    topk=topk,
+                    model_dim=model_dim,
+                    dtype_str=_reduce_dtype_str,
+                    use_mask=use_mask,
+                    # expert_mask is sized by global expert count (≠ w2.shape[0] under EP).
+                    num_experts=int(expert_mask.numel()) if use_mask else 0,
+                )
             X = target.view(token_num, topk, model_dim)
             if use_mask:
                 em = expert_mask.to(torch.int32).contiguous()

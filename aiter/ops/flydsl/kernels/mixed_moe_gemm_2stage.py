@@ -68,6 +68,18 @@ def _if_then(if_op):
                 scf.YieldOp([])
 
 
+@contextmanager
+def _if_else(if_op):
+    """Compat helper for SCF IfOp else-region across old/new Python APIs."""
+    with ir.InsertionPoint(if_op.else_block):
+        try:
+            yield if_op.else_block
+        finally:
+            blk = if_op.else_block
+            if (not blk.operations) or not isinstance(blk.operations[-1], scf.YieldOp):
+                scf.YieldOp([])
+
+
 
 def _get_cu_num() -> int:
     env = os.environ.get("CU_NUM")
@@ -2799,6 +2811,7 @@ def compile_mixed_moe_gemm2(
     fused_p2p_scatter: tuple | None = None,
     use_token_flag_sync: bool = False,
     mfma_variant: str | None = None,
+    partial_fp8: bool = False,
 ):
     """Compile stage2 kernel (`moe_gemm2`) and return the compiled executable.
 
@@ -3029,6 +3042,11 @@ def compile_mixed_moe_gemm2(
     def out_elem():
         return T.f32 if out_is_f32 else (T.bf16 if out_is_bf16 else T.f16)
 
+    # Opt-in compressed intermediate: computation/CShuffle remain bf16; only
+    # the non-accumulating global partial is OCP e4m3 on gfx950.
+    _partial_fp8 = bool(partial_fp8) and (not bool(accumulate))
+    _PF8_STORE_SCALE = 0.0007
+
     def _load_bias_scalar(bias_rsrc, offset):
         return buffer_ops.buffer_load(bias_rsrc, offset, vec_width=1, dtype=T.f32)
 
@@ -3118,7 +3136,7 @@ def compile_mixed_moe_gemm2(
         _tfs_topk = 0
         _tfs_num_n_tiles = 0
 
-    epilog_tag = "cshuffle"
+    epilog_tag = "cshuffle" + ("_pf8" if _partial_fp8 else "")
     # IMPORTANT: include tiling in the module name to avoid accidentally reusing a compiled
     # binary for a different (tile_m, tile_n, tile_k) configuration.
     # See stage1 note: include ABI tag to prevent binary reuse across signature changes.
@@ -3441,7 +3459,7 @@ def compile_mixed_moe_gemm2(
             w_rsrc = _ptr_buffer_resource(arg_w, w_nbytes)
 
             # OUT: [tokens, model_dim] -> clamp to descriptor max (i32 bytes) to avoid overflow on huge tokens.
-            out_elem_bytes = 4 if out_is_f32 else 2
+            out_elem_bytes = 1 if _partial_fp8 else (4 if out_is_f32 else 2)
             out_nbytes_idx = (
                 tokens_in * n_in * arith.constant(out_elem_bytes, index=True)
             )
@@ -5048,14 +5066,44 @@ def compile_mixed_moe_gemm2(
                             out_elem_bytes, index=True
                         )
                         ptr_addr_idx = row_byte_base + byte_off_col
-                        out_ptr_v = _idx_to_llvm_ptr(ptr_addr_idx)
-                        frag_v = frag._value if hasattr(frag, "_value") else frag
-                        llvm.StoreOp(
-                            frag_v,
-                            out_ptr_v,
-                            alignment=_e_vec * out_elem_bytes,
-                            nontemporal=True,
-                        )
+                        if const_expr(_partial_fp8):
+                            f32_ty = ir.F32Type.get()
+                            scale = arith.constant(_PF8_STORE_SCALE, type=f32_ty)
+                            scale = scale._value if hasattr(scale, "_value") else scale
+                            hi = arith.constant(440.0, type=f32_ty)
+                            hi = hi._value if hasattr(hi, "_value") else hi
+                            lo = arith.constant(-440.0, type=f32_ty)
+                            lo = lo._value if hasattr(lo, "_value") else lo
+                            vals = []
+                            for li in range_constexpr(_e_vec):
+                                bf = vector.extract(frag, static_position=[li], dynamic_position=[])
+                                bf = bf._value if hasattr(bf, "_value") else bf
+                                v = arith.extf(f32_ty, bf)
+                                v = v._value if hasattr(v, "_value") else v
+                                v = arith.mulf(v, scale)
+                                v = arith.minnumf(v, hi)
+                                v = arith.maxnumf(v, lo)
+                                vals.append(v._value if hasattr(v, "_value") else v)
+                            zero = arith.constant(0, type=T.i32)
+                            zero = zero._value if hasattr(zero, "_value") else zero
+                            for wi in range_constexpr(_e_vec // 4):
+                                b = wi * 4
+                                pk = rocdl.cvt_pk_fp8_f32(T.i32, vals[b], vals[b + 1], zero, 0)
+                                pk = rocdl.cvt_pk_fp8_f32(T.i32, vals[b + 2], vals[b + 3], pk, 1)
+                                pk = pk._value if hasattr(pk, "_value") else pk
+                                wptr = _idx_to_llvm_ptr(
+                                    ptr_addr_idx + arith.constant(wi * 4, index=True)
+                                )
+                                llvm.StoreOp(pk, wptr, alignment=4, nontemporal=True)
+                        else:
+                            out_ptr_v = _idx_to_llvm_ptr(ptr_addr_idx)
+                            frag_v = frag._value if hasattr(frag, "_value") else frag
+                            llvm.StoreOp(
+                                frag_v,
+                                out_ptr_v,
+                                alignment=_e_vec * out_elem_bytes,
+                                nontemporal=True,
+                            )
                     else:
                         # ---- accumulate=True: 64-bit global atomic path ----
                         col_idx = col_g0
@@ -5490,6 +5538,7 @@ def compile_mixed_moe_gemm2(
         _cu_num if _persistent else 0,
         xcd_swizzle,
         _fp2p_fp8_cast,
+        _partial_fp8,
     )
 
     def _emit_launch_body(
@@ -5601,3 +5650,435 @@ def compile_mixed_moe_gemm2(
 
     return launch_mixed_moe_gemm2
 
+# Matching raw-word OCP fp8 partial reduction (colocated with its producer).
+@functools.lru_cache(maxsize=1024)
+def compile_moe_reduction_fp8(
+    *,
+    topk: int,
+    model_dim: int,
+    dtype_str: str = "f16",
+    in_dtype_str: str = None,
+    use_mask: bool = False,
+    num_experts: int = 0,
+    block_size: int = 1024,
+    vec_width: int = 16,
+):
+    """Compile a reduction kernel that sums over the topk dimension.
+
+    Input:  X [tokens, topk, model_dim]
+            expert_mask [num_experts] i32 (optional, if use_mask=True)
+            topk_ids   [tokens, topk] i32 (optional, if use_mask=True)
+    Output: Y [tokens, model_dim]
+
+    This kernel performs: Y[t, d] = sum_k(X[t, k, d]) for all t, d.
+    When use_mask=True, the kernel fuses the EP validity gather:
+        valid[t, k] = expert_mask[topk_ids[t, k]] != 0
+    and only accumulates X[t, k, :] when valid[t, k] is true.
+    Used in conjunction with compile_moe_gemm2(accumulate=False) to avoid atomic contention.
+    """
+    get_hip_arch()
+    ir.ShapedType.get_dynamic_size()
+
+    # Kernel Config (parameterized for BLOCK_SIZE / VEC_WIDTH tuning)
+    BLOCK_SIZE = block_size
+    VEC_WIDTH = vec_width
+
+    if dtype_str == "f32":
+        elem_type_tag = "f32"
+    elif dtype_str == "f16":
+        elem_type_tag = "f16"
+    elif dtype_str == "bf16":
+        elem_type_tag = "bf16"
+    else:
+        raise ValueError(f"Unsupported dtype: {dtype_str}")
+
+    # Input (partial) dtype may differ from output (final) dtype.  Direction-4
+    # traffic-halving stores the topk partials as fp8_e4m3 (1 byte) while the
+    # reduced output stays bf16 for the LM head.  Default: same as output.
+    _in_tag = in_dtype_str if in_dtype_str is not None else elem_type_tag
+    in_is_fp8 = _in_tag in ("fp8", "f8", "fp8_e4m3", "e4m3")
+    # Reciprocal of the descale mfma_moe2 applied before the fp8 partial store.
+    # Must match AITER_FLYDSL_PF8_SCALE used there. Applied once on the reduced
+    # accumulator (linear, so post-sum rescale == per-partial rescale).
+    import os as _os
+    _pf8_store_scale = float(_os.environ.get("AITER_FLYDSL_PF8_SCALE", "0.0007"))
+    _pf8_rescale = (1.0 / _pf8_store_scale) if in_is_fp8 else 1.0
+
+    def compute_type():
+        return T.f32
+
+    def i32_type():
+        return T.i32
+
+    def i8_type():
+        return T.i8
+
+    def elem_type():
+        ty = (
+            T.f32
+            if elem_type_tag == "f32"
+            else (T.f16 if elem_type_tag == "f16" else T.bf16)
+        )
+        return ty() if callable(ty) else ty
+
+    def in_elem_type():
+        if in_is_fp8:
+            ty = T.f8
+            return ty() if callable(ty) else ty
+        return elem_type()
+
+    def in_load_type():
+        # fp8 is not a valid buffer_load result type on this backend; load the
+        # raw bytes as i8 and bitcast to f8 before the extf to f32.
+        if in_is_fp8:
+            ty = T.i8
+            return ty() if callable(ty) else ty
+        return in_elem_type()
+
+    module_name = (
+        f"moe_reduction_kernel_{'masked' if use_mask else 'plain'}"
+        f"_{dtype_str}_in{_in_tag}_topk{topk}_md{model_dim}_bs{BLOCK_SIZE}_vw{VEC_WIDTH}"
+    )
+
+    elem_bytes_c = (32 if dtype_str == "f32" else 16) // 8
+    in_elem_bytes_c = 1 if in_is_fp8 else elem_bytes_c
+
+    if True:
+
+        @flyc.kernel(name=module_name, known_block_size=[BLOCK_SIZE, 1, 1])
+        def moe_reduction_kernel(
+            X: fx.Pointer,
+            Y: fx.Pointer,
+            expert_mask: fx.Pointer,
+            topk_ids: fx.Pointer,
+            i32_m_tokens: fx.Int32,
+        ):
+            m_tokens = fx.Index(i32_m_tokens)
+            c_topk = fx.Index(topk)
+            c_model_dim = fx.Index(model_dim)
+            elem_bits = 32 if dtype_str == "f32" else 16
+            copy_vec_width = 128 // elem_bits  # 8 for f16/bf16, 4 for f32
+            n_sub = VEC_WIDTH // copy_vec_width  # 1 for f16/bf16, 2 for f32
+
+            def _ptr_buffer_resource_off(ptr, num_records_bytes, byte_off_i64=None):
+                # Build a buffer resource from a raw pointer, optionally folding
+                # a per-WG i64 byte offset into the descriptor's 48-bit base.
+                addr = fx.ptrtoint(ptr)
+                addr_i64 = arith.index_cast(T.i64, addr)
+                if byte_off_i64 is not None:
+                    addr_i64 = addr_i64 + byte_off_i64
+                return buffer_ops.create_buffer_resource_from_addr(
+                    addr_i64, num_records_bytes=num_records_bytes
+                )
+
+            token_idx = gpu.block_id("x")
+            tile_idx = gpu.block_id("y")
+            tid = gpu.thread_id("x")
+
+            # ── 64-bit base-offset folding ─────────────────────────────────
+            # X is [m_tokens, topk, model_dim]; total bytes can exceed 4 GiB
+            # for large batches (e.g. 131072 * 6 * 4096 * 2 = 6 GiB), which
+            # overflows the i32 voffset used by buffer_load. To stay i32-safe,
+            # fold the per-WG token byte offset into the descriptor's 48-bit
+            # base address (computed in i64). The in-kernel voffsets then only
+            # need to address one token's slab.
+            slab_elems_x = c_topk * c_model_dim
+            x_slab_nbytes = slab_elems_x * fx.Index(in_elem_bytes_c)
+            y_slab_nbytes = c_model_dim * fx.Index(elem_bytes_c)
+            x_base_off_i64 = fx.Int64(token_idx * x_slab_nbytes)
+            y_base_off_i64 = fx.Int64(token_idx * c_model_dim * fx.Index(elem_bytes_c))
+
+            x_rsrc = _ptr_buffer_resource_off(
+                X, fx.Int64(x_slab_nbytes), x_base_off_i64
+            )
+            y_rsrc = _ptr_buffer_resource_off(
+                Y, fx.Int64(y_slab_nbytes), y_base_off_i64
+            )
+
+            if const_expr(use_mask):
+                tk_slab_nbytes = c_topk * fx.Index(4)
+                tk_base_off_i64 = fx.Int64(token_idx * tk_slab_nbytes)
+                topk_ids_rsrc = _ptr_buffer_resource_off(
+                    topk_ids, fx.Int64(tk_slab_nbytes), tk_base_off_i64
+                )
+                # expert_mask: [num_experts] i32. Caller supplies num_experts
+                # at compile time so we can size the descriptor exactly.
+                em_nbytes = fx.Index(num_experts * 4)
+                expert_mask_rsrc = _ptr_buffer_resource_off(
+                    expert_mask, fx.Int64(em_nbytes), None
+                )
+
+            # Guard: token in range (Index is unsigned → auto ult)
+            tok_ok = token_idx < m_tokens
+            _if_tok = scf.IfOp(tok_ok)
+            with _if_then(_if_tok):
+                tile_cols = BLOCK_SIZE * VEC_WIDTH
+                c_tile_cols = fx.Index(tile_cols)
+                c_vecw = fx.Index(VEC_WIDTH)
+
+                col_base = tile_idx * c_tile_cols + tid * c_vecw
+
+                # Guard: any work in bounds (Index < → ult)
+                col_ok = col_base < c_model_dim
+                _if_col = scf.IfOp(col_ok)
+                with _if_then(_if_col):
+                    # Fast path: full vector in-bounds (Index <= → ule)
+                    end_ok = col_base + c_vecw <= c_model_dim
+                    _if_full = scf.IfOp(end_ok, has_else=True)
+                    with _if_then(_if_full):
+                        # ── Vector path via direct buffer_load ──
+                        # Use buffer_load with vec_width=copy_vec_width
+                        # (8 elems for bf16/f16 = 128b; 4 elems for f32 = 128b).
+                        # n_sub iterations cover the full VEC_WIDTH stride.
+                        vec_type_c = T.vec(copy_vec_width, compute_type())
+                        vec_type_e = T.vec(copy_vec_width, in_elem_type())
+                        # fp8 partials are loaded as raw i8 bytes (f8 is not a
+                        # valid buffer_load result type on this backend), then
+                        # bitcast to f8 before the extf to f32.
+                        vec_type_load = T.vec(copy_vec_width, in_load_type())
+                        _in_is_narrow = in_is_fp8 or (elem_bits < 32)
+
+                        acc_vecs = [
+                            vector.broadcast(vec_type_c, fx.Float32(0.0).ir_value())
+                            for _ in range(n_sub)
+                        ]
+
+                        for k in range_constexpr(topk):
+                            # X slab base for this (token, k) — within one token's
+                            # slab, k indexes the topk dim with stride model_dim.
+                            # elem offset = k*model_dim + col_base + si*copy_vec_width
+                            k_off_elems = fx.Index(k) * c_model_dim + col_base
+
+                            if const_expr(use_mask):
+                                # Fused EP gather: valid = expert_mask[topk_ids[token, k]] != 0
+                                # topk_ids_rsrc is already shifted by token_idx*topk
+                                tk_idx_i32 = fx.Int32(fx.Index(k))
+                                eid_i32 = buffer_ops.buffer_load(
+                                    topk_ids_rsrc,
+                                    tk_idx_i32,
+                                    vec_width=1,
+                                    dtype=i32_type(),
+                                )
+                                valid_i32 = buffer_ops.buffer_load(
+                                    expert_mask_rsrc,
+                                    eid_i32,
+                                    vec_width=1,
+                                    dtype=i32_type(),
+                                )
+                                mv_ok = valid_i32 != fx.Int32(0)
+
+                            for si in range_constexpr(n_sub):
+                                off_elems_i32 = fx.Int32(
+                                    k_off_elems + fx.Index(si * copy_vec_width)
+                                )
+                                if const_expr(in_is_fp8):
+                                    # fp8 partials are stored as raw i32 words (4
+                                    # fp8/word) by mfma_moe2's cvt_pk_fp8_f32 store.
+                                    # Load them back as i32 words (offset in fp8
+                                    # units is div-by-4 since model_dim & col_base
+                                    # are), unpack each byte via cvt_f32_fp8.
+                                    _nw = copy_vec_width // 4
+                                    off_words_i32 = fx.Int32(
+                                        (k_off_elems + fx.Index(si * copy_vec_width))
+                                        / fx.Index(4)
+                                    )
+                                    vec_i32 = buffer_ops.buffer_load(
+                                        x_rsrc,
+                                        off_words_i32,
+                                        vec_width=_nw,
+                                        dtype=i32_type(),
+                                    )
+                                    _lanes = []
+                                    for _w in range_constexpr(_nw):
+                                        _word = vector.extract(
+                                            vec_i32,
+                                            static_position=[_w],
+                                            dynamic_position=[],
+                                        )
+                                        _word_v = (
+                                            _word._value
+                                            if hasattr(_word, "_value")
+                                            else _word
+                                        )
+                                        for _bsel in range_constexpr(4):
+                                            _sc = rocdl.cvt_f32_fp8(
+                                                T.f32, _word_v, _bsel
+                                            )
+                                            _lanes.append(_sc)
+                                    vec_c = vector.from_elements(vec_type_c, _lanes)
+                                    if const_expr(use_mask):
+                                        zero_c = vector.broadcast(
+                                            vec_type_c, fx.Float32(0.0).ir_value()
+                                        )
+                                        vec_c = mv_ok.select(vec_c, zero_c)
+                                    acc_vecs[si] = acc_vecs[si] + vec_c
+                                    continue
+
+                                vec_e = buffer_ops.buffer_load(
+                                    x_rsrc,
+                                    off_elems_i32,
+                                    vec_width=copy_vec_width,
+                                    dtype=in_load_type(),
+                                )
+
+                                if const_expr(_in_is_narrow):
+                                    vec_c = vec_e.extf(vec_type_c)
+                                else:
+                                    vec_c = vec_e
+
+                                if const_expr(use_mask):
+                                    zero_c = vector.broadcast(
+                                        vec_type_c, fx.Float32(0.0).ir_value()
+                                    )
+                                    vec_c = mv_ok.select(vec_c, zero_c)
+
+                                acc_vecs[si] = acc_vecs[si] + vec_c
+
+                        # ── Store results ── (output stays bf16/f16/f32)
+                        vec_type_out = T.vec(copy_vec_width, elem_type())
+                        for si in range_constexpr(n_sub):
+                            out_vec = acc_vecs[si]
+                            if const_expr(in_is_fp8):
+                                _rs = vector.broadcast(
+                                    vec_type_c,
+                                    fx.Float32(_pf8_rescale).ir_value(),
+                                )
+                                out_vec = out_vec * _rs
+                            if const_expr(elem_bits < 32):
+                                out_vec = out_vec.truncf(vec_type_out)
+                            y_off_elems_i32 = fx.Int32(
+                                col_base + fx.Index(si * copy_vec_width)
+                            )
+                            buffer_ops.buffer_store(out_vec, y_rsrc, y_off_elems_i32)
+
+                    with _if_else(_if_full):
+                        # Tail path: scalar load/store per lane. All offsets
+                        # are now slab-local (token_idx folded into base ptr).
+                        for lane in range_constexpr(VEC_WIDTH):
+                            col = col_base + fx.Index(lane)
+                            lane_ok = col < c_model_dim
+                            _if_lane = scf.IfOp(lane_ok)
+                            with _if_then(_if_lane):
+                                a = arith.constant(0.0, type=compute_type())
+                                for k in range_constexpr(topk):
+                                    k_idx = fx.Index(k)
+                                    x_idx_i32 = fx.Int32(k_idx * c_model_dim + col)
+                                    if const_expr(use_mask):
+                                        tk_idx_i32 = fx.Int32(k_idx)
+                                        eid_i32 = buffer_ops.buffer_load(
+                                            topk_ids_rsrc,
+                                            tk_idx_i32,
+                                            vec_width=1,
+                                            dtype=i32_type(),
+                                        )
+                                        valid_i32 = buffer_ops.buffer_load(
+                                            expert_mask_rsrc,
+                                            eid_i32,
+                                            vec_width=1,
+                                            dtype=i32_type(),
+                                        )
+                                        if const_expr(in_is_fp8):
+                                            # scalar fp8: load byte -> i32 -> cvt_f32_fp8
+                                            _i8 = buffer_ops.buffer_load(
+                                                x_rsrc,
+                                                x_idx_i32,
+                                                vec_width=1,
+                                                dtype=in_load_type(),
+                                            )
+                                            _i8v = (
+                                                _i8._value
+                                                if hasattr(_i8, "_value")
+                                                else _i8
+                                            )
+                                            _i32w = arith.extui(T.i32, _i8v)
+                                            _i32w = (
+                                                _i32w._value
+                                                if hasattr(_i32w, "_value")
+                                                else _i32w
+                                            )
+                                            _vf = rocdl.cvt_f32_fp8(
+                                                T.f32, _i32w, 0
+                                            )
+                                            v = (valid_i32 != fx.Int32(0)).select(
+                                                _vf,
+                                                arith.constant(
+                                                    0.0, type=compute_type()
+                                                ),
+                                            )
+                                        else:
+                                            v = (valid_i32 != fx.Int32(0)).select(
+                                                buffer_ops.buffer_load(
+                                                    x_rsrc,
+                                                    x_idx_i32,
+                                                    vec_width=1,
+                                                    dtype=in_elem_type(),
+                                                ),
+                                                arith.constant(
+                                                    0.0, type=in_elem_type()
+                                                ),
+                                            )
+                                    else:
+                                        if const_expr(in_is_fp8):
+                                            _i8 = buffer_ops.buffer_load(
+                                                x_rsrc,
+                                                x_idx_i32,
+                                                vec_width=1,
+                                                dtype=in_load_type(),
+                                            )
+                                            _i8v = (
+                                                _i8._value
+                                                if hasattr(_i8, "_value")
+                                                else _i8
+                                            )
+                                            _i32w = arith.extui(T.i32, _i8v)
+                                            _i32w = (
+                                                _i32w._value
+                                                if hasattr(_i32w, "_value")
+                                                else _i32w
+                                            )
+                                            v = rocdl.cvt_f32_fp8(T.f32, _i32w, 0)
+                                        else:
+                                            v = buffer_ops.buffer_load(
+                                                x_rsrc,
+                                                x_idx_i32,
+                                                vec_width=1,
+                                                dtype=in_elem_type(),
+                                            )
+                                    if const_expr(
+                                        (not in_is_fp8)
+                                        and dtype_str in ("f16", "bf16")
+                                    ):
+                                        v = v.extf(compute_type())
+                                    a = a + v
+
+                                out = a
+                                if const_expr(in_is_fp8):
+                                    out = out * arith.constant(
+                                        _pf8_rescale, type=compute_type()
+                                    )
+                                if const_expr(dtype_str in ("f16", "bf16")):
+                                    out = out.truncf(elem_type())
+                                y_idx_i32 = fx.Int32(col)
+                                buffer_ops.buffer_store(out, y_rsrc, y_idx_i32)
+
+    # ── Host launcher (flyc.jit + .launch) ────────────────────────────────
+    tile_size = BLOCK_SIZE * VEC_WIDTH
+    gy_static = (model_dim + tile_size - 1) // tile_size
+
+    @flyc.jit
+    def launch_moe_reduction(
+        X: fx.Pointer,
+        Y: fx.Pointer,
+        expert_mask: fx.Pointer,
+        topk_ids: fx.Pointer,
+        i32_m_tokens: fx.Int32,
+        stream: fx.Stream,
+    ):
+        gx = fx.Index(i32_m_tokens)
+        moe_reduction_kernel(X, Y, expert_mask, topk_ids, i32_m_tokens).launch(
+            grid=(gx, gy_static, 1),
+            block=(BLOCK_SIZE, 1, 1),
+            stream=stream,
+        )
+
+    return launch_moe_reduction
