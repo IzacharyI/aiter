@@ -127,6 +127,7 @@ def compile_mixed_moe_gemm1(
     model_dim_pad: int = 0,
     inter_dim_pad: int = 0,
     persist_m: int = 1,
+    a_merge: int = 1,
     use_async_copy: bool = False,
     waves_per_eu: int = 4,
     k_batch: int = 1,
@@ -135,6 +136,7 @@ def compile_mixed_moe_gemm1(
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
     swiglu_limit: float = 0.0,
+    blk_map: bool = False,
 ):
     """Compile stage1 kernel (gate+up with silu/swiglu).
 
@@ -167,7 +169,15 @@ def compile_mixed_moe_gemm1(
     is_f4_a = a_dtype == "fp4"
     is_f4_b = b_dtype == "fp4"
 
-    sort_block_m = max(32, tile_m)
+    # Approach A: decouple the compute tile from the sort padding.  When
+    # a_merge>1 each CTA processes a compute tile spanning `a_merge` consecutive
+    # sort blocks (e.g. two 64-row blocks -> a 128-row compute tile) so each
+    # expert's fp4 weights are reused across more token rows, WITHOUT forcing the
+    # sort block (and thus stage-2 padding) up to the compute-tile size.
+    _base_tile_m = int(tile_m)
+    if int(a_merge) > 1:
+        tile_m = _base_tile_m * int(a_merge)  # rebind: all compute machinery uses the merged tile
+    sort_block_m = max(32, _base_tile_m)  # sort padding stays at the base tile
     num_waves = min(4, tile_n // 32)
     total_threads = num_waves * 64
     pack_M = 1 if tile_m < 32 else 2
@@ -282,9 +292,11 @@ def compile_mixed_moe_gemm1(
     _gui_tag = "_gui" if gate_up_interleave else ""
     _as1_tag = "_as1" if a_scale_one else ""
     _xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
+    _am_tag = f"_am{int(a_merge)}" if int(a_merge) > 1 else ""
+    _bmap_tag = "_bmap" if blk_map else ""
     module_name = (
         f"mfma_moe1_silu_mul_a{a_dtype}_w{b_dtype}_{out_s}"
-        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{_fp4q_tag}{_fp8q_tag}{_sort_tag}{_async_tag}{_sk_tag}{_go_tag}{_gui_tag}{_as1_tag}{_xcd_tag}_v32"
+        f"_t{_base_tile_m}x{tile_n}x{tile_k}_pm{persist_m}{_fp4q_tag}{_fp8q_tag}{_sort_tag}{_async_tag}{_sk_tag}{_go_tag}{_gui_tag}{_as1_tag}{_xcd_tag}{_am_tag}{_bmap_tag}_v32"
     ).replace("-", "_")
 
     # -- LDS sizing --
@@ -466,6 +478,7 @@ def compile_mixed_moe_gemm1(
             arg_num_valid_ids: fx.Pointer,
             arg_bias: fx.Pointer,
             arg_out_scale_sorted: fx.Pointer,
+            arg_blk_map: fx.Pointer,
             i32_tokens_in: fx.Int32,
             i32_n_in: fx.Int32,
             i32_k_in: fx.Int32,
@@ -676,6 +689,12 @@ def compile_mixed_moe_gemm1(
             eid_nbytes_idx = size_expert_ids_in * arith.constant(4, index=True)
             eid_nbytes_i32 = arith.index_cast(T.i32, eid_nbytes_idx)
             expert_rsrc = _ptr_buffer_resource(arg_expert_ids, eid_nbytes_i32)
+            # blk_map: per-work-unit leader block index (indirect grid).  Same
+            # length as expert_ids (size_expert_ids); padded with a sentinel
+            # (>= size_expert_ids) so surplus CTAs early-exit via blk_valid.
+            blkmap_rsrc = None
+            if const_expr(blk_map):
+                blkmap_rsrc = _ptr_buffer_resource(arg_blk_map, eid_nbytes_i32)
             bias_rsrc = (
                 _ptr_buffer_resource(arg_bias, bias_nbytes) if enable_bias else None
             )
@@ -711,7 +730,16 @@ def compile_mixed_moe_gemm1(
             _for_ip = ir.InsertionPoint(_for_persist.body)
             _for_ip.__enter__()
             _mi_p = _for_persist.induction_variable
-            bx = bx_persist * _c_pm + _mi_p
+            _cta_lin = bx_persist * _c_pm + _mi_p
+            if const_expr(blk_map):
+                # Indirect grid: this CTA's linear id selects a precomputed
+                # leader block index from blk_map (skips the parity scan).
+                _bx_i32 = buffer_ops.buffer_load(
+                    blkmap_rsrc, _cta_lin, vec_width=1, dtype=T.i32
+                )
+                bx = arith.index_cast(ir.IndexType.get(), _bx_i32)
+            else:
+                bx = _cta_lin
             bx_m = bx * arith.constant(sort_block_m, index=True)
 
             # Block validity
@@ -724,10 +752,82 @@ def compile_mixed_moe_gemm1(
             exp_valid = arith.cmpi(
                 CmpIPredicate.ult, expert_i32, arith.constant(experts, type=T.i32)
             )
+            _c_2inter = arith.constant(2 * inter_dim, index=True)
+            _e0_off = expert_idx * _c_2inter
 
-            def _moe_gemm1_body():
-                # Gate expert offset: first inter_dim rows of each expert's 2*inter_dim block
-                expert_off_idx = expert_idx * arith.constant(2 * inter_dim, index=True)
+            # ---- Approach A: within-expert 2-block merge (a_merge==2) ----
+            # Each sort block still maps to one CTA (grid unchanged, so sort padding
+            # stays at sort_block_m and stage-2 is not regressed).  A block is a
+            # "pair leader" iff its offset within its expert's run of blocks is even;
+            # a leader whose next block is the SAME expert processes BOTH blocks as a
+            # single (2*sort_block_m)-row compute tile, streaming that expert's fp4
+            # weight ONCE and reusing it across both blocks (the traffic win).  Odd-
+            # offset blocks are "followers" already covered by their leader -> skip.
+            # A leader with no same-expert partner (odd last block) processes just its
+            # own rows (upper sub-block masked off).  is_active gates the whole body;
+            # store_upper (runtime i1) gates the upper sub-block rows in the epilogue.
+            is_active = blk_valid
+            store_upper_rt = None
+            if const_expr(int(a_merge) > 1):
+                _c1_blk = arith.constant(1, index=True)
+                if const_expr(not blk_map):
+                    # Parity scan: is bx at an EVEN offset within its expert's run
+                    # of blocks?  Counting the contiguous same-expert predecessors
+                    # gives the offset; is_leader = (offset even).  Decode expert
+                    # runs span only a few 64-blocks (imbalance-bounded), so a small
+                    # fixed window suffices.  Phase 1 issues all predecessor loads
+                    # INDEPENDENTLY (parallel, one memory-latency hit); phase 2 is a
+                    # register-only serial reduction.
+                    _AM_SCAN_MAX = 16
+                    _true_i1 = arith.cmpi(CmpIPredicate.eq, expert_i32, expert_i32)
+                    _eqs = []
+                    for _jj in range_constexpr(1, _AM_SCAN_MAX + 1):
+                        _cj = arith.constant(_jj, index=True)
+                        _idx_prev = bx - _cj
+                        _bx_ge_j = arith.cmpi(CmpIPredicate.uge, bx, _cj)
+                        _prev_e = buffer_ops.buffer_load(
+                            expert_rsrc, _idx_prev, vec_width=1, dtype=T.i32
+                        )
+                        _prev_eq = arith.cmpi(CmpIPredicate.eq, _prev_e, expert_i32)
+                        _eqs.append(arith.andi(_bx_ge_j, _prev_eq))
+                    _still = _true_i1
+                    _lead = _true_i1
+                    for _jj in range_constexpr(_AM_SCAN_MAX):
+                        _match = arith.andi(_eqs[_jj], _still)
+                        _lead = arith.select(
+                            _match, arith.xori(_lead, _true_i1), _lead
+                        )
+                        _still = _match
+                    is_leader = _lead
+
+                # Same-expert partner in the next block?  With blk_map this cleanly
+                # distinguishes a pair leader (next block == same expert) from a solo
+                # leader; the parity scan above is unnecessary because blk_map already
+                # lists only leaders.
+                bx_next = bx + _c1_blk
+                bx_m_next = bx_next * arith.constant(sort_block_m, index=True)
+                bx_m_next_i32 = arith.index_cast(T.i32, bx_m_next)
+                _next_rows_valid = arith.cmpi(
+                    CmpIPredicate.ult, bx_m_next_i32, num_valid_i32
+                )
+                _expert_next_i32 = buffer_ops.buffer_load(
+                    expert_rsrc, bx_next, vec_width=1, dtype=T.i32
+                )
+                _next_same = arith.cmpi(
+                    CmpIPredicate.eq, _expert_next_i32, expert_i32
+                )
+                has_partner = arith.andi(_next_rows_valid, _next_same)
+                if const_expr(blk_map):
+                    is_active = blk_valid
+                else:
+                    is_active = arith.andi(blk_valid, is_leader)
+                store_upper_rt = has_partner
+
+            def _moe_gemm1_body(expert_off_idx, store_upper=None):
+                # `expert_off_idx` selects the expert whose fp4 weight this tile reads.
+                # `store_upper`: None => store all rows (a_merge==1); else a runtime i1
+                # gating whether the UPPER sub-block rows are written (Approach A: only
+                # when this leader has a same-expert partner block).
 
                 # X loading -- KEY DIFFERENCE from stage2: X row = token_id only
                 x_load_bytes = 16
@@ -2189,6 +2289,19 @@ def compile_mixed_moe_gemm1(
                     t_ok = arith.cmpi(CmpIPredicate.ult, t, tokens_i32_v)
                     s_ok = arith.cmpi(CmpIPredicate.ult, s, topk_i32_v)
                     row_valid = arith.andi(row_valid0, arith.andi(t_ok, s_ok))
+                    # Approach A: gate the UPPER sub-block rows by a runtime flag.
+                    # Rows [bx_m, bx_m+sort_block_m) are the lower block (always
+                    # stored); rows [bx_m+sort_block_m, ...) are the upper block,
+                    # stored only when this leader has a same-expert partner.
+                    if store_upper is not None:
+                        _hi_start_i32 = bx_m_i32 + arith.constant(
+                            sort_block_m, type=T.i32
+                        )
+                        _is_lo = arith.cmpi(
+                            CmpIPredicate.ult, row_i32, _hi_start_i32
+                        )
+                        _keep = arith.ori(store_upper, _is_lo)
+                        row_valid = arith.andi(row_valid, _keep)
                     t_idx = arith.index_cast(ir.IndexType.get(), t)
                     s_idx = arith.index_cast(ir.IndexType.get(), s)
                     ts_idx = t_idx * arith.constant(topk, index=True) + s_idx
@@ -2658,11 +2771,19 @@ def compile_mixed_moe_gemm1(
                         lds_out_split=lds_out_B,
                     )
 
-            _if_blk = scf.IfOp(blk_valid)
+            # Approach A: only pair leaders are active.  A leader with a same-expert
+            # partner processes BOTH sub-blocks as one 2*sort_block_m compute tile,
+            # streaming e0's fp4 weight ONCE and reusing it across both (the traffic
+            # win); store_upper_rt (=has_partner) gates the upper rows.  A solo leader
+            # (no same-expert partner) masks the upper rows and writes only its own
+            # block.  Followers (odd offset within the expert run) are inactive and
+            # skip -- their rows were written by their leader.  For a_merge==1,
+            # is_active==blk_valid and store_upper_rt is None (ordinary path).
+            _if_blk = scf.IfOp(is_active)
             with ir.InsertionPoint(_if_blk.then_block):
                 _ifexpert_of = scf.IfOp(exp_valid)
                 with ir.InsertionPoint(_ifexpert_of.then_block):
-                    _moe_gemm1_body()
+                    _moe_gemm1_body(_e0_off, store_upper=store_upper_rt)
                     scf.YieldOp([])
                 scf.YieldOp([])
 
@@ -2707,6 +2828,7 @@ def compile_mixed_moe_gemm1(
         arg_max_token_ids: fx.Pointer,
         arg_bias: fx.Pointer,
         arg_out_scale_sorted: fx.Pointer,
+        arg_blk_map: fx.Pointer,
         i32_tokens_in: fx.Int32,
         i32_inter_in: fx.Int32,
         i32_k_in: fx.Int32,
@@ -2742,6 +2864,9 @@ def compile_mixed_moe_gemm1(
                 / arith.constant(2, index=True)
             )
 
+        # Approach A within-expert pairing keeps one CTA per sort block (grid-y
+        # unchanged); a CTA that is the "leader" of a same-expert pair also
+        # processes the following block, and non-leaders early-exit.
         _c_pm_l = arith.constant(persist_m, index=True)
         gy = (
             arith.index_cast(ir.IndexType.get(), i32_size_expert_ids_in.ir_value())
@@ -2761,6 +2886,7 @@ def compile_mixed_moe_gemm1(
             arg_max_token_ids,
             arg_bias,
             arg_out_scale_sorted,
+            arg_blk_map,
             i32_tokens_in,
             i32_inter_in,
             i32_k_in,

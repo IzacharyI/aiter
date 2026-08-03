@@ -20,7 +20,112 @@ def _get_dtypes():
     return dtypes
 
 
-_SUFFIX_RE = re.compile(r"(?P<fp4>_fp4)?(?P<fp8>_fp8)?(?:_sbm(?P<sbm>\d+))?$")
+# ---------------------------------------------------------------------------
+# blk_map (halved-grid pair descriptor) device-side producer.
+#
+# The stage-1 a_merge=2 kernel merges two same-expert 64-row sort blocks into a
+# single 128-row compute tile (fp4 weight streamed once -> the traffic win).  To
+# skip the (expensive) per-CTA in-kernel parity scan, we hand it a precomputed
+# list of "leader" block indices (blk_map): within each expert's contiguous run
+# of sort blocks, blocks at an EVEN within-run offset are leaders; a leader whose
+# next block is the same expert forms a 128-row pair, otherwise a 64-row solo.
+# blk_map[0:n_leaders] = leader block indices (compacted); the rest stay at the
+# sentinel (= #blocks) so surplus CTAs early-exit.
+#
+# Building this in eager torch spawns ~13 tiny kernels (arange/cummax/cumsum/
+# scatter/...) ~= 47us/iter, which erases the ~18us kernel win.  This single
+# Triton program (one block, tl.associative_scan for the run-start cummax +
+# tl.cumsum for the compaction rank + a masked scatter) does it in one launch and
+# is CUDA-graph-capture safe (no host sync, static grid).
+_TRITON_BLKMAP = None
+
+
+def _get_triton_blkmap():
+    """Lazily compile & cache the Triton blk_map producer (False if unavailable)."""
+    global _TRITON_BLKMAP
+    if _TRITON_BLKMAP is not None:
+        return _TRITON_BLKMAP
+    try:
+        import triton
+        import triton.language as tl
+    except Exception:
+        _TRITON_BLKMAP = False
+        return False
+
+    @triton.jit
+    def _max_combine(a, b):
+        return tl.maximum(a, b)
+
+    @triton.jit
+    def _blkmap_kernel(eids_ptr, out_ptr, B, E, BLOCK: tl.constexpr):
+        idx = tl.arange(0, BLOCK)
+        m = idx < B
+        eid = tl.load(eids_ptr + idx, mask=m, other=E)
+        prev_m = m & (idx > 0)
+        eid_prev = tl.load(eids_ptr + idx - 1, mask=prev_m, other=E)
+        valid = eid < E
+        valid_prev = (eid_prev < E) & (idx > 0)
+        same_prev = (eid == eid_prev) & valid & valid_prev
+        run_start = valid & (~same_prev)
+        # run_start_pos[i] = index where i's expert-run began (cummax of run-start idx)
+        rs_val = tl.where(run_start, idx, 0)
+        run_start_pos = tl.associative_scan(rs_val, 0, _max_combine)
+        offset = idx - run_start_pos
+        leader = valid & ((offset % 2) == 0)
+        rank = tl.cumsum(leader.to(tl.int32), axis=0) - 1  # 0..n_leaders-1 for leaders
+        n_units = tl.sum(leader.to(tl.int32))
+        # Two DISJOINT stores over [0,B) -> whole descriptor built in one kernel with
+        # no pre-init and no write-write race: leaders scatter into [0,n_units); the
+        # tail [n_units,B) gets the sentinel (=B) so surplus CTAs early-exit.
+        tl.store(out_ptr + rank, idx.to(tl.int32), mask=leader)
+        tail = (idx >= n_units) & m
+        tl.store(out_ptr + idx, B, mask=tail)
+
+    _TRITON_BLKMAP = _blkmap_kernel
+    return _blkmap_kernel
+
+
+def _build_blk_map(sorted_expert_ids, E, dev):
+    """Return int32[B] blk_map (leaders compacted to front, sentinel=B elsewhere).
+
+    Fast path: one Triton program.  Fallback: graph-safe torch (more kernels).
+    """
+    eids = sorted_expert_ids.to(torch.int32).contiguous().view(-1)
+    B = int(eids.numel())
+    if B <= 0:
+        return None
+    kern = _get_triton_blkmap()
+    _MAX_TRITON_B = 8192  # one-block scan bound; larger shapes use the torch path
+    if kern and B <= _MAX_TRITON_B:
+        import triton
+
+        # kernel fills the whole [0,B) (disjoint scatter + tail sentinel) -> no init
+        blk = torch.empty((B,), device=dev, dtype=torch.int32)
+        BLOCK = triton.next_power_of_2(B)
+        kern[(1,)](eids, blk, B, int(E), BLOCK=BLOCK)
+        return blk
+    # ---- graph-safe torch fallback (no host sync, static shapes) ----
+    idx = torch.arange(B, device=dev, dtype=torch.int32)
+    valid = eids < int(E)
+    same_prev = torch.zeros(B, dtype=torch.bool, device=dev)
+    if B > 1:
+        same_prev[1:] = (eids[1:] == eids[:-1]) & valid[1:] & valid[:-1]
+    run_start = valid & (~same_prev)
+    run_start_pos = torch.cummax(
+        torch.where(run_start, idx, torch.zeros_like(idx)), 0
+    ).values
+    offset = idx - run_start_pos
+    leader = valid & ((offset % 2) == 0)
+    rank = torch.cumsum(leader.to(torch.int32), 0) - 1
+    write_pos = torch.where(leader, rank, torch.full_like(rank, B)).to(torch.int64)
+    scratch = torch.full((B + 1,), B, device=dev, dtype=torch.int32)
+    scratch.scatter_(0, write_pos, idx)
+    return scratch[:B]
+
+
+_SUFFIX_RE = re.compile(
+    r"(?P<fp4>_fp4)?(?P<fp8>_fp8)?(?:_am(?P<am>\d+))?(?:_sbm(?P<sbm>\d+))?$"
+)
 
 
 def flydsl_kernel_name(
@@ -61,6 +166,15 @@ def get_flydsl_kernel_params(name: str) -> Optional[Dict]:
                 extra["out_dtype"] = "fp4"
             if m.group("fp8"):
                 extra["out_dtype"] = "fp8"
+            if m.group("am") is not None:
+                # The existing wrapper forwards tile_m but not arbitrary params.
+                # Encode config-selected merge in tile_m's sign; stage1 decodes it
+                # before sizing buffers/compiling, so `_am2` and the forced mode
+                # reach the identical implementation without touching the wrapper.
+                am = int(m.group("am"))
+                if am != 2:
+                    raise ValueError(f"only stage1 _am2 is supported, got _am{am}")
+                extra["tile_m"] = -int(params["tile_m"])
             if m.group("sbm") is not None:
                 extra["sort_block_m"] = int(m.group("sbm"))
             return {**params, **extra}
@@ -353,6 +467,8 @@ def compile_flydsl_moe_stage1(
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
     swiglu_limit: float = 0.0,
+    a_merge: int = 1,
+    blk_map: bool = False,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
     if b_dtype == "fp4":
@@ -384,6 +500,8 @@ def compile_flydsl_moe_stage1(
             a_scale_one=a_scale_one,
             xcd_swizzle=xcd_swizzle,
             swiglu_limit=swiglu_limit,
+            a_merge=a_merge,
+            blk_map=blk_map,
         )
     elif a_dtype == "bf16" and b_dtype == "int4":
         # a16wi4: bf16 activations, int4 weights with groupwise scale
@@ -533,9 +651,11 @@ def _s1_args_fp4(
     dev,
     bias=None,
     stream=None,
+    blk_map=None,
 ):
     empty_f32 = torch.empty(0, device=dev, dtype=torch.float32)
     _bias = bias if bias is not None else empty_f32
+    _blk_map = blk_map if blk_map is not None else torch.empty(0, device=dev, dtype=torch.int32)
     if stream is None:
         stream = torch.cuda.current_stream()
     return (
@@ -550,6 +670,7 @@ def _s1_args_fp4(
         _ptr_view_safe(num_valid_ids),
         _ptr_view_safe(_bias),
         _ptr_view_safe(out_scale_sorted),
+        _ptr_view_safe(_blk_map),
         token_num,
         n_in,
         k_in,
@@ -762,6 +883,8 @@ def flydsl_moe_stage1(
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
     swiglu_limit: float = 0.0,
+    a_merge: int = 1,
+    blk_map: bool = False,
 ):
     """Fused gate+up GEMM (MOE stage1).
 
@@ -787,6 +910,38 @@ def flydsl_moe_stage1(
     E = w1.shape[0]
     inter_dim = w1.shape[1] // 2
     model_dim = a.shape[1]
+
+    # blk_map (halved-grid pair descriptor): keep sort64 (stage-2 untouched) but
+    # let each CTA process a precomputed leader block (same-expert pair -> 128-row
+    # tile, weight loaded once; solo -> 64 rows). A negative tile_m is the private
+    # config-wrapper carrier for an `_am2` suffix; normalize before all sizing.
+    if tile_m < 0:
+        tile_m = -tile_m
+        a_merge = 2
+        blk_map = True
+    if os.environ.get("AITER_S1_BMAP", "0") in ("1", "true", "True", "yes", "YES"):
+        blk_map = True
+    # A/B override: force a_merge from env (CSV normally sets it via the _am{N} tag).
+    _am_env = os.environ.get("AITER_S1_AMERGE", "")
+    if _am_env.isdigit() and int(_am_env) > 1:
+        a_merge = int(_am_env)
+    # a_merge>1 ALWAYS wants the precomputed leader descriptor (blk_map): the
+    # in-kernel parity scan is strictly slower (measured 202us vs 162us on decode,
+    # i.e. slower than the a_merge=1 baseline).  So auto-enable blk_map whenever
+    # the merged-tile path is active, unless explicitly opted out (A/B only).
+    if int(a_merge) > 2:
+        raise ValueError(
+            f"stage1 a_merge={a_merge} is not implemented; the pair descriptor merges "
+            "exactly two sort blocks (a_merge=2)"
+        )
+    if int(a_merge) == 2 and os.environ.get("AITER_S1_NOBMAP", "0") != "1":
+        blk_map = True
+    if blk_map:
+        a_merge = 2
+    if os.environ.get("AITER_S1_BMAP_DEBUG", "0") == "1":
+        import sys as _sys
+        print(f"[BMAP-DEBUG] flydsl_moe_stage1 blk_map={blk_map} a_merge={a_merge} "
+              f"b_dtype={b_dtype} tile_m={tile_m} token_num={token_num}", file=_sys.stderr, flush=True)
 
     if a_dtype == "fp4":
         model_dim = model_dim * 2
@@ -888,6 +1043,15 @@ def flydsl_moe_stage1(
     _n_in = inter_dim * 2 if is_fp4 else inter_dim
     _k_in = model_dim
 
+    # Build the leader-block descriptor for the halved-grid pair kernel.  For each
+    # expert's run of same-expert sort blocks, the even-offset blocks are "leaders";
+    # a leader whose next block is the same expert forms a 128-row pair (weight
+    # loaded once), otherwise it is a 64-row solo.  blk_map lists all leader block
+    # indices, padded with a sentinel (= #blocks) so surplus CTAs early-exit.
+    _blk_map_tensor = None
+    if blk_map and is_fp4:
+        _blk_map_tensor = _build_blk_map(sorted_expert_ids, E, dev)
+
     if is_fp4:
         args = _s1_args_fp4(
             _kernel_out.view(-1),
@@ -910,6 +1074,7 @@ def flydsl_moe_stage1(
                 if kernel_bias is not None
                 else torch.empty(0, device=dev)
             ),
+            blk_map=_blk_map_tensor,
         )
     else:
         args = _s1_args_std(
@@ -953,6 +1118,8 @@ def flydsl_moe_stage1(
         a_scale_one=a_scale_one,
         xcd_swizzle=xcd_swizzle,
         swiglu_limit=swiglu_limit,
+        a_merge=a_merge,
+        blk_map=blk_map,
     )
     _run_compiled(exe, args)
 
