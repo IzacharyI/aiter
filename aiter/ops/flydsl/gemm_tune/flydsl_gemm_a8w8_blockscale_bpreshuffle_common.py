@@ -247,15 +247,11 @@ kernels_by_name = {v.name: v for v in kernels_list.values()}
 # for run_gemm_a8w8_blockscale_flydsl / getKernelName (which index the full list).
 #
 # flag signature = (cshuffle, async_copy, waves_per_eu, xcd_swizzle, fused_promote)
-_FOCUSED_SIGNATURES_ASYNC = {  # tile_m > 16: async A-load path is valid
-    (0, 0, 0, 0, 0),  # plain direct-epilog baseline
-    (0, 1, 0, 8, 0),  # + async + xcd
-    (0, 1, 2, 8, 0),  # + async + xcd + wpe2
-    (0, 1, 2, 8, 1),  # + async + xcd + wpe2 + fused_promote
-    (1, 1, 2, 8, 0),  # cshuffle + async + xcd + wpe2  (proven winner family)
-    (1, 1, 2, 8, 1),  # cshuffle + async + xcd + wpe2 + fused_promote (proven)
-    (1, 1, 0, 8, 0),  # cshuffle + async + xcd (default occupancy)
-    (1, 1, 2, 0, 0),  # cshuffle + async + wpe2, no xcd (skinny-N shapes)
+_FOCUSED_SIGNATURES_ASYNC = {
+    (0, 1, 2, 8, 0),
+    (0, 1, 2, 8, 1),
+    (1, 1, 2, 8, 0),
+    (1, 1, 2, 8, 1),
 }
 _FOCUSED_SIGNATURES_SYNC = {  # tile_m <= 16: async invalid (_config_is_valid), sync only
     (0, 0, 0, 0, 0),
@@ -316,9 +312,8 @@ def get_tune_kernels_list():
 #     flydsl8w_blockscale_bpreshuffle_{bm}x{bn}_wpe{wpe}_xcd{xcd}
 #
 # so name -> parse -> wrapper args round-trips to the config the tuner measured.
-# ``bn`` (BLOCK_N) is locked to 256 (the scale-block alignment the kernel asserts).
-_BLOCK_N_8W = 256
-_WAVES_PER_EU_8W = 2  # kernel default; wpe4 spills, wpe hint is a no-op (see handoff)
+_BLOCK_N_8W_VALS = (128, 256)
+_WAVES_PER_EU_8W_VALS = (0, 1, 2, 3, 4)
 
 
 @dataclass
@@ -327,6 +322,7 @@ class kernelInstance8w:
     block_n: int
     waves_per_eu: int
     use_xcd_remap: int  # 0 or 1
+    promote_sched: int = 8
 
     @property
     def name(self) -> str:
@@ -334,16 +330,23 @@ class kernelInstance8w:
             "flydsl8w_blockscale_bpreshuffle_"
             f"{self.block_m}x{self.block_n}_"
             f"wpe{self.waves_per_eu}_xcd{self.use_xcd_remap}"
+            f"_ps{self.promote_sched}"
         )
 
 
 def _build_kernels_list_8w():
     kl = {}
     idx = 0
-    for bm in (128, 256):
-        for xcd in (0, 1):
-            kl[idx] = kernelInstance8w(bm, _BLOCK_N_8W, _WAVES_PER_EU_8W, xcd)
-            idx += 1
+    for bm in (64, 128):
+        for bn in _BLOCK_N_8W_VALS:
+            for wpe in _WAVES_PER_EU_8W_VALS:
+                for xcd in (0, 1):
+                    sched_values = (0, 4, 8, 12, 16) if bn == 128 else (0,)
+                    for promote_sched in sched_values:
+                        kl[idx] = kernelInstance8w(
+                            bm, bn, wpe, xcd, promote_sched
+                        )
+                        idx += 1
     return kl
 
 
@@ -352,10 +355,30 @@ kernels_by_name_8w = {v.name: v for v in kernels_list_8w.values()}
 
 
 def get_tune_kernels_list_8w():
-    """Candidate dict for the 8-wave blockscale family (small, no focused subset).
-
-    Keys index ``kernels_list_8w`` (a distinct id space from the 4-wave
-    ``kernels_list``); the tuner uses a distinct ``flydsl8w`` libtype + runner so
-    the two families never collide.
-    """
-    return kernels_list_8w
+    """Candidate dict for the 8-wave blockscale family."""
+    flag = os.environ.get("FLYDSL_BS_TUNE_FOCUSED", "").strip().lower()
+    if flag in ("", "0", "false", "no"):
+        return kernels_list_8w
+    preferred = {
+        (64, 128, 3, 0, 0),
+        (64, 128, 3, 0, 4),
+        (64, 128, 4, 0, 8),
+        (128, 128, 2, 0, 8),
+        (128, 128, 4, 0, 12),
+        (128, 128, 4, 0, 16),
+        (128, 256, 1, 0, 0),
+        (128, 256, 2, 0, 0),
+        (128, 256, 4, 0, 0),
+    }
+    return {
+        i: ki
+        for i, ki in kernels_list_8w.items()
+        if (
+            ki.block_m,
+            ki.block_n,
+            ki.waves_per_eu,
+            ki.use_xcd_remap,
+            ki.promote_sched,
+        )
+        in preferred
+    }

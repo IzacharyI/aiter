@@ -84,6 +84,7 @@ from .fp8_gemm_utils import (
     compute_global_swizzle,
     divmod,
     make_fp8_buffer_tensor,
+    pack_i32x4_i32x8,
     wait_barrier,
 )
 
@@ -125,10 +126,10 @@ class StoreCPlain:
                     self._store_bf16(scaled, arith.select(col_valid, c_index, oob))
 
 
-def compile_fp8_gemm_8w_blockscale(*, K: int, BLOCK_M: int = 256, BLOCK_N: int = 256, b_preshuffled: bool = False, waves_per_eu: int = 2, use_xcd_remap: bool = True):
+def compile_fp8_gemm_8w_blockscale(*, K: int, BLOCK_M: int = 256, BLOCK_N: int = 256, b_preshuffled: bool = False, waves_per_eu: int = 2, use_xcd_remap: bool = True, promote_sched: int = 8):
     BLOCK_K = 128
 
-    assert BLOCK_M >= 128 and BLOCK_N >= 256 and BLOCK_M % 128 == 0 and BLOCK_N % 256 == 0
+    assert BLOCK_M >= 64 and BLOCK_N >= 128 and BLOCK_M % 64 == 0 and BLOCK_N % 128 == 0
     assert K % BLOCK_K == 0
     assert BLOCK_K == SCALE_BLOCK_K, "this port assumes BLOCK_K == scale_block_k == 128 (kb == k)"
 
@@ -137,24 +138,29 @@ def compile_fp8_gemm_8w_blockscale(*, K: int, BLOCK_M: int = 256, BLOCK_N: int =
 
     scale_k = K // SCALE_BLOCK_K
 
-    N_TILES_A = BLOCK_M // 64
-    N_TILES_B = BLOCK_N // 128
-    N_ACCUMS = N_TILES_A * N_TILES_B
-    assert N_ACCUMS > 0
+    num_threads = 256 if BLOCK_N == 128 else 512
+    num_waves = num_threads // 64
+    waves_n = 4 if BLOCK_N == 256 else 2
+    waves_m = num_waves // waves_n
 
     LDS_BLOCK_M = BLOCK_M // 2
     LDS_BLOCK_N = BLOCK_N // 2
-    assert LDS_BLOCK_N == SCALE_BLOCK_N, "per-group N span must equal scale_block_n (BLOCK_N must be 256)"
+    assert LDS_BLOCK_N <= SCALE_BLOCK_N
 
-    N_LDS_STEPS_A = LDS_BLOCK_M // 64
-    N_LDS_STEPS_B = LDS_BLOCK_N // 64
-    N_LDS_ROUNDS = max(N_LDS_STEPS_A, N_LDS_STEPS_B)
-
-    NB_PER_BLOCK = BLOCK_N // SCALE_BLOCK_N  # = 2
-    WAVE_M_OFF = N_TILES_A * 16
+    N_TILES_A = LDS_BLOCK_M // waves_m // 16
+    N_TILES_B = BLOCK_N // (waves_n * 2 * 16)
+    N_ACCUMS = N_TILES_A * N_TILES_B
+    assert N_ACCUMS > 0
 
     a_lds_size = LDS_BLOCK_M * BLOCK_K
     b_lds_size = LDS_BLOCK_N * BLOCK_K
+
+    N_LDS_STEPS_A = max(1, a_lds_size // (num_waves * 1024))
+    N_LDS_STEPS_B = max(1, b_lds_size // (num_waves * 1024))
+    N_LDS_ROUNDS = max(N_LDS_STEPS_A, N_LDS_STEPS_B)
+
+    NB_PER_BLOCK = BLOCK_N // SCALE_BLOCK_N
+    WAVE_M_OFF = N_TILES_A * 16
 
     @fx.struct
     class SharedStorage:
@@ -167,7 +173,7 @@ def compile_fp8_gemm_8w_blockscale(*, K: int, BLOCK_M: int = 256, BLOCK_N: int =
         B_lds_next_0: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
         B_lds_next_1: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
 
-    @flyc.kernel(known_block_size=[512, 1, 1])
+    @flyc.kernel(known_block_size=[num_threads, 1, 1])
     def kernel_gemm(
         A: fx.Tensor,
         B_T: fx.Tensor,
@@ -194,8 +200,8 @@ def compile_fp8_gemm_8w_blockscale(*, K: int, BLOCK_M: int = 256, BLOCK_N: int =
 
         lane_id = fx.thread_idx.x % 64
         wave_id = fx.thread_idx.x // 64
-        wave_m = wave_id // 4
-        wave_n = wave_id % 4
+        wave_m = wave_id // waves_n
+        wave_n = wave_id % waves_n
         if const_expr(use_xcd_remap):
             block_m, block_n = _xcd_swizzle(ceildiv(c_m, BLOCK_M), n_blocks)
         else:
@@ -236,14 +242,28 @@ def compile_fp8_gemm_8w_blockscale(*, K: int, BLOCK_M: int = 256, BLOCK_N: int =
 
         lane_row_off = (lane_id // 16) * 4
         nb0 = block_n * NB_PER_BLOCK  # w_scale N-block for col-half Y=0
-        nb1 = nb0 + 1                 # ... for col-half Y=1
+        nb1 = nb0 + (1 if BLOCK_N == 256 else 0)
         xrow0 = block_m * BLOCK_M + wave_m * WAVE_M_OFF + lane_row_off  # X=0 row base
         xrow1 = xrow0 + LDS_BLOCK_M                                     # X=1 row base
 
         def preload_scales(kb):
             """Load x_scale (per row-half, per ti vec4) + w_scale (per col-half) for K-block kb."""
-            w0 = Vec.filled(4, fx.Float32(buffer_ops.buffer_load(scale_b_rsrc, nb0 * scale_k + kb, vec_width=1, dtype=T.f32)), fx.Float32)
-            w1 = Vec.filled(4, fx.Float32(buffer_ops.buffer_load(scale_b_rsrc, nb1 * scale_k + kb, vec_width=1, dtype=T.f32)), fx.Float32)
+            w0 = fx.Float32(
+                buffer_ops.buffer_load(
+                    scale_b_rsrc, nb0 * scale_k + kb, vec_width=1, dtype=T.f32
+                )
+            )
+            if const_expr(BLOCK_N == 128):
+                w1 = w0
+            else:
+                w1 = fx.Float32(
+                    buffer_ops.buffer_load(
+                        scale_b_rsrc,
+                        nb1 * scale_k + kb,
+                        vec_width=1,
+                        dtype=T.f32,
+                    )
+                )
             base = kb * c_M
             xs0 = [
                 Vec(buffer_ops.buffer_load(scale_a_rsrc, base + xrow0 + ti * 16, vec_width=4, dtype=T.f32)).bitcast(fx.Float32)
@@ -256,7 +276,7 @@ def compile_fp8_gemm_8w_blockscale(*, K: int, BLOCK_M: int = 256, BLOCK_N: int =
             return xs0, xs1, w0, w1
 
         def promote(blk, c_frag, xs, w):
-            """global += blk * (x_scale * w_scale) for one group (xs = row-half scales, w = col-half scale)."""
+            """global += blk * (x_scale * w_scale) for one group."""
             out = list(c_frag)
             for ti in range_constexpr(N_TILES_A):
                 comb = xs[ti] * w
@@ -321,10 +341,14 @@ def compile_fp8_gemm_8w_blockscale(*, K: int, BLOCK_M: int = 256, BLOCK_N: int =
             wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
 
             c11_blk = mfma.call(a1_frag, b1_frag, zero_c)
+            if const_expr(BLOCK_N == 128 and promote_sched > 0):
+                rocdl.sched_mfma(promote_sched)
             c00_frag = promote(c00_blk, c00_frag, xs0, w0)
             c01_frag = promote(c01_blk, c01_frag, xs0, w1)
             c10_frag = promote(c10_blk, c10_frag, xs1, w0)
             c11_frag = promote(c11_blk, c11_frag, xs1, w1)
+            if const_expr(BLOCK_N == 128 and promote_sched > 0):
+                rocdl.sched_barrier(0)
 
             # Swap cur and next
             a_cur0, a_next0 = a_next0, a_cur0
@@ -345,19 +369,19 @@ def compile_fp8_gemm_8w_blockscale(*, K: int, BLOCK_M: int = 256, BLOCK_N: int =
         rocdl.s_barrier()
 
         c01_blk = mfma.call(a0_frag, b1_frag, zero_c)
-        c00_frag = promote(c00_blk, c00_frag, xs0, w0)
 
         a1_frag = a_s2r.load(a_cur1)
         a_g2s.load(a_next1, A1_gl_offset + (K_ITERS - 1) * BLOCK_K)
         rocdl.s_barrier()
 
         c10_blk = mfma.call(a1_frag, b0_frag, zero_c)
-        c01_frag = promote(c01_blk, c01_frag, xs0, w1)
 
         b0_frag = b_s2r.load(b_next0, preshuffled=b_preshuffled)
         rocdl.s_barrier()
 
         c11_blk = mfma.call(a1_frag, b1_frag, zero_c)
+        c00_frag = promote(c00_blk, c00_frag, xs0, w0)
+        c01_frag = promote(c01_blk, c01_frag, xs0, w1)
         c10_frag = promote(c10_blk, c10_frag, xs1, w0)
         c11_frag = promote(c11_blk, c11_frag, xs1, w1)
 
@@ -379,7 +403,6 @@ def compile_fp8_gemm_8w_blockscale(*, K: int, BLOCK_M: int = 256, BLOCK_N: int =
         rocdl.s_barrier()
 
         c01_blk = mfma.call(a0_frag, b1_frag, zero_c)
-        c00_frag = promote(c00_blk, c00_frag, xs0, w0)
 
         a1_frag = a_s2r.load(a_cur1)
         rocdl.s_barrier()
@@ -387,13 +410,14 @@ def compile_fp8_gemm_8w_blockscale(*, K: int, BLOCK_M: int = 256, BLOCK_N: int =
         rocdl.s_setprio(1)
         c10_blk = mfma.call(a1_frag, b0_frag, zero_c)
         c11_blk = mfma.call(a1_frag, b1_frag, zero_c)
+        c00_frag = promote(c00_blk, c00_frag, xs0, w0)
         c01_frag = promote(c01_blk, c01_frag, xs0, w1)
         c10_frag = promote(c10_blk, c10_frag, xs1, w0)
         c11_frag = promote(c11_blk, c11_frag, xs1, w1)
         rocdl.s_setprio(0)
         rocdl.s_barrier()
 
-        # Scale and store back to gmem
+        # Scale and store back to gmem.
         wave_n_offset = wave_n * (N_TILES_B * 16)
         wave_m_offset = wave_m * (N_TILES_A * 16)
         base_row = block_m * BLOCK_M + wave_m_offset
@@ -424,7 +448,14 @@ def compile_fp8_gemm_8w_blockscale(*, K: int, BLOCK_M: int = 256, BLOCK_N: int =
             scale_b,
             c_m,
             c_n,
-            value_attrs={"rocdl.waves_per_eu": waves_per_eu, "rocdl.flat_work_group_size": "512,512"},
-        ).launch(grid=(grid_x, 1, 1), block=(512, 1, 1), stream=stream)
+            value_attrs={
+                "rocdl.waves_per_eu": waves_per_eu,
+                "rocdl.flat_work_group_size": (
+                    "256,256" if num_threads == 256 else "512,512"
+                ),
+            },
+        ).launch(
+            grid=(grid_x, 1, 1), block=(num_threads, 1, 1), stream=stream
+        )
 
     return launch_gemm

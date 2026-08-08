@@ -574,26 +574,14 @@ def compile_blockscale_preshuffle_gemm(
                     s_a_vec = buffer_ops.buffer_load(scale_a_rsrc, sa_idx, vec_width=4, dtype=T.f32)
                     s_a_vecs.append(Vec(s_a_vec).bitcast(fx.Float32))
 
-                s_b_vals = []
-                for ni in range_constexpr(num_acc_n):
-                    col_base_ni = by_n + n_tile_base + ni * 16
-                    n_block = col_base_ni // c_128
-                    sb_idx = n_block * c_scale_k + kb
-                    s_b_val = buffer_ops.buffer_load(scale_b_rsrc, sb_idx, vec_width=1, dtype=T.f32)
-                    s_b_vals.append(s_b_val)
-
-                s_b_vecs = []
-                for ni in range_constexpr(num_acc_n):
-                    s_b_vecs.append(Vec.filled(4, fx.Float32(s_b_vals[ni]), fx.Float32))
-
-                combined_scales = []
-                for mi in range_constexpr(m_repeat):
-                    mi_combined = []
-                    for ni in range_constexpr(num_acc_n):
-                        combined = s_a_vecs[mi] * s_b_vecs[ni]
-                        mi_combined.append(combined)
-                    combined_scales.append(mi_combined)
-                all_combined.append(combined_scales)
+                n_block = (by_n + n_tile_base) // c_128
+                sb_idx = n_block * c_scale_k + kb
+                s_b_val = fx.Float32(
+                    buffer_ops.buffer_load(
+                        scale_b_rsrc, sb_idx, vec_width=1, dtype=T.f32
+                    )
+                )
+                all_combined.append((s_a_vecs, s_b_val))
             return all_combined
 
         def compute_tile_blockscale(global_accs, b_tile_in, lds_buffer, pre_scales, *, a0_prefetch=None):
@@ -601,7 +589,7 @@ def compile_blockscale_preshuffle_gemm(
             current_global = list(global_accs)
 
             for sb in range_constexpr(sb_per_tile):
-                combined_scales = pre_scales[sb]
+                s_a_vecs, s_b_val = pre_scales[sb]
 
                 if const_expr(_is_gfx950 and fused_promote):
                     # Fused per-M-row promote: only one M-row of MFMA temps (num_acc_n
@@ -642,7 +630,7 @@ def compile_blockscale_preshuffle_gemm(
                             acc_idx = mi * num_acc_n + ni
                             current_global[acc_idx] = math_dialect.fma(
                                 block_row[ni],
-                                combined_scales[mi][ni],
+                                s_a_vecs[mi] * s_b_val,
                                 current_global[acc_idx],
                             )
                 else:
@@ -708,7 +696,7 @@ def compile_blockscale_preshuffle_gemm(
                             acc_idx = mi * num_acc_n + ni
                             fma_result = math_dialect.fma(
                                 block_accs[acc_idx],
-                                combined_scales[mi][ni],
+                                s_a_vecs[mi] * s_b_val,
                                 current_global[acc_idx],
                             )
                             current_global[acc_idx] = fma_result

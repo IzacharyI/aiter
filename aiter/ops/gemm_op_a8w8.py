@@ -187,12 +187,15 @@ def _parse_flydsl_blockscale_8w_kernel_name(kernel_name: str):
     import re
 
     m = re.match(
-        r"flydsl8w_blockscale_bpreshuffle_(\d+)x(\d+)_wpe(\d+)_xcd(\d+)",
+        r"flydsl8w_blockscale_bpreshuffle_(\d+)x(\d+)_wpe(\d+)_xcd(\d+)"
+        r"(?:_ps(\d+))?",
         kernel_name,
     )
     if m is None:
         return None
-    return tuple(int(m.group(i)) for i in range(1, 5))
+    values = [int(m.group(i)) for i in range(1, 5)]
+    values.append(int(m.group(5)) if m.group(5) is not None else 8)
+    return tuple(values)
 
 
 def gemm_a8w8_blockscale_bpreshuffle_flydsl(
@@ -259,7 +262,7 @@ def gemm_a8w8_blockscale_bpreshuffle_flydsl_8w(
     if parsed is None or XQ.shape[0] * WQ.shape[0] >= (1 << 31):
         return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Out)
 
-    block_m, block_n, wpe, xcd = parsed
+    block_m, block_n, wpe, xcd, promote_sched = parsed
     flydsl_fp8_gemm_8wave_blockscale_a8(
         XQ.contiguous(),
         WQ.contiguous(),
@@ -270,6 +273,7 @@ def gemm_a8w8_blockscale_bpreshuffle_flydsl_8w(
         block_n=block_n,
         waves_per_eu=wpe,
         use_xcd_remap=bool(xcd),
+        promote_sched=promote_sched,
     )
     return Out
 

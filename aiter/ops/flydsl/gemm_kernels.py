@@ -1243,6 +1243,7 @@ def flydsl_fp8_gemm_8wave_blockscale_a8(
     block_n: int = 256,
     waves_per_eu: int = 2,
     use_xcd_remap: bool = True,
+    promote_sched: int = 8,
 ) -> Tensor:
     """Compile (cached) and run the experimental 8-wave a8w8 blockscale GEMM.
 
@@ -1269,6 +1270,7 @@ def flydsl_fp8_gemm_8wave_blockscale_a8(
         b_preshuffled=True,
         waves_per_eu=waves_per_eu,
         use_xcd_remap=use_xcd_remap,
+        promote_sched=promote_sched,
     )
 
     out_contig = Out.contiguous()

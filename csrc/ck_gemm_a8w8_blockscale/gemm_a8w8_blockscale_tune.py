@@ -254,6 +254,7 @@ def run_gemm_a8w8_blockscale_flydsl_8w(
         block_n=ki.block_n,
         waves_per_eu=ki.waves_per_eu,
         use_xcd_remap=bool(ki.use_xcd_remap),
+        promote_sched=ki.promote_sched,
     )
     return out
 
