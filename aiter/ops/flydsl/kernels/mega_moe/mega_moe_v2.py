@@ -22,6 +22,12 @@ from .quant import per_1x32_mx_quant
 __all__ = ["MegaMoEV2"]
 
 
+def _group_done_slots(world_size: int) -> int:
+    if world_size <= 0:
+        raise ValueError(f"world_size must be positive, got {world_size}")
+    return world_size
+
+
 class MegaMoEV2:
     """Fused dispatch, GEMM1, GEMM2, and combine with one in-flight launch per instance."""
 
@@ -124,7 +130,12 @@ class MegaMoEV2:
             "active_payload_blocks": torch.zeros(1, dtype=torch.int32, device=self.dev),
             "payload_blocks_per_destination": torch.zeros(self.world_size, dtype=torch.int32, device=self.dev),
             "payload_chunks_per_destination": torch.zeros(self.world_size, dtype=torch.int32, device=self.dev),
-            "group_done": torch.zeros(1, dtype=torch.int32, device=self.dev),
+            # Fixed-slot dispatch indexes one completion counter per destination rank.
+            "group_done": torch.zeros(
+                _group_done_slots(self.world_size),
+                dtype=torch.int32,
+                device=self.dev,
+            ),
         }
         workspace["bigcnt"] = op._sym((self.world_size * self.epr,), torch.int32)
         workspace["count_done"] = op._sym((2 * self.world_size,), torch.int32)

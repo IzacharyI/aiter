@@ -4,6 +4,7 @@
 from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
     select_mega_moe_config,
 )
+from aiter.ops.flydsl.kernels.mega_moe.mega_moe_v2 import _group_done_slots
 
 
 def test_large_mtpr_512_uses_measured_payload_chunk():
@@ -16,3 +17,7 @@ def test_payload_chunk_override_is_bucket_and_mtpr_specific():
     assert select_mega_moe_config(1024, 8192).stage1.payload_chunk_rows == 384
     assert select_mega_moe_config(8192, 8192).stage1.payload_chunk_rows == 384
     assert select_mega_moe_config(512, 512).stage1.payload_chunk_rows == 0
+
+
+def test_fixed_slot_group_done_has_one_counter_per_rank():
+    assert _group_done_slots(8) == 8
