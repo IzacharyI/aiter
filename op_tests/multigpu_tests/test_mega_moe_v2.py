@@ -5,8 +5,13 @@
 from __future__ import annotations
 
 import argparse
+import importlib
+import json
+import math
 import os
+import platform
 from dataclasses import replace
+from pathlib import Path
 
 os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "40G")
 
@@ -20,6 +25,10 @@ from aiter import dtypes
 from aiter.ops.flydsl.kernels.mega_moe import MegaMoEV2
 from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
 from aiter.utility import fp4_utils
+
+EXPECTED_WORLD_SIZE = 8
+RESULT_SCHEMA_VERSION = "mega-moe-v2-ep8-v1"
+RESULT_PREFIX = "MEGAMOE_V2_RESULT_JSON="
 
 NETWORKS = {
     "v4_pro": {
@@ -36,10 +45,37 @@ def _setup_dist():
     rank = int(os.environ.get("RANK", "0"))
     world = int(os.environ.get("WORLD_SIZE", "1"))
     local_rank = int(os.environ.get("LOCAL_RANK", rank))
+    local_world = int(os.environ.get("LOCAL_WORLD_SIZE", str(world)))
+    if (
+        world != EXPECTED_WORLD_SIZE
+        or local_world != EXPECTED_WORLD_SIZE
+        or not 0 <= rank < EXPECTED_WORLD_SIZE
+        or rank != local_rank
+    ):
+        raise RuntimeError(
+            "MegaMoEV2 validation requires one local EP8 group with "
+            f"WORLD_SIZE=LOCAL_WORLD_SIZE={EXPECTED_WORLD_SIZE} and RANK=LOCAL_RANK; "
+            f"got rank={rank}, local_rank={local_rank}, world={world}, "
+            f"local_world={local_world}. "
+            f"launch with torchrun --nproc_per_node={EXPECTED_WORLD_SIZE}"
+        )
+    visible_devices = torch.cuda.device_count()
+    if visible_devices != EXPECTED_WORLD_SIZE:
+        raise RuntimeError(
+            f"MegaMoEV2 validation requires {EXPECTED_WORLD_SIZE} visible GPUs, "
+            f"got {visible_devices}"
+        )
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
     if not dist.is_initialized():
         dist.init_process_group("cpu:gloo,cuda:nccl", device_id=device)
+    if dist.get_world_size() != world or dist.get_rank() != rank:
+        actual = (dist.get_rank(), dist.get_world_size())
+        dist.destroy_process_group()
+        raise RuntimeError(
+            f"distributed layout changed during initialization: expected {(rank, world)}, "
+            f"got {actual}"
+        )
     import torch._C._distributed_c10d as c10d
 
     c10d._register_process_group("default", dist.group.WORLD)
@@ -64,6 +100,10 @@ def _reduce_float(value, device, op):
     result = torch.tensor(float(value), dtype=torch.float32, device=device)
     dist.all_reduce(result, op=op)
     return float(result.item())
+
+
+def _all_ranks_true(value, device):
+    return bool(_reduce_float(bool(value), device, dist.ReduceOp.MIN))
 
 
 def _next_power_of_two(value):
@@ -211,7 +251,11 @@ def _time_graph(fn, device, iters):
     local_ms = start.elapsed_time(end) / iters
     mean_ms = _reduce_float(local_ms, device, dist.ReduceOp.SUM) / dist.get_world_size()
     max_ms = _reduce_float(local_ms, device, dist.ReduceOp.MAX)
-    return mean_ms, max_ms
+    return {
+        "local_ms": local_ms,
+        "rank_mean_ms": mean_ms,
+        "rank_max_ms": max_ms,
+    }
 
 
 def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
@@ -219,7 +263,9 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
     output = moe(x, weights, ids)[:tokens]
     _barrier()
     rel_l2 = -1.0
-    if tokens <= args.accuracy_max_bs:
+    local_rel_l2 = None
+    accuracy_checked = tokens <= args.accuracy_max_bs
+    if accuracy_checked:
         reference = _reference(
             x,
             weights,
@@ -232,12 +278,28 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
             moe.experts,
             moe.swiglu_limit,
         )
-        rel_l2 = float(
-            torch.linalg.vector_norm(output.float() - reference)
-            / torch.linalg.vector_norm(reference)
+        output_finite = bool(torch.isfinite(output).all().item())
+        reference_finite = bool(torch.isfinite(reference).all().item())
+        if not _all_ranks_true(output_finite and reference_finite, device):
+            raise AssertionError(
+                f"bs={tokens} non-finite MegaMoEV2 output or reference detected"
+            )
+        error_norm = float(torch.linalg.vector_norm(output.float() - reference))
+        reference_norm = float(torch.linalg.vector_norm(reference))
+        norms_valid = (
+            math.isfinite(error_norm)
+            and math.isfinite(reference_norm)
+            and reference_norm > 0.0
         )
+        if not _all_ranks_true(norms_valid, device):
+            raise AssertionError(
+                f"bs={tokens} invalid correctness norm: "
+                f"error_norm={error_norm}, reference_norm={reference_norm}"
+            )
+        local_rel_l2 = error_norm / reference_norm
+        rel_l2 = local_rel_l2
         rel_l2 = _reduce_float(rel_l2, device, dist.ReduceOp.MAX)
-        if rel_l2 >= args.rtol:
+        if not math.isfinite(rel_l2) or rel_l2 >= args.rtol:
             raise AssertionError(f"bs={tokens} relL2={rel_l2:.6f} exceeds {args.rtol}")
 
     x_q, scale = moe.quantize(x)
@@ -260,16 +322,75 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
     sbm = int(moe._s1_active_tile_m)
     gemm2_bm = int(moe._g2_active_block_m)
     p2p_quant = moe._active_config.p2p_quant
+    rank_record = {
+        "rank": rank,
+        "tokens": tokens,
+        "accuracy_checked": accuracy_checked,
+        "rel_l2": local_rel_l2,
+        "timing_ms": {
+            "stage1": stage1_ms["local_ms"],
+            "stage2": stage2_ms["local_ms"],
+            "e2e": e2e_ms["local_ms"],
+        },
+    }
+    rank_records = [None] * world
+    dist.all_gather_object(rank_records, rank_record)
+    case_report = {
+        "schema_version": RESULT_SCHEMA_VERSION,
+        "record_type": "case",
+        "case_id": f"{args.network}_bs{tokens}",
+        "network": args.network,
+        "tokens_per_rank": tokens,
+        "world_size": world,
+        "path": "fixed" if moe._s1_fixed_slot else "compact",
+        "p2p_quant": p2p_quant,
+        "config": {
+            "stage1_block_m": sbm,
+            "stage2_block_m": gemm2_bm,
+        },
+        "correctness": {
+            "checked": accuracy_checked,
+            "rtol": args.rtol,
+            "rel_l2_rank_max": rel_l2 if accuracy_checked else None,
+            "finite": True if accuracy_checked else None,
+            "reference_norm_nonzero": True if accuracy_checked else None,
+        },
+        "timing_ms": {
+            "stage1": {
+                "rank_mean": stage1_ms["rank_mean_ms"],
+                "rank_max": stage1_ms["rank_max_ms"],
+            },
+            "stage2": {
+                "rank_mean": stage2_ms["rank_mean_ms"],
+                "rank_max": stage2_ms["rank_max_ms"],
+            },
+            "e2e": {
+                "rank_mean": e2e_ms["rank_mean_ms"],
+                "rank_max": e2e_ms["rank_max_ms"],
+            },
+        },
+        "ranks": rank_records,
+    }
     if rank == 0:
         print(
             f"[MEGA-V2] bs={tokens} relL2={rel_l2:.6f} "
             f"path={'fixed' if moe._s1_fixed_slot else 'compact'} "
             f"p2p_quant={p2p_quant} SBM={sbm} G2_BM={gemm2_bm} "
-            f"stage1={stage1_ms[0]:.4f}/{stage1_ms[1]:.4f}ms "
-            f"stage2={stage2_ms[0]:.4f}/{stage2_ms[1]:.4f}ms "
-            f"e2e={e2e_ms[0]:.4f}/{e2e_ms[1]:.4f}ms mean/max",
+            f"stage1={stage1_ms['rank_mean_ms']:.4f}/"
+            f"{stage1_ms['rank_max_ms']:.4f}ms "
+            f"stage2={stage2_ms['rank_mean_ms']:.4f}/"
+            f"{stage2_ms['rank_max_ms']:.4f}ms "
+            f"e2e={e2e_ms['rank_mean_ms']:.4f}/"
+            f"{e2e_ms['rank_max_ms']:.4f}ms mean/max",
             flush=True,
         )
+        print(
+            RESULT_PREFIX
+            + json.dumps(case_report, allow_nan=False, separators=(",", ":")),
+            flush=True,
+        )
+        return case_report
+    return None
 
 
 def _run_burst(moe, x, weights, ids, depth, rank):
@@ -325,6 +446,51 @@ def _install_config_policy(moe, config_tokens, unify_fields):
     moe._select_config = select_config
 
 
+def _module_version(name):
+    module = importlib.import_module(name)
+    return getattr(module, "__version__", "unknown")
+
+
+def _runtime_metadata(args, world):
+    return {
+        "python": platform.python_version(),
+        "torch": torch.__version__,
+        "rocm": torch.version.hip,
+        "flydsl": _module_version("flydsl"),
+        "mori": _module_version("mori"),
+        "aiter_path": str(Path(aiter.__file__).resolve()),
+        "visible_devices": os.environ.get(
+            "HIP_VISIBLE_DEVICES", os.environ.get("CUDA_VISIBLE_DEVICES", "")
+        ),
+        "mori_socket_ifname": os.environ.get("MORI_SOCKET_IFNAME", ""),
+        "mori_shmem_heap_size": os.environ.get("MORI_SHMEM_HEAP_SIZE", ""),
+        "world_size": world,
+        "local_world_size": int(os.environ.get("LOCAL_WORLD_SIZE", str(world))),
+        "network": args.network,
+        "seed": args.seed,
+        "iters": args.iters,
+        "rtol": args.rtol,
+    }
+
+
+def _write_json_report(path, args, world, cases):
+    output_path = Path(path).expanduser().resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    report = {
+        "schema_version": RESULT_SCHEMA_VERSION,
+        "record_type": "run",
+        "status": "pass",
+        "metadata": _runtime_metadata(args, world),
+        "cases": cases,
+    }
+    temporary_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    temporary_path.write_text(
+        json.dumps(report, indent=2, sort_keys=True, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    temporary_path.replace(output_path)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--network", choices=NETWORKS, default="v4_pro")
@@ -338,10 +504,19 @@ def main():
     parser.add_argument("--config-tokens", type=int, default=0)
     parser.add_argument("--unify-fields", default="")
     parser.add_argument("--burst-depth", type=int, default=0)
+    parser.add_argument(
+        "--json-output",
+        default="",
+        help="rank-0 path for a versioned per-rank and aggregate JSON report",
+    )
     args = parser.parse_args()
     batch_sizes = [int(value) for value in args.bs_list.split(",")]
     if not batch_sizes or min(batch_sizes) <= 0:
         raise ValueError("--bs-list must contain positive integers")
+    if args.iters <= 0:
+        raise ValueError("--iters must be positive")
+    if not math.isfinite(args.rtol) or args.rtol <= 0:
+        raise ValueError("--rtol must be finite and positive")
     rank_tokens = [int(value) for value in args.rank_tokens.split(",") if value]
 
     rank, world, device = _setup_dist()
@@ -376,6 +551,15 @@ def main():
         w1, w1_scale, w2, w2_scale, w1_q, w1_ref_scale, w2_q, w2_ref_scale = packed
         if rank_tokens and len(rank_tokens) != world:
             raise ValueError("--rank-tokens must contain one value per rank")
+        if (
+            rank_tokens
+            and len(set(rank_tokens)) != 1
+            and args.accuracy_max_bs >= min(rank_tokens)
+        ):
+            raise ValueError(
+                "unequal --rank-tokens correctness is unsupported; "
+                "set --accuracy-max-bs below every rank token or use equal sizes"
+            )
         max_bs = max(batch_sizes + rank_tokens)
         x, weights, ids = _make_inputs(
             max_bs,
@@ -387,6 +571,7 @@ def main():
             device,
         )
         ref_weights = w1_q, w1_ref_scale, w2_q, w2_ref_scale
+        case_reports = []
         for batch_size in batch_sizes:
             local_batch_size = rank_tokens[rank] if rank_tokens else batch_size
             max_tok_per_rank = args.max_tok_per_rank or max(
@@ -428,7 +613,7 @@ def main():
                     moe, local_x, local_weights, local_ids, args.burst_depth, rank
                 )
             else:
-                _run_size(
+                case_report = _run_size(
                     moe,
                     local_x,
                     local_weights,
@@ -439,6 +624,10 @@ def main():
                     world,
                     device,
                 )
+                if rank == 0:
+                    case_reports.append(case_report)
+        if rank == 0 and args.json_output:
+            _write_json_report(args.json_output, args, world, case_reports)
     finally:
         _cleanup()
 

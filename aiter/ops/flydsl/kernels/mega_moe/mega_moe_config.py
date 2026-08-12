@@ -265,7 +265,7 @@ def _select_large_stage1(
         work_shards=work_shards,
         external_grouping=bucket == 4 or bucket >= 256,
         external_counting=bucket >= 256,
-        payload_chunk_rows=384,
+        payload_chunk_rows=256 if bucket == 512 else 384,
         payload_tile_ready=True,
     )
 

@@ -211,6 +211,8 @@ def main():
     parser.add_argument("--stage1-grid-mult", type=int, default=0)
     parser.add_argument("--stage1-b-nt", type=int, default=-1)
     parser.add_argument("--stage1-tile-resource", action="store_true")
+    parser.add_argument("--combine-block-num", type=int, default=0)
+    parser.add_argument("--combine-warp-num", type=int, default=0)
     parser.add_argument("--check-variant", action="store_true")
     parser.add_argument("--profile-dir", default="")
     parser.add_argument("--mega-only", action="store_true")
@@ -268,6 +270,14 @@ def main():
         max_tok_per_rank=args.mtpr,
         swiglu_limit=SWIGLU_LIMIT,
     )
+    if bool(args.combine_block_num) != bool(args.combine_warp_num):
+        raise ValueError(
+            "--combine-block-num and --combine-warp-num must be passed together"
+        )
+    combine_variant = bool(args.combine_block_num)
+    if combine_variant:
+        mega.comb_cfg.combine_block_num = args.combine_block_num
+        mega.comb_cfg.combine_warp_num_per_block = args.combine_warp_num
     default_select_config = mega._select_config
     variant_select_config = None
     if (
@@ -418,12 +428,18 @@ def main():
 
     rel_l2 = None
     if args.check_variant:
-        if variant_select_config is None:
-            raise ValueError("--check-variant requires a Stage2 variant")
+        if variant_select_config is None and not combine_variant:
+            raise ValueError("--check-variant requires a Stage1, Stage2, or combine variant")
         mega._select_config = default_select_config
+        if combine_variant:
+            mega.comb_cfg.combine_block_num = None
+            mega.comb_cfg.combine_warp_num_per_block = None
         reference = mega(x, route_weights, ids).clone()
         barrier()
-        mega._select_config = variant_select_config
+        mega._select_config = variant_select_config or default_select_config
+        if combine_variant:
+            mega.comb_cfg.combine_block_num = args.combine_block_num
+            mega.comb_cfg.combine_warp_num_per_block = args.combine_warp_num
         candidate = mega(x, route_weights, ids).clone()
         barrier()
         rel_l2 = (
