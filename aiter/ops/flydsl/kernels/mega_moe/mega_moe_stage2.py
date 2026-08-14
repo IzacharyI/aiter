@@ -452,7 +452,7 @@ def make_stage2_body_emitter(*, BK, BM, BN, INTER_MAX, KH_TILE_A, N_OUT, SBM, Sh
 
 
 # fmt: off
-def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, topk: int, rank: int, npes: int,
+def derive_stage2_emit_constants(*, model_dim: int, inter_dim: int, experts: int, topk: int, rank: int, npes: int,
     max_tok: int, recv_cap: int | None = None, comb_inp_nbytes: int | None = None, BM: int = 32, BN: int = 256,
     BK: int = 256, use_nt: bool = True, HIDDEN_MAX: int = 8192, INTER_MAX: int = 8192, a_dtype: str = "fp8",
     SBM: int | None = None,
@@ -460,7 +460,12 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
     g2_spart=None, persist_strided: bool = False, g2_bf16_lds: bool = False, p2p_quant_type: str = "none",
     fixed_slot_dispatch: bool = False, skew_cu: int = 0, analysis_no_p2p_payload: bool = False):
 # fmt: on
-    """Compile fused GEMM2 and weighted cross-rank P2P scatter."""
+    """Validate a Stage2 configuration and derive the tile loop's compile-time constants.
+
+    Returns ``(constants, kernel_name)`` where ``constants`` is exactly the keyword set
+    ``make_stage2_body_emitter`` takes. Split out of ``compile_mega_moe_stage2`` so the
+    fused GEMM2+combine kernel derives Stage2 the same way instead of re-deriving it.
+    """
     arch = str(get_rocm_arch() or "")
     if not arch.startswith("gfx95"):
         raise RuntimeError(f"MegaMoE v2 stage2 requires CDNA4 (gfx95x), got {arch or 'unknown'}")
@@ -519,14 +524,68 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
         f"_np{int(analysis_no_p2p_payload)}"
     )
 
-    emit_stage2_body = make_stage2_body_emitter(
-        BK=BK, BM=BM, BN=BN, INTER_MAX=INTER_MAX, KH_TILE_A=KH_TILE_A, N_OUT=N_OUT,
-        SBM=SBM, SharedStorage=SharedStorage, _comb_inp_nbytes=_comb_inp_nbytes, _expert_offset=_expert_offset, _recv_cap=_recv_cap, aStages=aStages,
-        a_dtype=a_dtype, analysis_no_p2p_payload=analysis_no_p2p_payload, cu_num=cu_num, g2_ascale_pf=g2_ascale_pf, g2_bf16_lds=g2_bf16_lds, g2_bhoist=g2_bhoist,
-        g2_group_num=g2_group_num, g2_m01=g2_m01, g2_spart=g2_spart, has_pad=has_pad, is_f8=is_f8, lds_packed_off=lds_packed_off,
-        lds_peer_off=lds_peer_off, lds_weight_off=lds_weight_off, log2_max_tok=log2_max_tok, mask_max_tok=mask_max_tok, npes=npes, p2p_quant_type=p2p_quant_type,
-        persist=persist, persist_strided=persist_strided, skew_cu=skew_cu, topk=topk, use_nt=use_nt,
+    consts = {
+        "BK": BK,
+        "BM": BM,
+        "BN": BN,
+        "INTER_MAX": INTER_MAX,
+        "KH_TILE_A": KH_TILE_A,
+        "N_OUT": N_OUT,
+        "SBM": SBM,
+        "SharedStorage": SharedStorage,
+        "_comb_inp_nbytes": _comb_inp_nbytes,
+        "_expert_offset": _expert_offset,
+        "_recv_cap": _recv_cap,
+        "aStages": aStages,
+        "a_dtype": a_dtype,
+        "analysis_no_p2p_payload": analysis_no_p2p_payload,
+        "cu_num": cu_num,
+        "g2_ascale_pf": g2_ascale_pf,
+        "g2_bf16_lds": g2_bf16_lds,
+        "g2_bhoist": g2_bhoist,
+        "g2_group_num": g2_group_num,
+        "g2_m01": g2_m01,
+        "g2_spart": g2_spart,
+        "has_pad": has_pad,
+        "is_f8": is_f8,
+        "lds_packed_off": lds_packed_off,
+        "lds_peer_off": lds_peer_off,
+        "lds_weight_off": lds_weight_off,
+        "log2_max_tok": log2_max_tok,
+        "mask_max_tok": mask_max_tok,
+        "npes": npes,
+        "p2p_quant_type": p2p_quant_type,
+        "persist": persist,
+        "persist_strided": persist_strided,
+        "skew_cu": skew_cu,
+        "topk": topk,
+        "use_nt": use_nt,
+    }
+    return consts, kernel_name
+
+
+# fmt: off
+def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, topk: int, rank: int, npes: int,
+    max_tok: int, recv_cap: int | None = None, comb_inp_nbytes: int | None = None, BM: int = 32, BN: int = 256,
+    BK: int = 256, use_nt: bool = True, HIDDEN_MAX: int = 8192, INTER_MAX: int = 8192, a_dtype: str = "fp8",
+    SBM: int | None = None,
+    persist: bool = False, cu_num: int = 0, has_pad: bool = False, g2_bhoist=None, g2_ascale_pf=None,
+    g2_spart=None, persist_strided: bool = False, g2_bf16_lds: bool = False, p2p_quant_type: str = "none",
+    fixed_slot_dispatch: bool = False, skew_cu: int = 0, analysis_no_p2p_payload: bool = False):
+# fmt: on
+    """Compile fused GEMM2 and weighted cross-rank P2P scatter."""
+    consts, kernel_name = derive_stage2_emit_constants(
+        model_dim=model_dim, inter_dim=inter_dim, experts=experts, topk=topk, rank=rank,
+        npes=npes, max_tok=max_tok, recv_cap=recv_cap, comb_inp_nbytes=comb_inp_nbytes,
+        BM=BM, BN=BN, BK=BK, use_nt=use_nt, HIDDEN_MAX=HIDDEN_MAX, INTER_MAX=INTER_MAX,
+        a_dtype=a_dtype, SBM=SBM, persist=persist, cu_num=cu_num, has_pad=has_pad,
+        g2_bhoist=g2_bhoist, g2_ascale_pf=g2_ascale_pf, g2_spart=g2_spart,
+        persist_strided=persist_strided, g2_bf16_lds=g2_bf16_lds,
+        p2p_quant_type=p2p_quant_type, fixed_slot_dispatch=fixed_slot_dispatch,
+        skew_cu=skew_cu, analysis_no_p2p_payload=analysis_no_p2p_payload,
     )
+    BN = consts["BN"]
+    emit_stage2_body = make_stage2_body_emitter(**consts)
 
     # fmt: off
     @flyc.kernel(name=kernel_name, known_block_size=[256, 1, 1])
