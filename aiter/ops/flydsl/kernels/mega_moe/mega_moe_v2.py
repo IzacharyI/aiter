@@ -364,7 +364,8 @@ class MegaMoEV2:
             g2_ascale_pf=stage2.ascale_prefetch, g2_spart=stage2.spatial_partition,
             persist=stage2.persist, persist_cu=stage2.persist_cu,
             persist_strided=stage2.persist_strided, skew_cu=stage2.skew_cu,
-            g2_bf16_lds=stage2.bf16_lds, **invariants)
+            g2_bf16_lds=stage2.bf16_lds,
+            analysis_no_p2p_payload=stage2.analysis_no_p2p_payload, **invariants)
         # fmt: on
         self._g2_active_block_m = stage2.block_m
         return comb_op.combine_no_stage1(

@@ -33,6 +33,7 @@ __all__ = [
     "fence_system_acquire",
     "fence_system_release",
     "load_i64_global",
+    "read_memrealtime",
     "store_i32_system",
     "store_i64_global_system",
 ]
@@ -115,6 +116,19 @@ def load_i64_global(addr_i64):
     ptr = _to_ptr_global(addr_i64)
     _i64 = ir.IntegerType.get_signless(64)
     return _llvm_d.LoadOp(_i64, ptr, alignment=8).result
+
+
+def read_memrealtime():
+    """Read gfx9 ``s_memrealtime`` (100 MHz) after its scalar-memory wait."""
+    _i64 = ir.IntegerType.get_signless(64)
+    value = _llvm_d.inline_asm(
+        _i64,
+        [],
+        "s_memrealtime $0\n\ts_waitcnt lgkmcnt(0)",
+        "=s",
+        has_side_effects=True,
+    )
+    return fx.Int64(value)
 
 
 def atomic_add_global_at(addr_i64, val, syncscope="one-as"):

@@ -5,8 +5,13 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import statistics
+import sys
+import time
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 
 os.environ.setdefault("MORI_EP_LAUNCH_CONFIG_MODE", "AUTO")
@@ -37,6 +42,288 @@ PERF_GUARD_MIN_SPEEDUP = {
     (8192, "uniform"): 50.0,
     (8192, "rank-mixed-skew"): 40.0,
 }
+
+
+class _AmdSmiXgmiSampler:
+    """Read firmware XGMI accumulators without making AMD-SMI a hard dependency."""
+
+    def __init__(self):
+        os.environ["AMDSMI_GPU_METRICS_CACHE_MS"] = "0"
+        amd_smi_path = Path("/opt/rocm/share/amd_smi")
+        if amd_smi_path.exists() and str(amd_smi_path) not in sys.path:
+            sys.path.insert(0, str(amd_smi_path))
+        import amdsmi
+
+        self._amdsmi = amdsmi
+        amdsmi.amdsmi_init()
+        self._closed = False
+        self.version = dict(amdsmi.amdsmi_get_lib_version())
+        torch_bus_to_index = {
+            int(torch.cuda.get_device_properties(index).pci_bus_id): index
+            for index in range(torch.cuda.device_count())
+        }
+        self._handles = []
+        for amd_smi_index, handle in enumerate(amdsmi.amdsmi_get_processor_handles()):
+            bdf = amdsmi.amdsmi_get_gpu_device_bdf(handle)
+            bus = int(bdf.split(":")[1], 16)
+            if bus not in torch_bus_to_index:
+                raise RuntimeError(f"AMD-SMI BDF {bdf} is not visible to Torch")
+            self._handles.append(
+                {
+                    "handle": handle,
+                    "amd_smi_index": amd_smi_index,
+                    "torch_index": torch_bus_to_index[bus],
+                    "bdf": bdf,
+                }
+            )
+        if len(self._handles) != torch.cuda.device_count():
+            raise RuntimeError(
+                f"AMD-SMI exposed {len(self._handles)} GPUs, "
+                f"Torch exposed {torch.cuda.device_count()}"
+            )
+
+    def snapshot(self):
+        snapshot = []
+        for entry in self._handles:
+            metrics = self._amdsmi.amdsmi_get_gpu_metrics_info(entry["handle"])
+            header = self._amdsmi.amdsmi_get_gpu_metrics_header_info(entry["handle"])
+            snapshot.append(
+                {
+                    "amd_smi_index": entry["amd_smi_index"],
+                    "torch_index": entry["torch_index"],
+                    "bdf": entry["bdf"],
+                    "header": header,
+                    "xgmi_read_data_acc_kb": [
+                        int(value) for value in metrics["xgmi_read_data_acc"]
+                    ],
+                    "xgmi_write_data_acc_kb": [
+                        int(value) for value in metrics["xgmi_write_data_acc"]
+                    ],
+                    "xgmi_link_status": [
+                        str(value) for value in metrics["xgmi_link_status"]
+                    ],
+                }
+            )
+        return sorted(snapshot, key=lambda entry: entry["torch_index"])
+
+    def close(self):
+        if not self._closed:
+            self._amdsmi.amdsmi_shut_down()
+            self._closed = True
+
+
+def _counter_delta(before, after):
+    if after >= before:
+        return after - before
+    return (1 << 64) - before + after
+
+
+def _xgmi_delta(before, after):
+    before_by_bdf = {entry["bdf"]: entry for entry in before}
+    endpoints = []
+    for end in after:
+        start = before_by_bdf[end["bdf"]]
+        read_delta = [
+            _counter_delta(old, new)
+            for old, new in zip(
+                start["xgmi_read_data_acc_kb"],
+                end["xgmi_read_data_acc_kb"],
+                strict=True,
+            )
+        ]
+        write_delta = [
+            _counter_delta(old, new)
+            for old, new in zip(
+                start["xgmi_write_data_acc_kb"],
+                end["xgmi_write_data_acc_kb"],
+                strict=True,
+            )
+        ]
+        endpoints.append(
+            {
+                "torch_index": end["torch_index"],
+                "amd_smi_index": end["amd_smi_index"],
+                "bdf": end["bdf"],
+                "read_delta_kb_by_link": read_delta,
+                "write_delta_kb_by_link": write_delta,
+                "read_delta_kb": sum(read_delta),
+                "write_delta_kb": sum(write_delta),
+                "endpoint_total_delta_kb": sum(read_delta) + sum(write_delta),
+            }
+        )
+    endpoint_sum_kb = sum(entry["endpoint_total_delta_kb"] for entry in endpoints)
+    return {
+        "endpoints": endpoints,
+        "endpoint_sum_kb": endpoint_sum_kb,
+        "paired_endpoint_normalized_kb": endpoint_sum_kb / 2.0,
+    }
+
+
+def _measure_xgmi(graph, replays, rank):
+    sampler = None
+    initialization_error = None
+    if rank == 0:
+        try:
+            sampler = _AmdSmiXgmiSampler()
+        except Exception as error:  # propagate before peers enter the measurement
+            initialization_error = f"{type(error).__name__}: {error}"
+    error_box = [initialization_error]
+    dist.broadcast_object_list(error_box, src=0)
+    if error_box[0]:
+        raise RuntimeError(f"AMD-SMI XGMI sampler initialization failed: {error_box[0]}")
+
+    torch.cuda.synchronize()
+    dist.barrier()
+    before = sampler.snapshot() if rank == 0 else None
+    dist.barrier()
+    started = time.monotonic()
+    for _ in range(replays):
+        graph.replay()
+    torch.cuda.synchronize()
+    dist.barrier()
+    workload_wall_s = time.monotonic() - started
+    after = sampler.snapshot() if rank == 0 else None
+    elapsed_box = [workload_wall_s if rank == 0 else None]
+    dist.broadcast_object_list(elapsed_box, src=0)
+    workload_wall_s = float(elapsed_box[0])
+
+    dist.barrier()
+    idle_before = sampler.snapshot() if rank == 0 else None
+    dist.barrier()
+    time.sleep(workload_wall_s)
+    dist.barrier()
+    idle_after = sampler.snapshot() if rank == 0 else None
+    dist.barrier()
+
+    if rank != 0:
+        return None
+    try:
+        workload_delta = _xgmi_delta(before, after)
+        idle_delta = _xgmi_delta(idle_before, idle_after)
+        net_kb = max(
+            workload_delta["paired_endpoint_normalized_kb"]
+            - idle_delta["paired_endpoint_normalized_kb"],
+            0.0,
+        )
+        return {
+            "schema_version": "mega-moe-v2-amdsmi-xgmi-v1",
+            "collector": "AMD-SMI raw GPU metrics API",
+            "tool_version": sampler.version,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "command_argv": list(sys.argv),
+            "counter_semantics": {
+                "fields": "xgmi_read_data_acc + xgmi_write_data_acc",
+                "raw_unit": "KB as defined by AMD-SMI GPU metrics content revision 9",
+                "paired_endpoint_normalized": (
+                    "sum of endpoint read+write deltas divided by two to avoid "
+                    "counting the mirrored link endpoints twice"
+                ),
+                "not_wire_bytes": (
+                    "firmware accumulator traffic includes fabric amplification "
+                    "and is not a protocol packet/CRC/retry byte counter"
+                ),
+            },
+            "replays": replays,
+            "workload_wall_s": workload_wall_s,
+            "raw_before": before,
+            "raw_after": after,
+            "workload_delta": workload_delta,
+            "idle_baseline": {
+                "duration_s": workload_wall_s,
+                "raw_before": idle_before,
+                "raw_after": idle_after,
+                "delta": idle_delta,
+            },
+            "idle_subtracted_paired_endpoint_kb": net_kb,
+            "idle_subtracted_paired_endpoint_bytes": net_kb * 1024.0,
+        }
+    finally:
+        sampler.close()
+
+
+def _percentile(values, quantile):
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * quantile
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    fraction = position - lower
+    return ordered[lower] * (1.0 - fraction) + ordered[upper] * fraction
+
+
+def _collect_combine_wait(graph, combine_op, replays, rank, world):
+    records = []
+    for replay in range(replays):
+        combine_op.reset_analysis_wait_timing()
+        torch.cuda.synchronize()
+        dist.barrier()
+        graph.replay()
+        torch.cuda.synchronize()
+        dist.barrier()
+        ticks = [
+            int(value)
+            for value in combine_op.get_analysis_wait_timing().cpu().tolist()
+        ]
+        gathered = [None] * world
+        dist.all_gather_object(
+            gathered,
+            {
+                "rank": rank,
+                "block_wait_realtime_ticks": ticks,
+            },
+        )
+        if rank == 0:
+            records.append({"replay": replay, "ranks": gathered})
+    if rank != 0:
+        return None
+    rank_summaries = []
+    for rank_id in range(world):
+        values = [
+            tick
+            for record in records
+            for rank_record in record["ranks"]
+            if rank_record["rank"] == rank_id
+            for tick in rank_record["block_wait_realtime_ticks"]
+        ]
+        rank_summaries.append(
+            {
+                "rank": rank_id,
+                "samples": len(values),
+                "mean_ticks": statistics.fmean(values),
+                "p50_ticks": _percentile(values, 0.50),
+                "p95_ticks": _percentile(values, 0.95),
+                "max_ticks": max(values),
+                "mean_us": statistics.fmean(values) * 0.01,
+                "p95_us": _percentile(values, 0.95) * 0.01,
+                "max_us": max(values) * 0.01,
+            }
+        )
+    return {
+        "schema_version": "mega-moe-v2-combine-wait-timing-v1",
+        "status": "complete_for_instrumented_combine_peer_wait_scope",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timer": {
+            "instruction": "s_memrealtime",
+            "frequency_hz": 100_000_000,
+            "tick_ns": 10,
+        },
+        "replays": replays,
+        "world_size": world,
+        "rank_summaries": rank_summaries,
+        "rank_max_of_max_us": max(entry["max_us"] for entry in rank_summaries),
+        "rank_max_of_p95_us": max(entry["p95_us"] for entry in rank_summaries),
+        "records": records,
+        "scope": (
+            "one wave-level timer group per Combine block around the eight peer "
+            "uint64_wait_until_equals calls and acquire fences"
+        ),
+        "scope_warning": (
+            "Two scalar timer reads and one rank-local store perturb short waits. "
+            "The elapsed value is the wave reconvergence time for all peers, not "
+            "eight independently attributable peer durations."
+        ),
+    }
 
 
 def setup_dist():
@@ -70,6 +357,22 @@ def make_inputs(tokens, rank, world, model_dim, experts, topk, route, hot_bias, 
     if route == "hot-rank0":
         scores[:, :local_experts] += hot_bias
     values, ids = torch.topk(scores, topk, dim=-1)
+    if route == "local-only":
+        values, local_ids = torch.topk(
+            scores[:, rank * local_experts : (rank + 1) * local_experts],
+            topk,
+            dim=-1,
+        )
+        ids = local_ids + rank * local_experts
+    if route == "all-remote":
+        token_ids = torch.arange(tokens, device=device).view(-1, 1)
+        slots = torch.arange(topk, device=device).view(1, -1)
+        destination = (rank + 1 + slots) % world
+        local_ids = (token_ids + slots) % local_experts
+        ids = destination * local_experts + local_ids
+        values = torch.zeros(
+            (tokens, topk), dtype=torch.float32, device=device
+        )
     if route in ("rank-balanced-hot", "rank-balanced-last", "rank-mixed-skew"):
         destination_scores = torch.rand(
             (tokens, world), device=device, generator=generator
@@ -159,7 +462,11 @@ def time_graph(graph, iters, device):
     maximum = mean.clone()
     dist.all_reduce(mean, op=dist.ReduceOp.SUM)
     dist.all_reduce(maximum, op=dist.ReduceOp.MAX)
-    return float(mean.item() / dist.get_world_size()), float(maximum.item())
+    return (
+        float(mean.item() / dist.get_world_size()),
+        float(maximum.item()),
+        float(local_ms),
+    )
 
 
 def profile_graph(graph, name, rank, out_dir, replays=3):
@@ -190,6 +497,8 @@ def main():
         "--route",
         choices=(
             "uniform",
+            "local-only",
+            "all-remote",
             "hot-rank0",
             "rank-balanced-hot",
             "rank-balanced-last",
@@ -202,6 +511,16 @@ def main():
     parser.add_argument("--stage2-persist-cu", type=int, default=0)
     parser.add_argument("--stage2-skew-cu", type=int, default=0)
     parser.add_argument("--disable-stage2-skew", action="store_true")
+    parser.add_argument(
+        "--p2p-quant",
+        choices=("default", "none", "fp8_blockwise_1x32"),
+        default="default",
+    )
+    parser.add_argument(
+        "--analysis-no-p2p-payload",
+        action="store_true",
+        help="analysis only: keep Stage2 scatter instructions but force all payload stores OOB",
+    )
     parser.add_argument("--stage1-payload-chunk-rows", type=int, default=0)
     parser.add_argument("--stage1-tile-ready", action="store_true")
     parser.add_argument("--disable-stage1-tile-ready", action="store_true")
@@ -215,9 +534,29 @@ def main():
     parser.add_argument("--combine-warp-num", type=int, default=0)
     parser.add_argument("--check-variant", action="store_true")
     parser.add_argument("--profile-dir", default="")
+    parser.add_argument("--json-output", default="")
+    parser.add_argument("--xgmi-output", default="")
+    parser.add_argument("--xgmi-replays", type=int, default=0)
+    parser.add_argument("--combine-wait-output", default="")
+    parser.add_argument("--combine-wait-replays", type=int, default=0)
     parser.add_argument("--mega-only", action="store_true")
+    parser.add_argument("--prequant", action="store_true")
     parser.add_argument("--perf-guard", action="store_true")
     args = parser.parse_args()
+    if bool(args.xgmi_output) != bool(args.xgmi_replays):
+        raise ValueError("--xgmi-output and --xgmi-replays must be passed together")
+    if args.xgmi_replays < 0:
+        raise ValueError("--xgmi-replays must be positive")
+    if args.xgmi_output and not args.mega_only:
+        raise ValueError("--xgmi-output requires --mega-only")
+    if bool(args.combine_wait_output) != bool(args.combine_wait_replays):
+        raise ValueError(
+            "--combine-wait-output and --combine-wait-replays must be passed together"
+        )
+    if args.combine_wait_replays < 0:
+        raise ValueError("--combine-wait-replays must be positive")
+    if args.combine_wait_output and not args.mega_only:
+        raise ValueError("--combine-wait-output requires --mega-only")
 
     rank, world, device = setup_dist()
     if world != 8:
@@ -246,10 +585,12 @@ def main():
         ids.flatten().to(torch.int64) // local_experts,
         torch.ones_like(ids.flatten(), dtype=torch.int64),
     )
+    local_route_counts = route_counts.clone()
     dist.all_reduce(route_counts, op=dist.ReduceOp.SUM)
     expert_counts = torch.bincount(
         ids.flatten().to(torch.int64), minlength=args.experts
     )
+    local_expert_counts = expert_counts.clone()
     dist.all_reduce(expert_counts, op=dist.ReduceOp.SUM)
     w1, w1_scale, w2, w2_scale = make_weights(
         local_experts, args.model_dim, args.inter_dim, rank, device
@@ -270,6 +611,7 @@ def main():
         max_tok_per_rank=args.mtpr,
         swiglu_limit=SWIGLU_LIMIT,
     )
+    mega.comb_op.set_analysis_wait_timing(bool(args.combine_wait_output))
     if bool(args.combine_block_num) != bool(args.combine_warp_num):
         raise ValueError(
             "--combine-block-num and --combine-warp-num must be passed together"
@@ -285,6 +627,8 @@ def main():
         or args.stage2_persist_cu
         or args.stage2_skew_cu
         or args.disable_stage2_skew
+        or args.p2p_quant != "default"
+        or args.analysis_no_p2p_payload
         or args.stage1_payload_chunk_rows
         or args.stage1_tile_ready
         or args.disable_stage1_tile_ready
@@ -328,6 +672,7 @@ def main():
                 or args.stage2_persist_cu
                 or args.stage2_skew_cu
                 or args.disable_stage2_skew
+                or args.analysis_no_p2p_payload
             ):
                 stage2 = replace(
                     stage2,
@@ -338,7 +683,10 @@ def main():
                         if args.disable_stage2_skew
                         else args.stage2_skew_cu or stage2.skew_cu
                     ),
+                    analysis_no_p2p_payload=args.analysis_no_p2p_payload,
                 )
+            if args.p2p_quant != "default":
+                config = replace(config, p2p_quant=args.p2p_quant)
             config = replace(
                 config,
                 stage1=stage1,
@@ -392,8 +740,14 @@ def main():
         )
         holders["mori"] = mori_op.combine(local_out, None, ids)[0]
 
+    prequant_x, prequant_scale = mega.quantize(x)
+
     def mega_body():
-        holders["mega"] = mega(x, route_weights, ids)
+        holders["mega"] = (
+            mega.forward_prequant(prequant_x, prequant_scale, route_weights, ids)
+            if args.prequant
+            else mega(x, route_weights, ids)
+        )
 
     mori_graph = None if args.mega_only else capture(mori_body)
     print(f"[STEP] rank={rank} mori-capture-done", flush=True)
@@ -406,7 +760,7 @@ def main():
     )
     mega_ms = time_graph(mega_graph, args.iters, device)
 
-    x_q, x_scale = mega.quantize(x)
+    x_q, x_scale = prequant_x, prequant_scale
 
     def mega_stage1():
         mega._run_fused_stage1(x_q, route_weights, x_scale, ids)
@@ -425,18 +779,43 @@ def main():
     mega_stage1()
     barrier()
     stage2_ms = time_graph(stage2_graph, args.iters, device)
+    xgmi_evidence = (
+        _measure_xgmi(mega_graph, args.xgmi_replays, rank)
+        if args.xgmi_output
+        else None
+    )
+    combine_wait_evidence = (
+        _collect_combine_wait(
+            mega_graph,
+            mega.comb_op,
+            args.combine_wait_replays,
+            rank,
+            world,
+        )
+        if args.combine_wait_output
+        else None
+    )
+    measurement_config = mega._active_config
 
     rel_l2 = None
     if args.check_variant:
-        if variant_select_config is None and not combine_variant:
+        if (
+            variant_select_config is None
+            and not combine_variant
+            and not args.combine_wait_output
+        ):
             raise ValueError("--check-variant requires a Stage1, Stage2, or combine variant")
         mega._select_config = default_select_config
+        if args.combine_wait_output:
+            mega.comb_op.set_analysis_wait_timing(False)
         if combine_variant:
             mega.comb_cfg.combine_block_num = None
             mega.comb_cfg.combine_warp_num_per_block = None
         reference = mega(x, route_weights, ids).clone()
         barrier()
         mega._select_config = variant_select_config or default_select_config
+        if args.combine_wait_output:
+            mega.comb_op.set_analysis_wait_timing(True)
         if combine_variant:
             mega.comb_cfg.combine_block_num = args.combine_block_num
             mega.comb_cfg.combine_warp_num_per_block = args.combine_warp_num
@@ -471,7 +850,116 @@ def main():
                 f"no performance guard for tokens={args.tokens}, route={args.route}"
             )
     guard_pass = guard_floor is None or speedup >= guard_floor
+    local_record = {
+        "rank": rank,
+        "tokens": tokens,
+        "route_counts_by_destination": local_route_counts.tolist(),
+        "expert_counts": local_expert_counts.tolist(),
+        "timing_ms": {
+            "e2e": mega_ms[2],
+            "stage1": stage1_ms[2],
+            "stage2_combine": stage2_ms[2],
+        },
+    }
+    rank_records = [None] * world
+    dist.all_gather_object(rank_records, local_record)
     if rank == 0:
+        if combine_wait_evidence is not None:
+            combine_wait_evidence["workload"] = {
+                "route": args.route,
+                "tokens_per_rank": tokens,
+                "world_size": world,
+                "topk": args.topk,
+                "stage2_p2p_quant": measurement_config.p2p_quant,
+                "analysis_no_p2p_payload": bool(args.analysis_no_p2p_payload),
+                "instrumented_e2e_rank_max_ms": mega_ms[1],
+                "instrumented_stage2_combine_rank_max_ms": stage2_ms[1],
+            }
+            combine_wait_evidence["command_argv"] = list(sys.argv)
+            wait_output = Path(args.combine_wait_output)
+            wait_output.parent.mkdir(parents=True, exist_ok=True)
+            wait_output.write_text(
+                json.dumps(
+                    combine_wait_evidence,
+                    indent=2,
+                    sort_keys=True,
+                    allow_nan=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+        if xgmi_evidence is not None:
+            remote_rows = sum(
+                int(value)
+                for source in rank_records
+                for destination, value in enumerate(
+                    source["route_counts_by_destination"]
+                )
+                if destination != int(source["rank"])
+            )
+            stage1_row_bytes = args.model_dim + args.model_dim // 32
+            stage2_row_bytes = (
+                args.model_dim + args.model_dim // 32
+                if measurement_config.p2p_quant == "fp8_blockwise_1x32"
+                else args.model_dim * 2
+            )
+            stage1_payload_bytes_per_replay = remote_rows * stage1_row_bytes
+            stage2_payload_bytes_per_replay = (
+                0
+                if args.analysis_no_p2p_payload
+                else remote_rows * stage2_row_bytes
+            )
+            metadata_bytes_per_replay = remote_rows * 8
+            useful_bytes_per_replay = (
+                stage1_payload_bytes_per_replay
+                + stage2_payload_bytes_per_replay
+                + metadata_bytes_per_replay
+            )
+            counter_bytes_per_replay = (
+                xgmi_evidence["idle_subtracted_paired_endpoint_bytes"]
+                / args.xgmi_replays
+            )
+            xgmi_evidence["workload"] = {
+                "route": args.route,
+                "tokens_per_rank": tokens,
+                "world_size": world,
+                "topk": args.topk,
+                "remote_route_rows_per_replay": remote_rows,
+                "stage1_row_bytes": stage1_row_bytes,
+                "stage2_row_bytes": stage2_row_bytes,
+                "stage2_p2p_quant": measurement_config.p2p_quant,
+                "analysis_no_p2p_payload": bool(args.analysis_no_p2p_payload),
+                "logical_stage1_payload_bytes_per_replay": (
+                    stage1_payload_bytes_per_replay
+                ),
+                "logical_stage2_payload_bytes_per_replay": (
+                    stage2_payload_bytes_per_replay
+                ),
+                "logical_route_metadata_bytes_per_replay": metadata_bytes_per_replay,
+                "logical_useful_bytes_per_replay": useful_bytes_per_replay,
+            }
+            xgmi_evidence["derived"] = {
+                "idle_subtracted_paired_endpoint_bytes_per_replay": (
+                    counter_bytes_per_replay
+                ),
+                "counter_to_logical_useful_amplification": (
+                    counter_bytes_per_replay / useful_bytes_per_replay
+                    if useful_bytes_per_replay
+                    else None
+                ),
+            }
+            xgmi_output = Path(args.xgmi_output)
+            xgmi_output.parent.mkdir(parents=True, exist_ok=True)
+            xgmi_output.write_text(
+                json.dumps(
+                    xgmi_evidence,
+                    indent=2,
+                    sort_keys=True,
+                    allow_nan=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
         print(f"[ROUTES] per-destination-rank={route_counts.tolist()}", flush=True)
         print(
             f"[EXPERTS] active={(expert_counts > 0).sum().item()} max_routes={expert_counts.max().item()} "
@@ -497,6 +985,71 @@ def main():
             print(
                 f"[PERF-GUARD] {status} speedup={speedup:.2f}% minimum={guard_floor:.2f}%",
                 flush=True,
+            )
+        if args.json_output:
+            output = Path(args.json_output)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            variant_parts = []
+            if args.stage1_payload_chunk_rows:
+                variant_parts.append(f"pc{args.stage1_payload_chunk_rows}")
+            if args.p2p_quant != "default":
+                variant_parts.append(
+                    "p2p_" + args.p2p_quant.replace("fp8_blockwise_1x32", "fp8")
+                )
+            if args.analysis_no_p2p_payload:
+                variant_parts.append("no_p2p_payload")
+            variant_name = "_".join(variant_parts) or "default"
+            base_case_id = f"t{tokens}_{args.route.replace('-', '_')}"
+            case_id = (
+                f"{base_case_id}_{variant_name}"
+                if variant_name != "default"
+                else base_case_id
+            )
+            payload = {
+                "schema_version": "mega-moe-v2-route-benchmark-v1",
+                "record_type": "run",
+                "status": "pass" if guard_pass else "fail",
+                "metadata": {
+                    "world_size": world,
+                    "iters": args.iters,
+                    "network": "v4_pro",
+                },
+                "cases": [
+                    {
+                        "case_id": case_id,
+                        "network": "v4_pro",
+                        "tokens_per_rank": tokens,
+                        "world_size": world,
+                        "route": args.route,
+                        "comparison_group": f"v4_pro_t{tokens}_ep{world}",
+                        "variant": {
+                            "name": variant_name,
+                            "stage1_payload_chunk_rows": args.stage1_payload_chunk_rows,
+                            "p2p_quant": args.p2p_quant,
+                            "analysis_no_p2p_payload": bool(
+                                args.analysis_no_p2p_payload
+                            ),
+                            "prequant": bool(args.prequant),
+                        },
+                        "correctness": {
+                            "variant_vs_default_rel_l2": (
+                                float(rel_l2.item()) if rel_l2 is not None else None
+                            )
+                        },
+                        "ranks": rank_records,
+                        "route_summary": {
+                            "per_destination_rank": route_counts.tolist(),
+                            "active_experts": int((expert_counts > 0).sum().item()),
+                            "expert_max_routes": int(expert_counts.max().item()),
+                            "expert_mean_routes": float(expert_counts.float().mean().item()),
+                            "per_expert_routes": expert_counts.tolist(),
+                        },
+                    }
+                ],
+            }
+            output.write_text(
+                json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n",
+                encoding="utf-8",
             )
     ms.shmem_finalize()
     dist.destroy_process_group()

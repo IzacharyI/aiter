@@ -588,6 +588,13 @@ class FlyDSLDispatchCombineIntraNodeOp:
 
         # Start at 1: a zero flag would satisfy the first wait and skip the sync.
         self._xdev_flag = torch.ones(1, dtype=torch.int64, device=self._dev)
+        self._analysis_wait_timing = False
+        self._analysis_wait_block_num = 0
+        self._analysis_combine_wait_ticks = torch.zeros(
+            config.max_num_inp_token_per_rank,
+            dtype=torch.int64,
+            device=self._dev,
+        )
 
         _fx_srcs = {
             "_fx_out_tok": self.shmem_disp_out_tok,
@@ -623,6 +630,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
             "_fx_disp_tok_map": self.disp_tok_to_ep_slot_map,
             "_fx_disp_grid_bar": self.disp_grid_bar,
             "_fx_disp_out_wts": self.shmem_disp_out_wts,
+            "_fx_analysis_combine_wait_ticks": self._analysis_combine_wait_ticks,
         }
         for _attr, _src in _fx_srcs.items():
             setattr(self, _attr, fx.Int64(_src.data_ptr()))
@@ -1248,7 +1256,14 @@ class FlyDSLDispatchCombineIntraNodeOp:
             self._fx_p2p_xdb_mem,
         )
         tail = (self._fx_comb_inp_wts, self._fx_comb_out_wts, self._fx_p2p_comb_inp_wts)
-        std = (self._fx_disp_tok_map, self._fx_disp_out_wts)
+        std = (
+            self._fx_disp_tok_map,
+            (
+                self._fx_analysis_combine_wait_ticks
+                if self._analysis_wait_timing
+                else self._fx_disp_out_wts
+            ),
+        )
         compiled = cache.get(key)
         if compiled is None:
             cache[key] = flyc.compile(
@@ -1367,6 +1382,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
             bn,
             wpb,
             bool(skip_stage1),
+            bool(self._analysis_wait_timing),
         )
         fn = self._comb_jit_cache.get(key)
         if fn is None:
@@ -1387,8 +1403,10 @@ class FlyDSLDispatchCombineIntraNodeOp:
                 blockwise_fp8_transport=bool(blockwise_fp8),
                 # Must match dispatch's encoding stride so tok_map decode lines up.
                 max_recv=self._effective_max_recv,
+                analysis_wait_timing=bool(self._analysis_wait_timing),
             )
             self._comb_jit_cache[key] = fn
+        self._analysis_wait_block_num = bn
         self._run_combine_kernel(
             self._comb_compiled_cache,
             key,
@@ -1462,6 +1480,20 @@ class FlyDSLDispatchCombineIntraNodeOp:
             skip_stage1=True,
             stage2_p2p_quant=stage2_p2p_quant,
         )
+
+    def set_analysis_wait_timing(self, enabled: bool) -> None:
+        """Enable the analysis-only Combine cross-rank wait timer."""
+        self._analysis_wait_timing = bool(enabled)
+
+    def reset_analysis_wait_timing(self) -> None:
+        self._analysis_combine_wait_ticks.zero_()
+
+    def get_analysis_wait_timing(self):
+        """Return one 100 MHz peer-wait timer sample per launched Combine block."""
+        torch.cuda.synchronize()
+        return self._analysis_combine_wait_ticks[
+            : self._analysis_wait_block_num
+        ].clone()
 
     def get_dispatch_src_token_pos(self):
         torch.cuda.synchronize()

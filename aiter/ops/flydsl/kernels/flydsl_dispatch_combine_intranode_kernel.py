@@ -34,12 +34,13 @@ from .communication_ops_utils import (
     atomic_add_global_at,
     fence_system_acquire,
     load_i64_global,
+    read_memrealtime,
     store_i32_system,
     store_i64_global_system,
 )
 
 # Bump when generated kernel shape changes.
-_DISPATCH_COMBINE_JIT_SCHEMA_VERSION = "v10-stage2-blockwise-fp8-scale-prefetch"
+_DISPATCH_COMBINE_JIT_SCHEMA_VERSION = "v11-analysis-combine-wait-timer"
 
 # Stage-3 switches from narrow step=64 to wide step=128/256 above this threshold.
 _S3_WIDE_PATH_THRESHOLD_I32 = 895
@@ -435,6 +436,7 @@ def make_combine_kernel(
     fp8_direct_cast: bool = False,
     blockwise_fp8_transport: bool = False,
     max_recv: int | None = None,
+    analysis_wait_timing: bool = False,
 ):
     """Build the intranode combine ``@flyc.kernel``.
 
@@ -459,6 +461,10 @@ def make_combine_kernel(
     if blockwise_fp8_transport and fp8_direct_cast:
         raise ValueError(
             "blockwise_fp8_transport and fp8_direct_cast are mutually exclusive"
+        )
+    if analysis_wait_timing and (not skip_stage1 or enable_weights):
+        raise ValueError(
+            "analysis_wait_timing requires skip_stage1=True and enable_weights=False"
         )
     _xfer_bf16_to_fp8 = fp8_direct_cast
     _transport_dtype = torch.float8_e4m3fn if _xfer_bf16_to_fp8 else data_type
@@ -914,12 +920,30 @@ def make_combine_kernel(
         if grid_thread_id == 0:
             atomic_add_global_at(addr_xdb_flag, fx.Int64(1))
 
-        if tid < npes:
-            xdb_peer_slot = addr_shmem_xdb_mem + fx.Int64(tid) * 8
-            mori_shmem.uint64_wait_until_equals(xdb_peer_slot, xdb_cur_flag)
-            # wait_until_equals' relaxed-system load does not invalidate L2, so a
-            # paired acquire fence is required before Stage 3 reads peer shmem_comb_inp.
-            fence_system_acquire()
+        if const_expr(analysis_wait_timing):
+            if warp == fx.Int32(0):
+                wait_started = read_memrealtime()
+                if tid < npes:
+                    xdb_peer_slot = addr_shmem_xdb_mem + fx.Int64(tid) * 8
+                    mori_shmem.uint64_wait_until_equals(xdb_peer_slot, xdb_cur_flag)
+                    # wait_until_equals' relaxed-system load does not invalidate L2, so a
+                    # paired acquire fence is required before Stage 3 reads peer shmem_comb_inp.
+                    fence_system_acquire()
+                wait_finished = read_memrealtime()
+                if tid == fx.Int32(0):
+                    # Under skip-stage1 + weights-disabled analysis launches,
+                    # addr_inp_disp_wts is reserved as rank-local i64[block_num] stats.
+                    store_i64_global_system(
+                        addr_inp_disp_wts + fx.Int64(bid) * fx.Int64(8),
+                        wait_finished - wait_started,
+                    )
+        else:
+            if tid < npes:
+                xdb_peer_slot = addr_shmem_xdb_mem + fx.Int64(tid) * 8
+                mori_shmem.uint64_wait_until_equals(xdb_peer_slot, xdb_cur_flag)
+                # wait_until_equals' relaxed-system load does not invalidate L2, so a
+                # paired acquire fence is required before Stage 3 reads peer shmem_comb_inp.
+                fence_system_acquire()
 
         fx.barrier()
         if tid == 0:
@@ -1316,6 +1340,7 @@ def make_combine_jit(
     fp8_direct_cast: bool = False,
     blockwise_fp8_transport: bool = False,
     max_recv=None,
+    analysis_wait_timing: bool = False,
 ):
     """Build the JIT launcher for ``make_combine_kernel``. ``data_type`` is the
     external dtype (symmetric I/O); ``fp8_direct_cast`` enables bf16-external /
@@ -1340,6 +1365,7 @@ def make_combine_jit(
         fp8_direct_cast=fp8_direct_cast,
         blockwise_fp8_transport=blockwise_fp8_transport,
         max_recv=max_recv,
+        analysis_wait_timing=analysis_wait_timing,
     )
 
     # JIT cache key (mirrors the dispatch launcher above; keep in sync).
@@ -1352,6 +1378,7 @@ def make_combine_jit(
     _key_skip_s1 = skip_stage1
     _key_fp8_direct_cast = bool(fp8_direct_cast)
     _key_blockwise_fp8_transport = bool(blockwise_fp8_transport)
+    _key_analysis_wait_timing = bool(analysis_wait_timing)
     _key_max_recv = max_recv if max_recv is not None else npes * max_tok_per_rank
     # See dispatch launcher for the ``str(torch.dtype)`` rationale.
     _key_data_type = str(data_type)
@@ -1392,6 +1419,7 @@ def make_combine_jit(
             _key_skip_s1,
             _key_fp8_direct_cast,
             _key_blockwise_fp8_transport,
+            _key_analysis_wait_timing,
             _key_max_recv,
             _key_data_type,
             _key_schema_version,

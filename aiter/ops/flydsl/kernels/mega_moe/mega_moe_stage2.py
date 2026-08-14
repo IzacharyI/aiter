@@ -49,7 +49,7 @@ def _fp8_scale_for_leader(is_leader, local_max):
 # fmt: off
 def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM, BN, npes, topk,
     log2_max_tok, mask_max_tok, recv_cap, comb_inp_nbytes, lds_packed_off, lds_weight_off,
-    lds_peer_off, g2_bf16_lds=False, p2p_quant_type="none"):
+    lds_peer_off, g2_bf16_lds=False, p2p_quant_type="none", analysis_no_p2p_payload=False):
 # fmt: on
     """CShuffle one GEMM2 tile into weighted BF16 rows and scatter them to peers."""
     kMChunks = BM // 16
@@ -212,10 +212,13 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
                 fx.Int32,
             )
             scale_leader = active & ((lane & fx.Int32(3)) == fx.Int32(0))
-            payload_off = (valid & active).select(
-                row_off + col,
-                fx.Int32(comb_inp_nbytes),
-            )
+            if const_expr(analysis_no_p2p_payload):
+                payload_off = fx.Int32(comb_inp_nbytes)
+            else:
+                payload_off = (valid & active).select(
+                    row_off + col,
+                    fx.Int32(comb_inp_nbytes),
+                )
             # Adjacent active lanes issue contiguous 8-byte stores without ds_bpermute gathers.
             buffer_ops.buffer_store(
                 payload.ir_value(),
@@ -228,13 +231,16 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
             @flyc.jit
             def store_scale_if_leader():
                 if scale_leader:
-                    scale_off = valid.select(
-                        row_base
-                        + fx.Int32(N_OUT)
-                        + n_block_idx * fx.Int32(BN // 32)
-                        + lane // fx.Int32(4),
-                        fx.Int32(comb_inp_nbytes),
-                    )
+                    if const_expr(analysis_no_p2p_payload):
+                        scale_off = fx.Int32(comb_inp_nbytes)
+                    else:
+                        scale_off = valid.select(
+                            row_base
+                            + fx.Int32(N_OUT)
+                            + n_block_idx * fx.Int32(BN // 32)
+                            + lane // fx.Int32(4),
+                            fx.Int32(comb_inp_nbytes),
+                        )
                     buffer_ops.buffer_store(
                         e8m0.to(fx.Int8),
                         rsrc_dst,
@@ -245,10 +251,13 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
 
             store_scale_if_leader()
         else:
-            off = (valid & active).select(
-                row_off + col * fx.Int32(out_elem_bytes),
-                fx.Int32(comb_inp_nbytes),
-            )
+            if const_expr(analysis_no_p2p_payload):
+                off = fx.Int32(comb_inp_nbytes)
+            else:
+                off = (valid & active).select(
+                    row_off + col * fx.Int32(out_elem_bytes),
+                    fx.Int32(comb_inp_nbytes),
+                )
             buffer_ops.buffer_store(
                 pk.ir_value(),
                 rsrc_dst,
@@ -273,7 +282,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
     SBM: int | None = None,
     persist: bool = False, cu_num: int = 0, has_pad: bool = False, g2_bhoist=None, g2_ascale_pf=None,
     g2_spart=None, persist_strided: bool = False, g2_bf16_lds: bool = False, p2p_quant_type: str = "none",
-    fixed_slot_dispatch: bool = False, skew_cu: int = 0):
+    fixed_slot_dispatch: bool = False, skew_cu: int = 0, analysis_no_p2p_payload: bool = False):
 # fmt: on
     """Compile fused GEMM2 and weighted cross-rank P2P scatter."""
     arch = str(get_rocm_arch() or "")
@@ -331,6 +340,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
         f"_sk{skew_cu}"
         f"_bh{int(g2_bhoist)}apf{int(g2_ascale_pf)}sp{g2_group_num}x{g2_m01}"
         f"_bf16lds{int(g2_bf16_lds)}_{p2p_quant_type}"
+        f"_np{int(analysis_no_p2p_payload)}"
     )
 
     # fmt: off
@@ -417,7 +427,8 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
                 log2_max_tok=log2_max_tok, mask_max_tok=mask_max_tok, recv_cap=_recv_cap,
                 comb_inp_nbytes=_comb_inp_nbytes, lds_packed_off=lds_packed_off,
                 lds_weight_off=lds_weight_off, lds_peer_off=lds_peer_off, g2_bf16_lds=g2_bf16_lds,
-                p2p_quant_type=p2p_quant_type)
+                p2p_quant_type=p2p_quant_type,
+                analysis_no_p2p_payload=analysis_no_p2p_payload)
             # fmt: on
 
         cumsum0 = global_typed_ptr(arg_cumsum, T.i32)[0]
@@ -536,7 +547,8 @@ def run_mega_moe_stage2(arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_cu
     model_dim, inter_dim, experts, topk, rank, npes, max_tok, recv_cap, comb_inp_nbytes, BM, SBM,
     HIDDEN_MAX, INTER_MAX, cu_num, BN=256, BK=256, use_nt=True, g2_bhoist=True,
     g2_ascale_pf=True, g2_spart=402, persist=False, persist_cu=0, persist_strided=False,
-    g2_bf16_lds=False, p2p_quant_type="none", fixed_slot_dispatch=False, skew_cu=0):
+    g2_bf16_lds=False, p2p_quant_type="none", fixed_slot_dispatch=False, skew_cu=0,
+    analysis_no_p2p_payload=False):
     # fmt: on
     """Compile or reuse one fused Stage2 configuration and launch it."""
     launch_cu_num = min(cu_num, persist_cu) if persist and persist_cu > 0 else cu_num
@@ -547,6 +559,7 @@ def run_mega_moe_stage2(arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_cu
         cu_num=launch_cu_num, g2_bhoist=g2_bhoist, g2_ascale_pf=g2_ascale_pf,
         g2_spart=g2_spart, persist_strided=persist_strided, g2_bf16_lds=g2_bf16_lds,
         p2p_quant_type=p2p_quant_type, fixed_slot_dispatch=fixed_slot_dispatch, skew_cu=skew_cu,
+        analysis_no_p2p_payload=analysis_no_p2p_payload,
     )
     max_m_blocks = (row_capacity + BM - 1) // BM
     grid_blocks = launch_cu_num if persist else max_m_blocks

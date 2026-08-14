@@ -66,6 +66,7 @@ class Stage2Config:
     ascale_prefetch: bool = True
     spatial_partition: int = 402
     bf16_lds: bool = False
+    analysis_no_p2p_payload: bool = False
 
 
 @dataclass(frozen=True, slots=True)
