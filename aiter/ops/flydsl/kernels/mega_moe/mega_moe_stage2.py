@@ -288,12 +288,21 @@ def make_stage2_body_emitter(*, BK, BM, BN, INTER_MAX, KH_TILE_A, N_OUT, SBM, Sh
     block index *within the Stage2 role*, numbered from 0.
     """
     # fmt: off
-    def emit_stage2_body(*, tx_i32, bx_i32, lane, wave, arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_cumsum, arg_max_expert_tiles, arg_stids, arg_sweights, arg_trb, arg_p2p_comb_inp, i32_max_m_blocks, i32_inter, i32_hidden, i32_kpad, i32_npad):
+    def emit_stage2_body(*, tx_i32, bx_i32, lane, wave, arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_cumsum, arg_max_expert_tiles, arg_stids, arg_sweights, arg_trb, arg_p2p_comb_inp, i32_max_m_blocks, i32_inter, i32_hidden, i32_kpad, i32_npad, lds_slab=None):
     # fmt: on
+        # FlyDSL permits one SharedAllocator per kernel, so the fused GEMM2+combine
+        # kernel allocates a single slab for both roles and passes Stage2's field in
+        # as ``lds_slab``. It must expose ``buf`` with at least ``lds_bytes``.
+        _slab = (
+            fx.SharedAllocator().allocate(SharedStorage).peek()
+            if lds_slab is None
+            else lds_slab
+        )
+        _lds_base_i32 = fx.Int32(fx.ptrtoint(_slab.buf.ptr))
+
         @flyc.jit
         def _emit_stage2_body():
-            lds = fx.SharedAllocator().allocate(SharedStorage).peek()
-            lds_base_i32 = fx.Int32(fx.ptrtoint(lds.buf.ptr))
+            lds_base_i32 = _lds_base_i32
 
             num_n_blocks = fx.Int32(i32_hidden) // fx.Int32(BN)
             k_bytes = fx.Int32(i32_inter) // fx.Int32(1 if is_f8 else 2)

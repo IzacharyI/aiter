@@ -2,6 +2,9 @@
 # Copyright (c) 2025 FlyDSL Project Contributors
 """MegaMoE v2 fused dispatch, GEMM1, GEMM2, and combine implementation."""
 
+import os
+from dataclasses import replace
+
 import flydsl.expr as fx
 import mori.shmem as ms
 import torch
@@ -217,6 +220,12 @@ class MegaMoEV2:
             model_dim=self.model_dim,
             inter_dim=self.inter_dim,
         )
+        # A/B knob for the opt-in single-grid Stage2+combine path. No route table
+        # entry sets fuse_combine yet; this is how the fused kernel gets measured.
+        if os.environ.get("AITER_MEGAMOE_FUSE_S2C") == "1" and config.stage2.persist:
+            config = replace(
+                config, stage2=replace(config.stage2, fuse_combine=True)
+            )
         self._active_config = config
         return config
 
@@ -340,6 +349,64 @@ class MegaMoEV2:
         self._g2_combine_placeholder = torch.empty(
             1, comb_cfg.hidden_dim, dtype=comb_cfg.combine_dtype, device=dev
         )
+        # [0] Stage2 block completion count, [1] combine block arrival count. The
+        # fused kernel clears both before it returns, so one buffer serves every
+        # launch; zeroed once here.
+        from .mega_moe_fused_s2c import FUSED_S2C_WORKSPACE_I32
+
+        self._fused_s2c_ws = torch.zeros(
+            FUSED_S2C_WORKSPACE_I32, dtype=torch.int32, device=dev
+        )
+        self._fx_fused_s2c_ws = fx.Int64(self._fused_s2c_ws.data_ptr())
+        self._g2_cu_num = int(cu_num)
+
+    def _run_fused_s2c(self, run_tokens, config: MegaMoEConfig, s_fx):
+        """Opt-in single-grid Stage2+combine (mega_moe_fused_s2c)."""
+        from .mega_moe_fused_s2c import get_fused_s2c_launch, run_mega_moe_fused_s2c
+
+        comb_op = self.comb_op
+        op = self._s1_op
+        stage2 = config.stage2
+        invariants = dict(self._g2_invariants_by_quant[config.p2p_quant])
+        cu_num = invariants.pop("cu_num")
+        launch_cu_num = min(cu_num, stage2.persist_cu) if stage2.persist_cu > 0 else cu_num
+        num_n_blocks = self._g2v2_hidden // stage2.block_n
+        # Sweep knob for the fused combine role's block count. Its tuned standalone
+        # geometry (128 blocks x 16 waves) is unavailable here because both roles
+        # must share Stage2's 4-wave block, so the block count has to be re-tuned.
+        _bn_env = os.environ.get("AITER_MEGAMOE_FUSE_COMB_BN")
+        comb_ptrs, comb_meta = comb_op.fused_s2c_combine_context(
+            run_tokens, comb_block_num=int(_bn_env) if _bn_env else None
+        )
+        launch = get_fused_s2c_launch(
+            s2_total_blocks=launch_cu_num * num_n_blocks,
+            comb_block_num=comb_meta["comb_block_num"],
+            combine_hidden_elem_size=comb_meta["combine_hidden_elem_size"],
+            combine_max_recv=comb_meta["combine_max_recv"],
+            combine_data_type=comb_meta["combine_data_type"],
+            BM=stage2.block_m, SBM=config.stage1.sort_block_m, BN=stage2.block_n,
+            BK=stage2.block_k, use_nt=stage2.use_nt, g2_bhoist=stage2.b_hoist,
+            g2_ascale_pf=stage2.ascale_prefetch, g2_spart=stage2.spatial_partition,
+            persist=True, cu_num=launch_cu_num, persist_strided=stage2.persist_strided,
+            skew_cu=stage2.skew_cu, g2_bf16_lds=stage2.bf16_lds,
+            analysis_no_p2p_payload=stage2.analysis_no_p2p_payload, **invariants,
+        )
+        max_m_blocks = (self._s1_nvm + stage2.block_m - 1) // stage2.block_m
+        # fmt: off
+        run_mega_moe_fused_s2c(launch, (
+            fx.Int64(self._s1_out.view(-1).data_ptr()), fx.Int64(self._s1_osd.data_ptr()),
+            fx.Int64(self.w2.data_ptr()), fx.Int64(self.w2_scale.data_ptr()),
+            fx.Int64(op.sorted_expert_ids.data_ptr()), fx.Int64(op.num_valid.data_ptr()),
+            fx.Int64(self._s1_dispatch_workspace["max_expert_tiles"].data_ptr()),
+            fx.Int64(op.srcmap_em.data_ptr()), fx.Int64(op.wts_em.data_ptr()),
+            fx.Int64(op.tile_row_base.data_ptr()), comb_op._fx_p2p_comb_inp,
+            *comb_ptrs, self._fx_fused_s2c_ws,
+            fx.Int32(max_m_blocks), fx.Int32(self._g2v2_inter), fx.Int32(self._g2v2_hidden),
+            fx.Int32(0), fx.Int32(0), fx.Int32(comb_meta["cur_tok"]),
+        ), s_fx)
+        # fmt: on
+        self._g2_active_block_m = stage2.block_m
+        return comb_op.fused_s2c_output()
 
     def _run_fused_stage2(self, run_tokens, config: MegaMoEConfig, stream=None):
         comb_op = self.comb_op
@@ -350,6 +417,8 @@ class MegaMoEV2:
         stage2 = config.stage2
         p2p_quant = config.p2p_quant
         invariants = self._g2_invariants_by_quant[p2p_quant]
+        if stage2.fuse_combine:
+            return self._run_fused_s2c(run_tokens, config, s_fx)
         # fmt: off
         self._g2_run(
             fx.Int64(self._s1_out.view(-1).data_ptr()), fx.Int64(self._s1_osd.data_ptr()),

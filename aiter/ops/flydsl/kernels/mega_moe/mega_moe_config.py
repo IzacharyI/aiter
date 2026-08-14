@@ -67,6 +67,11 @@ class Stage2Config:
     spatial_partition: int = 402
     bf16_lds: bool = False
     analysis_no_p2p_payload: bool = False
+    # Opt-in: emit Stage2 and combine into one grid (mega_moe_fused_s2c). Off by
+    # default -- the merge costs the combine role its tuned 16-wave geometry and
+    # currently only saves the second launch, so it must win a measured A/B before
+    # any route selects it. Requires persist=True.
+    fuse_combine: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +91,8 @@ class MegaMoEConfig:
             raise ValueError(f"unsupported p2p_quant={self.p2p_quant!r}")
         if self.p2p_quant != "none" and self.stage2.bf16_lds:
             raise ValueError("FP8 P2P requires Stage2 bf16_lds=False")
+        if self.stage2.fuse_combine and not self.stage2.persist:
+            raise ValueError("Stage2 fuse_combine requires persist=True")
 
 
 def nearest_token_bucket(tokens: int) -> int:

@@ -1239,6 +1239,59 @@ class FlyDSLDispatchCombineIntraNodeOp:
             )
         return cur_tok
 
+    def fused_s2c_combine_context(self, cur_tok, comb_block_num=None):
+        """Combine-half inputs for the fused Stage2+combine kernel.
+
+        Returns ``(ptr_args, meta)``. ``ptr_args`` is the combine pointer tuple in
+        ``mega_moe_fused_s2c.compile_mega_moe_fused_s2c``'s kernel-argument order;
+        ``meta`` carries the compile-time combine constants and the resolved token
+        count. The fused kernel runs the ``skip_stage1`` / no-weights / no-zero-copy
+        contract, so the weight and Stage-1 pointers are the compiled-out ones.
+        """
+        cfg = self.cfg
+        if cfg.zero_copy:
+            raise ValueError("fused Stage2+combine does not support zero_copy")
+        if cfg.enable_std_moe:
+            raise ValueError("fused Stage2+combine does not support std-MoE")
+        bn = int(comb_block_num or cfg.combine_block_num or _DEFAULT_COMBINE_BLOCK_NUM)
+        _check_block_num_resident("fused combine", bn)
+        ptr_args = (
+            self._fx_comb_inp,
+            self._fx_comb_out,
+            self._fx_xdb_mem,
+            self._fx_xdev_flag,
+            self._fx_tok_map,
+            self._fx_comb_bar,
+            self._fx_trecv,
+            self._fx_p2p_xdb_mem,
+            self._fx_comb_out_wts,
+            self._fx_disp_out_wts,
+        )
+        meta = {
+            "comb_block_num": bn,
+            "combine_data_type": cfg.combine_dtype,
+            "combine_hidden_elem_size": torch.tensor(
+                [], dtype=cfg.combine_dtype
+            ).element_size(),
+            "combine_max_recv": self._effective_max_recv,
+            "cur_tok": self._resolve_cur_tok(cur_tok, "fused_s2c_combine_context()"),
+        }
+        return ptr_args, meta
+
+    def fused_s2c_output(self):
+        """The combine output views the fused kernel wrote (matches combine())."""
+        cfg = self.cfg
+        mt = cfg.max_num_inp_token_per_rank
+        c_dtype = cfg.combine_dtype
+        out_token_bytes = _token_bytes_for(c_dtype, cfg.hidden_dim)
+        out_view_dim = _token_view_dim_for(c_dtype, cfg.hidden_dim)
+        out_tok = (
+            self.shmem_comb_out_tok.view(torch.int8)[: mt * out_token_bytes]
+            .view(c_dtype)
+            .view(mt, out_view_dim)
+        )
+        return out_tok, self.shmem_comb_out_wts.view(mt, cfg.num_experts_per_token)
+
     def _run_combine_kernel(
         self, cache, key, fn, inp_ptr, wts_ptr, prx_ptr, cur_tok, stream
     ):
