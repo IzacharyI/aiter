@@ -648,7 +648,8 @@ def emit_combine_barrier_and_reduce(spec, *, rank, npes, experts_per_token, max_
     analysis_wait_timing, tid, bid, lane, warp, grid_thread_id, global_warp_id, global_warp_num,
     addr_shmem_tok, addr_out_shmem_tok, addr_shmem_xdb_mem, addr_xdb_flag, addr_comb_bar,
     addr_shmem_wts, addr_out_shmem_wts, addr_inp_disp_wts, cur_rank_num_token, xdb_cur_flag,
-    r_comb_bar, r_trecv, r_p2p_xdb, rsrc_tok_map, lds_p2p_bases, lds_p2p_wt_bases, maybe_load):
+    r_comb_bar, r_trecv, r_p2p_xdb, rsrc_tok_map, lds_p2p_bases, lds_p2p_wt_bases, maybe_load,
+    tok_ready_addr=None, tok_ready_expected=0):
 # fmt: on
     """Emit combine's cross-device barrier (Stage 2) + local reduction (Stage 3/3b).
 
@@ -657,6 +658,15 @@ def emit_combine_barrier_and_reduce(spec, *, rank, npes, experts_per_token, max_
     ``addr_comb_bar`` -- in the fused kernel that is the combine-role block count, not the
     whole grid. ``bid``/``grid_thread_id``/``global_warp_id`` must likewise be numbered
     within the participating set, starting at 0.
+
+    ``tok_ready_addr`` switches Stage 2 from the all-rank readiness barrier to per-token
+    readiness: instead of every rank waiting for every peer to finish its whole Stage2,
+    each Stage 3 work item waits only for its own token's ``tok_ready_expected``
+    contributions. The peer-flag wait is dropped; the rank-local block barrier and the
+    cross-device flag bookkeeping are kept so the two paths stay state-compatible. Stage 3
+    then reads the payload system-scope (``sc0 sc1``) rather than paying an acquire fence
+    per token -- an acquire would lower to an L2 invalidate, and the payload is streamed
+    once, so bypassing L2 costs nothing and an invalidate would cost the whole cache.
     """
     # Unpacked under the original local names so the emitted body stays verbatim.
     _r_comb_bar = r_comb_bar
@@ -698,14 +708,19 @@ def emit_combine_barrier_and_reduce(spec, *, rank, npes, experts_per_token, max_
             # ``addr_comb_bar``; makes Stage 1 P2P writes visible.
             fence_system_acquire()
             buffer_store(fx.Int32(0), _r_comb_bar, 0)
-            xdb_remote_addr = (
-                buffer_load(_r_p2p_xdb, grid_thread_id, vec_width=1, dtype=T.i64)
-                + fx.Int64(rank) * 8
-            )
-            store_i64_global_system(xdb_remote_addr, xdb_cur_flag)
+            # Under per-token readiness the epoch flag means "I have finished this
+            # iteration and reset my arrival counters", so it must be published
+            # after the reduction, not here; the caller emits it.
+            if const_expr(tok_ready_addr is None):
+                xdb_remote_addr = (
+                    buffer_load(_r_p2p_xdb, grid_thread_id, vec_width=1, dtype=T.i64)
+                    + fx.Int64(rank) * 8
+                )
+                store_i64_global_system(xdb_remote_addr, xdb_cur_flag)
 
-        if grid_thread_id == 0:
-            atomic_add_global_at(addr_xdb_flag, fx.Int64(1))
+        if const_expr(tok_ready_addr is None):
+            if grid_thread_id == 0:
+                atomic_add_global_at(addr_xdb_flag, fx.Int64(1))
 
         if const_expr(analysis_wait_timing):
             if warp == fx.Int32(0):
@@ -724,7 +739,7 @@ def emit_combine_barrier_and_reduce(spec, *, rank, npes, experts_per_token, max_
                         addr_inp_disp_wts + fx.Int64(bid) * fx.Int64(8),
                         wait_finished - wait_started,
                     )
-        else:
+        elif const_expr(tok_ready_addr is None):
             if tid < npes:
                 xdb_peer_slot = addr_shmem_xdb_mem + fx.Int64(tid) * 8
                 mori_shmem.uint64_wait_until_equals(xdb_peer_slot, xdb_cur_flag)
@@ -739,6 +754,9 @@ def emit_combine_barrier_and_reduce(spec, *, rank, npes, experts_per_token, max_
         # Stage 3: local read + WarpAccum. hidden-dim splits into warps_per_tok
         # partitions; each warp reduces k partials in f32 -> shmem_comb_out.
         SLC_CACHE = _SLC_CACHE
+        # sc0|sc1 on the payload loads: per-token readiness has no acquire fence to
+        # pair with, so the reads themselves must be system-scope.
+        IN_CACHE = (_SLC_CACHE | 1 | 16) if tok_ready_addr is not None else _SLC_CACHE
         rsrc_out = create_buffer_resource_from_addr(addr_out_shmem_tok)
 
         n_elems = n_i32
@@ -760,6 +778,19 @@ def emit_combine_barrier_and_reduce(spec, *, rank, npes, experts_per_token, max_
             tok_id = s3_work_idx // warps_per_tok
             part_id = s3_work_idx % warps_per_tok
             hdim_off = part_id * hdim_per_warp
+
+            if const_expr(tok_ready_addr is not None):
+                # Lane 0 polls; the rest of the wave cannot reconverge past the guard,
+                # so the whole warp is held until this token's partials have landed.
+                @flyc.jit
+                def _wait_tok_ready(tok_id=tok_id):
+                    if lane == fx.Int32(0):
+                        mori_shmem.int32_wait_until_equals(
+                            tok_ready_addr + fx.Int64(tok_id) * fx.Int64(4),
+                            fx.Int32(tok_ready_expected),
+                        )
+
+                _wait_tok_ready()
 
             expert_rsrcs = []
             expert_scale_rsrcs = []
@@ -837,7 +868,7 @@ def emit_combine_barrier_and_reduce(spec, *, rank, npes, experts_per_token, max_
                         kw = {
                             "vec_width": 1,
                             "dtype": T.i32,
-                            "cache_modifier": SLC_CACHE,
+                            "cache_modifier": IN_CACHE,
                         }
                         if u > 0:
                             kw["soffset_bytes"] = u * 256
@@ -852,7 +883,7 @@ def emit_combine_barrier_and_reduce(spec, *, rank, npes, experts_per_token, max_
                                     vld_k,
                                     vec_width=1,
                                     dtype=T.i8,
-                                    cache_modifier=SLC_CACHE,
+                                    cache_modifier=IN_CACHE,
                                 )
                                 sc_i32 = (
                                     fx.Uint8(sc_raw).to(fx.Uint32).bitcast(fx.Int32)

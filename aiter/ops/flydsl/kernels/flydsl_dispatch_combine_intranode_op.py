@@ -570,6 +570,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
             "_p2p_comb_inp": self.shmem_comb_inp_tok,
             "_p2p_comb_inp_wts": self.shmem_comb_inp_wts,
             "_p2p_xdb_mem": self.shmem_xdev_bar_mem,
+            "_p2p_tok_ready": self.shmem_tok_ready,
         }
         for _attr, _src in _p2p_srcs.items():
             setattr(self, _attr, build_p2p_table(_src, r, npes, self._dev))
@@ -623,6 +624,8 @@ class FlyDSLDispatchCombineIntraNodeOp:
             "_fx_p2p_comb_inp": self._p2p_comb_inp,
             "_fx_p2p_comb_inp_wts": self._p2p_comb_inp_wts,
             "_fx_p2p_xdb_mem": self._p2p_xdb_mem,
+            "_fx_p2p_tok_ready": self._p2p_tok_ready,
+            "_fx_tok_ready": self.shmem_tok_ready,
             "_fx_comb_inp_wts": self.shmem_comb_inp_wts,
             "_fx_comb_out_wts": self.shmem_comb_out_wts,
             "_fx_packed_recv_count": self.packed_recv_count,
@@ -703,12 +706,23 @@ class FlyDSLDispatchCombineIntraNodeOp:
         self.shmem_comb_out_tok = mori_shmem_create_tensor((tok_i16_mt,), torch.int16)
         self.shmem_comb_out_wts = mori_shmem_create_tensor((mt * k,), torch.float32)
         self.shmem_xdev_bar_mem = mori_shmem_create_tensor((npes,), torch.int64)
+        # Per-destination-token arrival counters for the fused Stage2+combine
+        # kernel's per-token readiness edge: a peer's Stage2 adds one per source
+        # row it has published for our token ``t`` into ``shmem_tok_ready[t]``,
+        # and combine's Stage 3 waits for ``topk`` before reducing that token.
+        # Unused (and untouched) by the two-launch path. Element ``mt`` is the tail
+        # slot that kernel's end-of-iteration epoch barrier counts arrivals in; it
+        # lives here because the barrier needs a symmetric-heap address to target
+        # with remote atomics, and this is the array whose peer bases the kernel
+        # already carries.
+        self.shmem_tok_ready = mori_shmem_create_tensor((mt + 8,), torch.int32)
 
         # shmem_malloc is uninitialized; zero what combine reads.
         self.shmem_tok_id_to_src.zero_()
         self.shmem_comb_inp_tok.zero_()
         self.shmem_comb_inp_wts.zero_()
         self.shmem_xdev_bar_mem.zero_()
+        self.shmem_tok_ready.zero_()
 
         self.dest_pe_ctr = torch.zeros(npes, dtype=torch.int32, device=self._dev)
         self.disp_bar = torch.zeros(1, dtype=torch.int32, device=self._dev)

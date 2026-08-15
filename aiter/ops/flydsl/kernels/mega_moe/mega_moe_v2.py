@@ -358,6 +358,15 @@ class MegaMoEV2:
             FUSED_S2C_WORKSPACE_I32, dtype=torch.int32, device=dev
         )
         self._fx_fused_s2c_ws = fx.Int64(self._fused_s2c_ws.data_ptr())
+        # Per-m-tile completion counters for the per-token-readiness variant: the
+        # Stage2 block that observes the last of an m-tile's ``num_n_blocks``
+        # column stripes is the one that publishes that tile's rows to the peers.
+        # Sized by the worst case ``BM == 1``; the fused kernel clears it before
+        # returning, so one buffer serves every launch.
+        self._fused_mtile_ctr = torch.zeros(
+            max(1, self._s1_nvm), dtype=torch.int32, device=dev
+        )
+        self._fx_fused_mtile_ctr = fx.Int64(self._fused_mtile_ctr.data_ptr())
         self._g2_cu_num = int(cu_num)
 
     def _run_fused_s2c(self, run_tokens, config: MegaMoEConfig, s_fx):
@@ -375,6 +384,11 @@ class MegaMoEV2:
         # geometry (128 blocks x 16 waves) is unavailable here because both roles
         # must share Stage2's 4-wave block, so the block count has to be re-tuned.
         _bn_env = os.environ.get("AITER_MEGAMOE_FUSE_COMB_BN")
+        # Per-token readiness (M1.5): Stage2 publishes per-destination-token arrival
+        # counts as each m-tile closes and combine waits per token, instead of the
+        # all-rank Stage2-complete handshake. Only progressive at token counts where
+        # a persistent block owns more than one m-tile, so it stays opt-in.
+        _tok_ready = os.environ.get("AITER_MEGAMOE_FUSE_TOK_READY") == "1"
         comb_ptrs, comb_meta = comb_op.fused_s2c_combine_context(
             run_tokens, comb_block_num=int(_bn_env) if _bn_env else None
         )
@@ -389,7 +403,8 @@ class MegaMoEV2:
             g2_ascale_pf=stage2.ascale_prefetch, g2_spart=stage2.spatial_partition,
             persist=True, cu_num=launch_cu_num, persist_strided=stage2.persist_strided,
             skew_cu=stage2.skew_cu, g2_bf16_lds=stage2.bf16_lds,
-            analysis_no_p2p_payload=stage2.analysis_no_p2p_payload, **invariants,
+            analysis_no_p2p_payload=stage2.analysis_no_p2p_payload,
+            per_token_ready=_tok_ready, **invariants,
         )
         max_m_blocks = (self._s1_nvm + stage2.block_m - 1) // stage2.block_m
         # fmt: off
@@ -401,6 +416,7 @@ class MegaMoEV2:
             fx.Int64(op.srcmap_em.data_ptr()), fx.Int64(op.wts_em.data_ptr()),
             fx.Int64(op.tile_row_base.data_ptr()), comb_op._fx_p2p_comb_inp,
             *comb_ptrs, self._fx_fused_s2c_ws,
+            comb_op._fx_p2p_tok_ready, comb_op._fx_tok_ready, self._fx_fused_mtile_ctr,
             fx.Int32(max_m_blocks), fx.Int32(self._g2v2_inter), fx.Int32(self._g2v2_hidden),
             fx.Int32(0), fx.Int32(0), fx.Int32(comb_meta["cur_tok"]),
         ), s_fx)

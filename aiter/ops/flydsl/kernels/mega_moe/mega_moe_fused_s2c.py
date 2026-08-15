@@ -32,6 +32,21 @@ kernel's speed and the combine role costs about what the standalone combine
 kernel does even at 4 waves, but publishing completion from every Stage2 block
 adds ~30-60 us that the kernel boundary used to provide for free. Only per-token
 readiness, which lets combine start inside Stage2's shadow, can pay that back.
+
+``AITER_MEGAMOE_FUSE_TOK_READY=1`` is that per-token variant, and measured, it
+does *not* pay it back: rank-max stage2+combine is 0.2698 ms at 512 uniform and
+0.3561 at 512 skew against 0.2332/0.2942 for the two-launch path with
+write-through P2P, and 2.6712 vs 2.5518 at 8192 skew. Two structural reasons,
+both worth carrying into the next milestone. At 512 there is nothing to overlap:
+``tiles_per_slot == 1``, so a persistent block finishes its single m-tile and the
+readiness edge can only add cost. At 8192 there are ~7 m-tiles per slot, but
+``n_block = bx % num_n_blocks`` is fixed for a block's whole life, so every one
+of a tile's column stripes completes at nearly the same time and the arrival
+counters go from 0 to topk in a burst -- the progressive readiness the design
+wanted does not exist at this granularity. On top of that the variant is not yet
+live: at 8192 it still wedges intermittently after a handful of iterations. It
+therefore stays opt-in and default-off, and it must not be enabled until that is
+resolved; what it is good for today is the evidence above.
 """
 
 import os
@@ -39,7 +54,7 @@ import os
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import mori.ir.flydsl as mori_shmem
-from flydsl.expr import range_constexpr, rocdl
+from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import Int8, T
 
 from aiter.ops.flydsl.kernels.buffer_ops import (
@@ -49,6 +64,7 @@ from aiter.ops.flydsl.kernels.buffer_ops import (
 
 from ..communication_ops_utils import (
     atomic_add_agent,
+    atomic_add_system,
     atomic_add_global_at,
     fence_release,
     fence_system_acquire,
@@ -81,7 +97,13 @@ _FUSED_WARPS_PER_BLOCK = _FUSED_BLOCK_THREADS // 64
 _S2_DONE_SHARDS = 64
 _S2_ACK_SLOT = _S2_DONE_SHARDS
 _S2_GO_SLOT = _S2_DONE_SHARDS + 1
-FUSED_S2C_WORKSPACE_I32 = _S2_DONE_SHARDS + 2
+# Launch counter for the per-token path's epoch barrier. It has to be private to
+# this kernel: ``addr_xdb_flag`` is the dispatch/combine op's shared cross-device
+# barrier flag and is stepped by other kernels too, so deriving an arrival target
+# from it would ask for a count that never arrives.
+_S2_EPOCH_SLOT = _S2_DONE_SHARDS + 2
+_S2_RESET_SLOTS = _S2_DONE_SHARDS + 2
+FUSED_S2C_WORKSPACE_I32 = _S2_DONE_SHARDS + 3
 
 # Attribution knob, analysis only -- the kernel produces wrong output when it is
 # set. ``nocomb`` keeps the readiness edge but drops the combine work; ``nosig``
@@ -89,6 +111,19 @@ FUSED_S2C_WORKSPACE_I32 = _S2_DONE_SHARDS + 2
 # the fused kernel's time three ways, which is how the fence-scope and counter-
 # sharding costs below were measured.
 _DIAG = os.environ.get("AITER_MEGAMOE_FUSE_DIAG", "")
+
+# Per-token-readiness diagnostic, analysis only: publish the arrival counters but
+# neither wait on them nor clear them, so the host can read the per-token counts
+# back after a launch. Output is wrong under this knob (combine reduces whatever
+# has landed); it exists to tell an undershooting counter from an overshooting one.
+_TOKRDY_DEBUG = os.environ.get("AITER_MEGAMOE_TOKRDY_DEBUG") == "1"
+
+# Bisection knob, analysis only: keep the per-token waits and the end-of-kernel
+# reset but drop the inter-iteration epoch barrier. Back-to-back iterations are
+# then unsynchronised and may read stale payload, so this is not a correctness
+# configuration; it exists to tell a hang in the barrier from a hang in the
+# per-token wait.
+_TOKRDY_NOEPOCH = os.environ.get("AITER_MEGAMOE_TOKRDY_NOEPOCH") == "1"
 
 
 # fmt: off
@@ -100,7 +135,8 @@ def compile_mega_moe_fused_s2c(*, s2_total_blocks: int, comb_block_num: int,
     a_dtype: str = "fp8", SBM: int | None = None, persist: bool = False, cu_num: int = 0,
     has_pad: bool = False, g2_bhoist=None, g2_ascale_pf=None, g2_spart=None,
     persist_strided: bool = False, g2_bf16_lds: bool = False, p2p_quant_type: str = "none",
-    fixed_slot_dispatch: bool = False, skew_cu: int = 0, analysis_no_p2p_payload: bool = False):
+    fixed_slot_dispatch: bool = False, skew_cu: int = 0, analysis_no_p2p_payload: bool = False,
+    per_token_ready: bool = False):
 # fmt: on
     """Compile the single-grid Stage2+combine kernel and return its launcher.
 
@@ -129,6 +165,7 @@ def compile_mega_moe_fused_s2c(*, s2_total_blocks: int, comb_block_num: int,
         persist_strided=persist_strided, g2_bf16_lds=g2_bf16_lds,
         p2p_quant_type=p2p_quant_type, fixed_slot_dispatch=fixed_slot_dispatch,
         skew_cu=skew_cu, analysis_no_p2p_payload=analysis_no_p2p_payload,
+        publish_tok_ready=per_token_ready,
     )
     BN = consts["BN"]
     emit_stage2_body = make_stage2_body_emitter(**consts)
@@ -149,13 +186,17 @@ def compile_mega_moe_fused_s2c(*, s2_total_blocks: int, comb_block_num: int,
     # FlyDSL allows one SharedAllocator per kernel, so both roles share one slab.
     # The roles never run in the same block, so the fields could overlap; they are
     # kept disjoint because the combine half is only npes*16 bytes.
-    s2_lds_bytes = consts["lds_peer_off"] + npes * 8
+    s2_lds_bytes = consts["lds_ready_off"] + (npes * 8 + 16 if per_token_ready else 0)
 
     @fx.struct
     class FusedSharedStorage:
         buf: fx.Array[Int8, s2_lds_bytes, 16]
         p2p_bases: fx.Array[fx.Int64, npes, 16]
+        ack: fx.Array[fx.Int32, 4, 16]
 
+    # The per-token arrival array is allocated with a tail past ``max_tok``; its
+    # first tail element is the epoch-barrier counter (see the barrier below).
+    _EPOCH_CTR_OFF = int(max_tok) * 4
     S2_TOTAL = int(s2_total_blocks)
     _SHARD_BASE = S2_TOTAL // _S2_DONE_SHARDS
     _SHARD_REM = S2_TOTAL % _S2_DONE_SHARDS
@@ -172,6 +213,7 @@ def compile_mega_moe_fused_s2c(*, s2_total_blocks: int, comb_block_num: int,
         addr_xdb_flag: fx.Int64, addr_inp_tok_map: fx.Int64, addr_comb_bar: fx.Int64,
         addr_inp_total_recv: fx.Int64, addr_p2p_xdb_mem: fx.Int64, addr_out_shmem_wts: fx.Int64,
         addr_inp_disp_wts: fx.Int64, addr_s2_done: fx.Int64,
+        arg_p2p_tok_ready: fx.Int64, addr_tok_ready: fx.Int64, arg_mtile_ctr: fx.Int64,
         i32_max_m_blocks: fx.Int32, i32_inter: fx.Int32, i32_hidden: fx.Int32, i32_kpad: fx.Int32,
         i32_npad: fx.Int32, cur_rank_num_token: fx.Int32):
     # fmt: on
@@ -191,6 +233,7 @@ def compile_mega_moe_fused_s2c(*, s2_total_blocks: int, comb_block_num: int,
                 arg_sweights=arg_sweights, arg_trb=arg_trb, arg_p2p_comb_inp=arg_p2p_comb_inp,
                 i32_max_m_blocks=i32_max_m_blocks, i32_inter=i32_inter, i32_hidden=i32_hidden,
                 i32_kpad=i32_kpad, i32_npad=i32_npad, lds_slab=_lds,
+                arg_p2p_tok_ready=arg_p2p_tok_ready, arg_mtile_ctr=arg_mtile_ctr,
             )
             # Publish this block's completion.
             #
@@ -203,7 +246,7 @@ def compile_mega_moe_fused_s2c(*, s2_total_blocks: int, comb_block_num: int,
             # acknowledged by its XCD's L2 before the counter moves. Getting those
             # lines out of the per-XCD L2s then costs one writeback per combine
             # block instead of one per Stage2 block (see below).
-            if _DIAG != "nosig":
+            if _DIAG != "nosig" and not per_token_ready:
                 # Every wave runs the fence: ``s_waitcnt vmcnt(0)`` is per-wave, and
                 # ``s_barrier`` does not wait on memory, so fencing only in wave 0
                 # would leave the other three waves' payload stores unordered.
@@ -230,7 +273,7 @@ def compile_mega_moe_fused_s2c(*, s2_total_blocks: int, comb_block_num: int,
             # blocks poll all shards is measurably worse: the poll loop's
             # uncached loads contend with the Stage2 blocks' completion atomics
             # on the very lines they are updating.
-            if _DIAG != "nosig":
+            if _DIAG != "nosig" and not per_token_ready:
                 if cb == fx.Int32(0):
                     if tid < fx.Int32(_S2_DONE_SHARDS):
                         shard_target = fx.Int32(_SHARD_BASE) + (
@@ -250,7 +293,11 @@ def compile_mega_moe_fused_s2c(*, s2_total_blocks: int, comb_block_num: int,
             fx.barrier()
             # wait_until_equals uses a relaxed system load that does not invalidate
             # L2, so the acquire is required before reading anything it guards.
-            fence_system_acquire()
+            # Per-token readiness has nothing to acquire here -- it waits per token
+            # and reads the payload system-scope -- and an acquire would invalidate
+            # the whole L2 for nothing.
+            if const_expr(not per_token_ready):
+                fence_system_acquire()
 
             # The system-scope release for the whole Stage2 half. In the two-kernel
             # path this came free from Stage2's kernel-end release; here it must be
@@ -261,20 +308,24 @@ def compile_mega_moe_fused_s2c(*, s2_total_blocks: int, comb_block_num: int,
             # XCD's L2 only. Every combine block issues it, and blocks are dealt
             # round-robin across the 8 XCDs, so all eight L2s are written back
             # before the grid-wide ``comb_bar`` barrier inside the emitter below.
-            if tid == fx.Int32(0):
-                fence_system_release()
-            fx.barrier()
+            # Write-through payload stores (per-token readiness) are already
+            # system-visible, so there is nothing to write back.
+            if const_expr(not per_token_ready):
+                if tid == fx.Int32(0):
+                    fence_system_release()
+                fx.barrier()
 
             # Arrive-and-clear: every combine block has passed the wait by the time
             # the last one arrives, so that block resets both counters for the next
             # launch (stream ordering keeps the next Stage2 out of the way).
-            if tid == fx.Int32(0):
-                prev_ack = atomic_add_global_at(
-                    addr_s2_done + fx.Int64(_S2_ACK_SLOT * 4), fx.Int32(1)
-                )
-                if prev_ack == fx.Int32(COMB_BLOCKS - 1):
-                    for _slot in range_constexpr(FUSED_S2C_WORKSPACE_I32):
-                        store_i32_system(addr_s2_done, _slot, fx.Int32(0))
+            if const_expr(not per_token_ready):
+                if tid == fx.Int32(0):
+                    prev_ack = atomic_add_global_at(
+                        addr_s2_done + fx.Int64(_S2_ACK_SLOT * 4), fx.Int32(1)
+                    )
+                    if prev_ack == fx.Int32(COMB_BLOCKS - 1):
+                        for _slot in range_constexpr(_S2_RESET_SLOTS):
+                            store_i32_system(addr_s2_done, _slot, fx.Int32(0))
 
             # DIAG-ONLY: attribute fused-kernel time between the two roles.
             if _DIAG not in ("nocomb", "nosig"):
@@ -290,6 +341,10 @@ def compile_mega_moe_fused_s2c(*, s2_total_blocks: int, comb_block_num: int,
                 _rsrc_tok_map = create_buffer_resource_from_addr(addr_inp_tok_map)
 
                 xdb_cur_flag = buffer_load(_r_xdb_flag, 0, vec_width=1, dtype=T.i64)
+                if const_expr(per_token_ready and not _TOKRDY_DEBUG):
+                    _r_p2p_tok_ready = create_buffer_resource_from_addr(
+                        arg_p2p_tok_ready
+                    )
 
                 _lds_p2p_bases = _lds.p2p_bases.view(fx.make_layout(npes, 1))
                 if clane < fx.Int32(npes):
@@ -333,7 +388,80 @@ def compile_mega_moe_fused_s2c(*, s2_total_blocks: int, comb_block_num: int,
                     lds_p2p_bases=_lds_p2p_bases,
                     lds_p2p_wt_bases=None,
                     maybe_load=_maybe_load,
+                    tok_ready_addr=(addr_tok_ready
+                        if (per_token_ready and not _TOKRDY_DEBUG) else None),
+                    tok_ready_expected=topk,
                 )
+
+                # Per-token readiness clears *after* the reduction, not before it:
+                # the counters are what Stage 3 waits on. The last combine block to
+                # arrive is by definition the one that finds every other block done
+                # reducing, so it can reset both the arrival counters and the
+                # per-m-tile counters for the next launch without anyone waiting.
+                if const_expr(per_token_ready and not _TOKRDY_DEBUG):
+                    _lds_ack = _lds.ack.view(fx.make_layout(4, 1))
+                    if tid == fx.Int32(0):
+                        prev_ack = atomic_add_global_at(
+                            addr_s2_done + fx.Int64(_S2_ACK_SLOT * 4), fx.Int32(1)
+                        )
+                        fx.memref_store(prev_ack, _lds_ack, 0)
+                    fx.barrier()
+                    if fx.memref_load(_lds_ack, 0) == fx.Int32(COMB_BLOCKS - 1):
+                        if tid == fx.Int32(0):
+                            store_i32_system(
+                                addr_s2_done, _S2_ACK_SLOT, fx.Int32(0)
+                            )
+                        for _t in range(tid, cur_rank_num_token,
+                                        fx.Int32(_FUSED_BLOCK_THREADS)):
+                            store_i32_system(addr_tok_ready, _t, fx.Int32(0))
+                        # The m-tile counters clear themselves in Stage2 (the closing
+                        # block subtracts what it counted), so only the arrival
+                        # counters are swept here.
+                        #
+                        # Inter-iteration epoch barrier. Per-token readiness removed
+                        # the pre-reduce peer wait, and with it the only thing that
+                        # kept the ranks in step: nothing otherwise stops a fast rank
+                        # from starting the next launch's Stage2 and incrementing our
+                        # arrival counters -- or overwriting the single-buffered
+                        # payload -- while we are still reducing this one. Publishing
+                        # the epoch flag *after* the reset and waiting for every peer's
+                        # arrival before exiting restores that: a peer can only leave
+                        # this kernel once we have finished reducing and cleared, so
+                        # its next Stage2 cannot race us. The wait sits after all the
+                        # useful work, so unlike the two-launch barrier it does not
+                        # serialise the reduction behind the slowest peer's Stage2.
+                        #
+                        # The arrival is a remote *atomic increment* of a monotone
+                        # counter, not a per-peer flag store, for two reasons. An
+                        # ordinary store would sit dirty in this XCD's L2 with no
+                        # kernel boundary left to write it back -- the two-launch
+                        # barrier gets that flush for free because its store is
+                        # followed by the whole reduction and then kernel end, and
+                        # this one is followed only by a spin -- whereas an atomic
+                        # goes to the coherence point by construction. And a monotone
+                        # counter cannot be missed: an equality wait on a flag slot
+                        # deadlocks if the peer overwrites it with the next epoch's
+                        # value before we sample it, while ``>= npes*epoch`` is
+                        # satisfied by every later value too.
+                        fence_system_release()
+                        if tid < fx.Int32(npes):
+                            _peer_tr = buffer_load(
+                                _r_p2p_tok_ready, tid, vec_width=1, dtype=T.i64
+                            )
+                            atomic_add_system(
+                                _peer_tr + fx.Int64(_EPOCH_CTR_OFF), fx.Int32(1)
+                            )
+                        if tid == fx.Int32(0):
+                            _epoch = atomic_add_global_at(
+                                addr_s2_done + fx.Int64(_S2_EPOCH_SLOT * 4),
+                                fx.Int32(1),
+                            )
+                            if const_expr(not _TOKRDY_NOEPOCH):
+                                mori_shmem.int32_wait_until_greater_than(
+                                    addr_tok_ready + fx.Int64(_EPOCH_CTR_OFF),
+                                    fx.Int32(npes) * (_epoch + fx.Int32(1))
+                                    - fx.Int32(1),
+                                )
 
     # fmt: off
     @flyc.jit
@@ -344,6 +472,7 @@ def compile_mega_moe_fused_s2c(*, s2_total_blocks: int, comb_block_num: int,
         addr_xdb_flag: fx.Int64, addr_inp_tok_map: fx.Int64, addr_comb_bar: fx.Int64,
         addr_inp_total_recv: fx.Int64, addr_p2p_xdb_mem: fx.Int64, addr_out_shmem_wts: fx.Int64,
         addr_inp_disp_wts: fx.Int64, addr_s2_done: fx.Int64,
+        arg_p2p_tok_ready: fx.Int64, addr_tok_ready: fx.Int64, arg_mtile_ctr: fx.Int64,
         i32_max_m_blocks: fx.Int32, i32_inter: fx.Int32, i32_hidden: fx.Int32, i32_kpad: fx.Int32,
         i32_npad: fx.Int32, cur_rank_num_token: fx.Int32, stream: fx.Stream):
     # fmt: on
@@ -352,7 +481,8 @@ def compile_mega_moe_fused_s2c(*, s2_total_blocks: int, comb_block_num: int,
             arg_stids, arg_sweights, arg_trb, arg_p2p_comb_inp, addr_shmem_tok,
             addr_out_shmem_tok, addr_shmem_xdb_mem, addr_xdb_flag, addr_inp_tok_map,
             addr_comb_bar, addr_inp_total_recv, addr_p2p_xdb_mem, addr_out_shmem_wts,
-            addr_inp_disp_wts, addr_s2_done, i32_max_m_blocks, i32_inter, i32_hidden,
+            addr_inp_disp_wts, addr_s2_done, arg_p2p_tok_ready, addr_tok_ready,
+            arg_mtile_ctr, i32_max_m_blocks, i32_inter, i32_hidden,
             i32_kpad, i32_npad, cur_rank_num_token,
         ).launch(
             grid=(S2_TOTAL + COMB_BLOCKS, 1, 1),

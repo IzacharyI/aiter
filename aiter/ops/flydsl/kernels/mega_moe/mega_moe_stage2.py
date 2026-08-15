@@ -3,6 +3,8 @@
 # ruff: noqa: B023, I001
 """Fused GEMM2 and weighted cross-rank P2P scatter."""
 
+import os
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, range_constexpr, rocdl
@@ -17,6 +19,11 @@ from ..mxfp4_gemm_common import (
     lds_typed_ptr,
     lds_vec_load,
 )
+from ..communication_ops_utils import (
+    atomic_add_agent,
+    atomic_add_system,
+    fence_release,
+)
 from ..tensor_shim import _run_compiled
 
 from .gemm2 import (
@@ -28,6 +35,12 @@ from .gemm2 import (
 )
 
 _BUFFER_OFFSET_ABI_BYTES = 1 << 31
+
+# Buffer cache-policy bits as the gfx95x backend reads them: bit0 = sc0, bit1 = nt,
+# bit4 = sc1. ``nt`` alone leaves the line in the issuing XCD's L2; ``sc0 sc1`` makes
+# the store system-scope so no L2 writeback is needed to publish it.
+_P2P_CACHE_NT = 2
+_P2P_CACHE_WT = 2 | 1 | 16
 
 
 @flyc.jit
@@ -49,9 +62,22 @@ def _fp8_scale_for_leader(is_leader, local_max):
 # fmt: off
 def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM, BN, npes, topk,
     log2_max_tok, mask_max_tok, recv_cap, comb_inp_nbytes, lds_packed_off, lds_weight_off,
-    lds_peer_off, g2_bf16_lds=False, p2p_quant_type="none", analysis_no_p2p_payload=False):
+    lds_peer_off, g2_bf16_lds=False, p2p_quant_type="none", analysis_no_p2p_payload=False,
+    p2p_write_through=False):
 # fmt: on
-    """CShuffle one GEMM2 tile into weighted BF16 rows and scatter them to peers."""
+    """CShuffle one GEMM2 tile into weighted BF16 rows and scatter them to peers.
+
+    ``p2p_write_through`` raises the payload stores from ``nt`` to ``sc0 sc1 nt``
+    (system scope). That is not a hint: it decides what a producer's release fence
+    costs. With plain ``nt`` stores the payload can sit in the issuing XCD's L2, so
+    making it visible to a peer needs a system-scope release, which lowers to
+    ``buffer_wbl2`` -- a full L2 writeback, measured at +0.411 ms when paid per
+    Stage2 block. Written through, ordering needs only ``s_waitcnt vmcnt(0)``, so
+    readiness can be published at whatever granularity the consumer wants. The
+    stores lose L2 write-combining in exchange, which is why this is a measured A/B
+    and not a default.
+    """
+    p2p_cache_mod = _P2P_CACHE_WT if p2p_write_through else _P2P_CACHE_NT
     kMChunks = BM // 16
     numAccN = (BN // 4) // 16
     wave_n = BN // 4
@@ -225,7 +251,7 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
                 rsrc_dst,
                 payload_off,
                 offset_is_bytes=True,
-                cache_modifier=2,
+                cache_modifier=p2p_cache_mod,
             )
 
             @flyc.jit
@@ -246,7 +272,7 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
                         rsrc_dst,
                         scale_off,
                         offset_is_bytes=True,
-                        cache_modifier=2,
+                        cache_modifier=p2p_cache_mod,
                     )
 
             store_scale_if_leader()
@@ -263,7 +289,7 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
                 rsrc_dst,
                 off,
                 offset_is_bytes=True,
-                cache_modifier=2,
+                cache_modifier=p2p_cache_mod,
             )
 
 
@@ -276,7 +302,7 @@ def _stage2_lds_bytes(BM, BN, BK, a_dtype, aStages, g2_bf16_lds=False):
 
 
 # fmt: off
-def make_stage2_body_emitter(*, BK, BM, BN, INTER_MAX, KH_TILE_A, N_OUT, SBM, SharedStorage, _comb_inp_nbytes, _expert_offset, _recv_cap, aStages, a_dtype, analysis_no_p2p_payload, cu_num, g2_ascale_pf, g2_bf16_lds, g2_bhoist, g2_group_num, g2_m01, g2_spart, has_pad, is_f8, lds_packed_off, lds_peer_off, lds_weight_off, log2_max_tok, mask_max_tok, npes, p2p_quant_type, persist, persist_strided, skew_cu, topk, use_nt):
+def make_stage2_body_emitter(*, BK, BM, BN, INTER_MAX, KH_TILE_A, N_OUT, SBM, SharedStorage, _comb_inp_nbytes, _expert_offset, _recv_cap, aStages, a_dtype, analysis_no_p2p_payload, cu_num, g2_ascale_pf, g2_bf16_lds, g2_bhoist, g2_group_num, g2_m01, g2_spart, has_pad, is_f8, lds_packed_off, lds_peer_off, lds_weight_off, log2_max_tok, mask_max_tok, npes, p2p_quant_type, persist, persist_strided, skew_cu, topk, use_nt, p2p_write_through=False, lds_ready_off=None, publish_tok_ready=False):
 # fmt: on
     """Build the Stage2 GEMM2 + P2P-scatter tile-loop emitter for one block.
 
@@ -288,7 +314,7 @@ def make_stage2_body_emitter(*, BK, BM, BN, INTER_MAX, KH_TILE_A, N_OUT, SBM, Sh
     block index *within the Stage2 role*, numbered from 0.
     """
     # fmt: off
-    def emit_stage2_body(*, tx_i32, bx_i32, lane, wave, arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_cumsum, arg_max_expert_tiles, arg_stids, arg_sweights, arg_trb, arg_p2p_comb_inp, i32_max_m_blocks, i32_inter, i32_hidden, i32_kpad, i32_npad, lds_slab=None):
+    def emit_stage2_body(*, tx_i32, bx_i32, lane, wave, arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_cumsum, arg_max_expert_tiles, arg_stids, arg_sweights, arg_trb, arg_p2p_comb_inp, i32_max_m_blocks, i32_inter, i32_hidden, i32_kpad, i32_npad, lds_slab=None, arg_p2p_tok_ready=None, arg_mtile_ctr=None):
     # fmt: on
         # FlyDSL permits one SharedAllocator per kernel, so the fused GEMM2+combine
         # kernel allocates a single slab for both roles and passes Stage2's field in
@@ -323,6 +349,86 @@ def make_stage2_body_emitter(*, BK, BM, BN, INTER_MAX, KH_TILE_A, N_OUT, SBM, Sh
                         align=8,
                     ),
                 )
+            if const_expr(publish_tok_ready):
+                _r_p2p_ready = buffer_ops.create_buffer_resource_from_addr(arg_p2p_tok_ready)
+                if tx_i32 < fx.Int32(npes):
+                    ready_base = buffer_ops.buffer_load(
+                        _r_p2p_ready, tx_i32, vec_width=1, dtype=fx.Int64
+                    )
+                    fx.ptr_store(
+                        ready_base,
+                        lds_typed_ptr(
+                            fx.Int32(lds_ready_off) + tx_i32 * fx.Int32(8),
+                            T.i64,
+                            align=8,
+                        ),
+                    )
+
+            # Per-destination-token readiness publication (fused per-token combine).
+            # A tile's rows are only complete once every column stripe of that m-tile
+            # has stored, so each tile bumps an agent-scope per-m-tile counter and the
+            # block that closes it publishes the tile's 32 rows to their destination
+            # ranks. That keeps the remote atomics at one per source row instead of one
+            # per (row, stripe), and keeps the release at workgroup scope: the payload
+            # stores are write-through, so ``s_waitcnt vmcnt(0)`` already makes them
+            # visible system-wide and no L2 writeback is needed.
+            @flyc.jit
+            def _publish_tok_ready(m_block_idx, num_n_blocks):
+                # Every wave runs the fence: the waitcnt is per-wave and s_barrier
+                # does not wait on memory.
+                fence_release(fx.rocdl.SyncScope.WorkgroupOneAs)
+                fx.barrier()
+                _bcast = lds_typed_ptr(
+                    fx.Int32(lds_ready_off) + fx.Int32(npes * 8), T.i32, align=4
+                )
+                if tx_i32 == fx.Int32(0):
+                    prev = atomic_add_agent(
+                        arg_mtile_ctr + fx.Int64(m_block_idx) * fx.Int64(4),
+                        fx.Int32(1),
+                    )
+                    fx.ptr_store(prev, _bcast)
+                fx.barrier()
+                closes_tile = fx.ptr_load(_bcast) == num_n_blocks - fx.Int32(1)
+                if closes_tile:
+                    if tx_i32 == fx.Int32(0):
+                        # Self-clear: exactly one block closes this tile, and nothing
+                        # else touches the slot for the rest of the launch, so the
+                        # counter is returned to zero here instead of being swept by
+                        # the combine role (which would have to clear the whole
+                        # worst-case ``max_m_blocks`` range every launch).
+                        atomic_add_agent(
+                            arg_mtile_ctr + fx.Int64(m_block_idx) * fx.Int64(4),
+                            fx.Int32(0) - num_n_blocks,
+                        )
+                    if tx_i32 < fx.Int32(BM):
+                        pk_meta = fx.ptr_load(
+                            lds_typed_ptr(
+                                fx.Int32(lds_packed_off) + tx_i32 * fx.Int32(4),
+                                T.i32,
+                                align=4,
+                            )
+                        )
+                        mt_t = pk_meta & fx.Int32(0x00FFFFFF)
+                        mt_s = pk_meta >> fx.Int32(24)
+                        mt_pe = mt_t >> fx.Int32(log2_max_tok)
+                        mt_lid = mt_t & fx.Int32(mask_max_tok)
+                        mt_ok = (
+                            (mt_t < fx.Int32(_recv_cap))
+                            & (mt_s < fx.Int32(topk))
+                            & (mt_pe < fx.Int32(npes))
+                        )
+                        if mt_ok:
+                            ready_base = fx.ptr_load(
+                                lds_typed_ptr(
+                                    fx.Int32(lds_ready_off) + mt_pe * fx.Int32(8),
+                                    T.i64,
+                                    align=8,
+                                )
+                            )
+                            atomic_add_system(
+                                ready_base + fx.Int64(mt_lid) * fx.Int64(4),
+                                fx.Int32(1),
+                            )
 
             def issue_all_a_loads(m_row0):
                 for slot in range_constexpr(kStages):
@@ -374,8 +480,11 @@ def make_stage2_body_emitter(*, BK, BM, BN, INTER_MAX, KH_TILE_A, N_OUT, SBM, Sh
                     comb_inp_nbytes=_comb_inp_nbytes, lds_packed_off=lds_packed_off,
                     lds_weight_off=lds_weight_off, lds_peer_off=lds_peer_off, g2_bf16_lds=g2_bf16_lds,
                     p2p_quant_type=p2p_quant_type,
-                    analysis_no_p2p_payload=analysis_no_p2p_payload)
+                    analysis_no_p2p_payload=analysis_no_p2p_payload,
+                    p2p_write_through=p2p_write_through)
                 # fmt: on
+                if const_expr(publish_tok_ready):
+                    _publish_tok_ready(m_block_idx, num_n_blocks)
 
             cumsum0 = global_typed_ptr(arg_cumsum, T.i32)[0]
             total_m_blocks = (cumsum0 + fx.Int32(BM - 1)) // fx.Int32(BM)
@@ -467,7 +576,8 @@ def derive_stage2_emit_constants(*, model_dim: int, inter_dim: int, experts: int
     SBM: int | None = None,
     persist: bool = False, cu_num: int = 0, has_pad: bool = False, g2_bhoist=None, g2_ascale_pf=None,
     g2_spart=None, persist_strided: bool = False, g2_bf16_lds: bool = False, p2p_quant_type: str = "none",
-    fixed_slot_dispatch: bool = False, skew_cu: int = 0, analysis_no_p2p_payload: bool = False):
+    fixed_slot_dispatch: bool = False, skew_cu: int = 0, analysis_no_p2p_payload: bool = False,
+    p2p_write_through: bool | None = None, publish_tok_ready: bool = False):
 # fmt: on
     """Validate a Stage2 configuration and derive the tile loop's compile-time constants.
 
@@ -510,13 +620,19 @@ def derive_stage2_emit_constants(*, model_dim: int, inter_dim: int, experts: int
     lds_packed_off = compute_lds_bytes
     lds_weight_off = lds_packed_off + BM * 4
     lds_peer_off = lds_weight_off + BM * 4
-    lds_bytes = lds_peer_off + npes * 8
+    # Peer ``shmem_tok_ready`` bases plus a 4-byte tile-close broadcast slot; always
+    # laid out so the fused kernel can size one slab either way.
+    lds_ready_off = lds_peer_off + npes * 8
+    lds_bytes = lds_ready_off + (npes * 8 + 16 if publish_tok_ready else 0)
     _recv_cap = npes * max_tok if recv_cap is None else int(recv_cap)
     _row_nbytes = N_OUT + N_OUT // 32 if p2p_quant_type == "fp8_blockwise_1x32" else N_OUT * 2
     _comb_inp_nbytes = max_tok * topk * _row_nbytes if comb_inp_nbytes is None else int(comb_inp_nbytes)
     if not 0 < _comb_inp_nbytes < _BUFFER_OFFSET_ABI_BYTES:
         raise ValueError("MegaMoE v2 stage2 P2P buffer exceeds the 32-bit buffer-resource ABI")
     _expert_offset = rank * experts
+    if p2p_write_through is None:
+        p2p_write_through = os.environ.get("AITER_MEGAMOE_P2P_WT") == "1"
+    p2p_write_through = bool(p2p_write_through)
 
     @fx.struct
     class SharedStorage:
@@ -531,6 +647,8 @@ def derive_stage2_emit_constants(*, model_dim: int, inter_dim: int, experts: int
         f"_bh{int(g2_bhoist)}apf{int(g2_ascale_pf)}sp{g2_group_num}x{g2_m01}"
         f"_bf16lds{int(g2_bf16_lds)}_{p2p_quant_type}"
         f"_np{int(analysis_no_p2p_payload)}"
+        f"{'_wt' if p2p_write_through else ''}"
+        f"{'_tokrdy' if publish_tok_ready else ''}"
     )
 
     consts = {
@@ -564,6 +682,9 @@ def derive_stage2_emit_constants(*, model_dim: int, inter_dim: int, experts: int
         "mask_max_tok": mask_max_tok,
         "npes": npes,
         "p2p_quant_type": p2p_quant_type,
+        "p2p_write_through": p2p_write_through,
+        "publish_tok_ready": publish_tok_ready,
+        "lds_ready_off": lds_ready_off,
         "persist": persist,
         "persist_strided": persist_strided,
         "skew_cu": skew_cu,
