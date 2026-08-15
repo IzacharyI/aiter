@@ -631,7 +631,11 @@ def derive_stage2_emit_constants(*, model_dim: int, inter_dim: int, experts: int
         raise ValueError("MegaMoE v2 stage2 P2P buffer exceeds the 32-bit buffer-resource ABI")
     _expert_offset = rank * experts
     if p2p_write_through is None:
-        p2p_write_through = os.environ.get("AITER_MEGAMOE_P2P_WT") == "1"
+        # On by default: it measured at or better than the cached path on all four
+        # route guards (rank-max stage2+combine 0.2435 -> 0.2395 ms at 512 uniform,
+        # 0.2954 -> 0.2917 at 512 skew, 2.0841 -> 2.0778 at 8192 uniform and
+        # 2.5594 -> 2.5192 at 8192 skew) with relL2 unchanged. ``=0`` opts out.
+        p2p_write_through = os.environ.get("AITER_MEGAMOE_P2P_WT", "1") != "0"
     p2p_write_through = bool(p2p_write_through)
 
     @fx.struct
