@@ -646,7 +646,8 @@ def _combine_transport_spec(
 def make_combine_reduce_emitter(spec, *, rank, npes, experts_per_token,
     max_tok_per_rank, zero_copy, skip_stage1, blockwise_fp8_transport, lane,
     addr_shmem_tok, addr_out_shmem_tok, rsrc_tok_map, lds_p2p_bases, maybe_load,
-    cur_rank_num_token, nominal_warp_num, tok_ready_addr=None, tok_ready_expected=0):
+    cur_rank_num_token, nominal_warp_num, tok_ready_addr=None, tok_ready_expected=0,
+    tok_ready_epoch=None):
 # fmt: on
     """Build combine's Stage-3 reduction as a *per-work-item* emitter.
 
@@ -676,6 +677,12 @@ def make_combine_reduce_emitter(spec, *, rank, npes, experts_per_token,
     _lds_p2p_bases = lds_p2p_bases
     _maybe_load = maybe_load
     global_warp_num = nominal_warp_num
+    # ``tok_ready_epoch`` is a device value (this launch's generation, 1-based) when
+    # the caller carries the counters across launches instead of clearing them.
+    if tok_ready_epoch is None:
+        _tok_ready_target = fx.Int32(tok_ready_expected)
+    else:
+        _tok_ready_target = fx.Int32(tok_ready_expected) * tok_ready_epoch
 
     # Stage 3: local read + WarpAccum. hidden-dim splits into warps_per_tok
     # partitions; each warp reduces k partials in f32 -> shmem_comb_out.
@@ -712,9 +719,14 @@ def make_combine_reduce_emitter(spec, *, rank, npes, experts_per_token,
             @flyc.jit
             def _wait_tok_ready(tok_id=tok_id):
                 if lane == fx.Int32(0):
-                    mori_shmem.int32_wait_until_equals(
+                    # ``>=``, not ``==``. The megakernel never resets these
+                    # counters -- it raises the target by ``topk`` every launch
+                    # instead -- so an equality wait would miss the window.
+                    # Callers that do reset are unaffected: exactly ``topk``
+                    # arrivals land either way.
+                    mori_shmem.int32_wait_until_greater_than(
                         tok_ready_addr + fx.Int64(tok_id) * fx.Int64(4),
-                        fx.Int32(tok_ready_expected),
+                        _tok_ready_target - fx.Int32(1),
                     )
 
             _wait_tok_ready()
@@ -899,7 +911,7 @@ def emit_combine_barrier_and_reduce(spec, *, rank, npes, experts_per_token, max_
     addr_shmem_tok, addr_out_shmem_tok, addr_shmem_xdb_mem, addr_xdb_flag, addr_comb_bar,
     addr_shmem_wts, addr_out_shmem_wts, addr_inp_disp_wts, cur_rank_num_token, xdb_cur_flag,
     r_comb_bar, r_trecv, r_p2p_xdb, rsrc_tok_map, lds_p2p_bases, lds_p2p_wt_bases, maybe_load,
-    tok_ready_addr=None, tok_ready_expected=0):
+    tok_ready_addr=None, tok_ready_expected=0, tok_ready_epoch=None):
 # fmt: on
     """Emit combine's cross-device barrier (Stage 2) + local reduction (Stage 3/3b).
 
@@ -1012,6 +1024,7 @@ def emit_combine_barrier_and_reduce(spec, *, rank, npes, experts_per_token, max_
             lds_p2p_bases=_lds_p2p_bases, maybe_load=_maybe_load,
             cur_rank_num_token=cur_rank_num_token, nominal_warp_num=global_warp_num,
             tok_ready_addr=tok_ready_addr, tok_ready_expected=tok_ready_expected,
+            tok_ready_epoch=tok_ready_epoch,
         )
         for s3_work_idx in range(global_warp_id, _s3_consts["s3_total_work"], global_warp_num):
             _s3_emit(s3_work_idx)

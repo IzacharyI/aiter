@@ -253,7 +253,7 @@ class MegaMoEV2:
         self._active_config = config
         return config
 
-    def _fused_all_kwargs(self, config: MegaMoEConfig):
+    def _fused_all_kwargs(self, config: MegaMoEConfig, fuse_combine=False):
         """Stage2 compile spec + kernel arguments for the fused megakernel path."""
         op = self._s1_op
         comb_op = self.comb_op
@@ -266,6 +266,7 @@ class MegaMoEV2:
             g2_ascale_pf=stage2.ascale_prefetch, g2_bf16_lds=stage2.bf16_lds,
             analysis_no_p2p_payload=stage2.analysis_no_p2p_payload,
             SBM=config.stage1.sort_block_m, cu_num=0,
+            publish_tok_ready=bool(fuse_combine),
         )
         max_m_blocks = (self._s1_nvm + stage2.block_m - 1) // stage2.block_m
         args = (
@@ -278,10 +279,24 @@ class MegaMoEV2:
             self._fx_fused_mtile_ctr, fx.Int32(max_m_blocks),
         )
         self._g2_active_block_m = stage2.block_m
-        return s2_spec, args
+        if not fuse_combine:
+            return s2_spec, args, None, None
+        cfg = self.comb_cfg
+        c_spec = {
+            "hidden_elem_size": torch.tensor([], dtype=cfg.combine_dtype).element_size(),
+            "data_type": cfg.combine_dtype,
+            "blockwise_fp8_transport": config.p2p_quant == "fp8_blockwise_1x32",
+            "max_recv": comb_op._effective_max_recv,
+        }
+        c_args = (
+            comb_op._fx_comb_inp, comb_op._fx_comb_out, comb_op._fx_tok_ready,
+            self._fx_fused_comb_ctr, comb_op._fx_p2p_tok_ready,
+            self._fx_fused_comb_mtile_ctr,
+        )
+        return s2_spec, args, c_spec, c_args
 
     def _run_fused_stage1(self, x, wts, scales, topk_ids, stream=None, config: Stage1Config | None = None,
-                          fused_config: "MegaMoEConfig | None" = None):
+                          fused_config: "MegaMoEConfig | None" = None, fuse_combine=False):
         if stream is None:
             stream = fx.Stream(torch.cuda.current_stream())
         cur_tok = int(x.shape[0])
@@ -307,9 +322,12 @@ class MegaMoEV2:
         _fused_kw = {}
         _s2_nw8 = os.environ.get("AITER_MEGAMOE_FUSE_S2_NW8", "1") == "1"
         if fused_config is not None:
-            _s2_spec, _s2_args = self._fused_all_kwargs(fused_config)
+            _s2_spec, _s2_args, _c_spec, _c_args = self._fused_all_kwargs(
+                fused_config, fuse_combine=fuse_combine
+            )
             _fused_kw = {
                 "fused_stage2": _s2_spec, "fused_args": _s2_args,
+                "fused_combine": _c_spec, "fused_combine_args": _c_args,
                 # nw8 (native 8-wave GEMM2 tile) is the default: it removes the
                 # halves=2 lockstep and is worth -0.48 ms. It halves the GEMM2 unit
                 # count, so it wants a larger pref stride than the halves=2 path did
@@ -376,16 +394,28 @@ class MegaMoEV2:
             # from a second queue inside Stage1's own persistent work loop, gated on
             # per-m-tile GEMM1 completion, so GEMM2 (and its P2P traffic) overlaps
             # the tail of GEMM1 instead of waiting for a kernel boundary.
+            # M2.5 (opt-in): combine becomes a third queue in the same persistent
+            # loop, so there is no second launch at all. Blocks that have drained
+            # both GEMM queues start reducing tokens whose ``topk`` partials have
+            # already landed while their peers are still computing GEMM2.
+            # Default on: interleaved 3-rep rank-max is at or better than the
+            # two-launch M2 path on all four route guards (512 uniform 0.6855 ->
+            # 0.6811, 512 skew 0.7741 -> 0.7660, 8192 uniform 4.6228 -> 4.4961,
+            # 8192 skew 5.4942 -> 5.3871). Set to 0 to fall back to M2.
+            fuse_comb = os.environ.get("AITER_MEGAMOE_FUSE_COMBINE", "1") == "1"
             self._run_fused_stage1(
                 x, wts, scales, topk_ids, stream=stream, config=config.stage1,
-                fused_config=config,
+                fused_config=config, fuse_combine=fuse_comb,
             )
-            # ``combine_no_stage1`` returns the same ``(out_tok, ...)`` shape as the
-            # scattered path, so unwrap it exactly like ``_run_stage2`` does.
-            ret = self.comb_op.combine_no_stage1(
-                self._g2_combine_placeholder, None, None, cur_tok=run_tokens,
-                enable_weights=False, stage2_p2p_quant=config.p2p_quant,
-            )
+            if fuse_comb:
+                ret = None
+            else:
+                # ``combine_no_stage1`` returns the same ``(out_tok, ...)`` shape as
+                # the scattered path, so unwrap it exactly like ``_run_stage2`` does.
+                ret = self.comb_op.combine_no_stage1(
+                    self._g2_combine_placeholder, None, None, cur_tok=run_tokens,
+                    enable_weights=False, stage2_p2p_quant=config.p2p_quant,
+                )
             out_tok = ret[0] if isinstance(ret, (tuple, list)) else ret
             if out_tok is None:
                 cfg = self.comb_cfg
@@ -482,6 +512,18 @@ class MegaMoEV2:
             max(1, self._s1_nvm), dtype=torch.int32, device=dev
         )
         self._fx_fused_mtile_ctr = fx.Int64(self._fused_mtile_ctr.data_ptr())
+        # M2.5: combine as a third queue inside the megakernel. Two more rank-local
+        # counters -- the combine claim head (cleared by the ticket-0 block ahead of
+        # the epoch gate) and Stage2's per-m-tile n-stripe close counter, which is
+        # self-clearing. Distinct from ``_fused_mtile_ctr`` above: that one indexes
+        # Stage1 tiles for the GEMM1->GEMM2 edge, this one indexes GEMM2 m-blocks.
+        # [0] combine claim head (cleared per launch), [1] combine generation.
+        self._fused_comb_ctr = torch.zeros(4, dtype=torch.int32, device=dev)
+        self._fx_fused_comb_ctr = fx.Int64(self._fused_comb_ctr.data_ptr())
+        self._fused_comb_mtile_ctr = torch.zeros(
+            max(1, self._s1_nvm), dtype=torch.int32, device=dev
+        )
+        self._fx_fused_comb_mtile_ctr = fx.Int64(self._fused_comb_mtile_ctr.data_ptr())
         self._g2_cu_num = int(cu_num)
 
     def _run_fused_s2c(self, run_tokens, config: MegaMoEConfig, s_fx):

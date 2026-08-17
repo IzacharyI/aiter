@@ -13,6 +13,11 @@ from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
 
 from .. import communication_ops_utils as comm_ops
+from ..buffer_ops import buffer_load as _raw_buffer_load
+from ..flydsl_dispatch_combine_intranode_kernel import (
+    _combine_transport_spec,
+    make_combine_reduce_emitter,
+)
 from ..tensor_shim import _run_compiled
 from .dispatch import (
     DispatchSlot,
@@ -100,6 +105,7 @@ def compile_mega_moe_stage1(
     fused_s2_nw8: bool = False,
     fused_g2_skew: tuple = (5, 4),
     fused_diag_nopub: bool = False,
+    fused_combine=None,
 ):
     arch = str(get_rocm_arch() or "")
     if not arch.startswith("gfx95"):
@@ -232,6 +238,31 @@ def compile_mega_moe_stage1(
         fz_mtpr, fz_npes, fz_epr, fz_k, fz_tile_m, fz_nbytes, inter_dim, use_tile_resource
     )
 
+    # ---- combine role (M2.5) -------------------------------------------------
+    # Combine becomes a third queue in the same persistent loop rather than a second
+    # launch. A block may only claim combine work once *both* local queues are empty,
+    # which is what keeps it deadlock-free: a block waiting on a token's arrivals is
+    # never also holding an unexecuted GEMM tile that some peer is waiting for.
+    C = None
+    if fused_combine is not None:
+        c_cfg = dict(fused_combine)
+        C = {
+            "spec": _combine_transport_spec(
+                npes=fuse_npes, experts_per_token=fuse_topk, hidden_dim=model_dim,
+                hidden_elem_size=c_cfg["hidden_elem_size"],
+                max_tok_per_rank=fuse_mtpr, data_type=c_cfg["data_type"],
+                enable_weights=False, fp8_direct_cast=False,
+                blockwise_fp8_transport=c_cfg["blockwise_fp8_transport"],
+                max_recv=c_cfg["max_recv"],
+            ),
+            "blockwise": c_cfg["blockwise_fp8_transport"],
+        }
+        # ``_publish_tok_ready`` broadcasts through a single LDS word, so two lockstep
+        # half-blocks would collide on it. nw8 is the tuned geometry anyway.
+        assert S2 is not None and S2["halves"] == 1, (
+            "fused combine requires the nw8 (single-tile) GEMM2 geometry"
+        )
+
     @fx.struct
     class SharedStorage:
         pool: fx.Array[fx.Int8, lds_pool_bytes, 16]
@@ -250,6 +281,7 @@ def compile_mega_moe_stage1(
         f"{swiglu_suffix}"
         + ("" if S2 is None else f"_g2h{S2['halves']}m{S2['BM']}n{S2['BN']}p{int(fused_g2_pref)}c{G2_CHUNK}"
            f"s{fused_g2_skew[0]}_{fused_g2_skew[1]}{'_nopub' if fused_diag_nopub else ''}")
+        + ("_fcomb" if fused_combine is not None else "")
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[TOTAL_THREADS, 1, 1])
@@ -263,6 +295,8 @@ def compile_mega_moe_stage1(
         s2_eids: fx.Int64, s2_cumsum: fx.Int64, s2_metiles: fx.Int64, s2_stids: fx.Int64,
         s2_sweights: fx.Int64, s2_trb: fx.Int64, s2_p2p: fx.Int64, s2_ctr: fx.Int64,
         i32_s2_maxmb: fx.Int32,
+        c_inp: fx.Int64, c_out: fx.Int64, c_tok_ready: fx.Int64, c_ctr: fx.Int64,
+        c_p2p_ready: fx.Int64, c_mtile_ctr: fx.Int64,
     ):
         tid = fx.thread_idx.x
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
@@ -339,6 +373,26 @@ def compile_mega_moe_stage1(
                 for shard in range_constexpr(8):
                     _buffer_store(work_head_rsrc, fx.Int32(shard * 16), fx.Int32(0), fx.Int32)
                 _buffer_store(_make_buffer_from_addr(a_work_tail, fx.Int32), fx.Int32(0), fx.Int32(0), fx.Int32)
+                if const_expr(C is not None):
+                    # ``c_ctr[0]`` is combine's claim head. It is rank-local, so
+                    # unlike the arrival counters it can simply be cleared: every
+                    # other block on this rank waits on the epoch gate this block is
+                    # about to publish, and no peer ever touches it.
+                    #
+                    # ``c_ctr[1]`` is combine's own generation counter. It cannot be
+                    # the dispatch ``gate_epoch``: that one counts *every* Stage1
+                    # launch, including the ones compiled without the combine role,
+                    # which publish no arrivals at all. Deriving the wait target from
+                    # it makes the first fused-combine launch after any such launch
+                    # wait for arrivals that were never sent.
+                    _c_rsrc = _make_buffer_from_addr(c_ctr, fx.Int32)
+                    _buffer_store(_c_rsrc, fx.Int32(0), fx.Int32(0), fx.Int32)
+                    _buffer_store(
+                        _c_rsrc,
+                        fx.Int32(1),
+                        _buffer_load(_c_rsrc, fx.Int32(1), fx.Int32) + fx.Int32(1),
+                        fx.Int32,
+                    )
                 if const_expr(external_grouping or direct_fixed_slot):
                     group_done_rsrc = _make_buffer_from_addr(a_group_done, fx.Int32)
                     for destination in range_constexpr(fz_npes if direct_fixed_slot else 1):
@@ -361,6 +415,28 @@ def compile_mega_moe_stage1(
 
         payload_parity = _buffer_load(parity_rsrc, fx.Int32(0), fx.Int32, cache_modifier=_SC0_CACHE)
         payload_expected = _buffer_load(expected_rsrc, payload_parity, fx.Int32, cache_modifier=_SC0_CACHE)
+
+        if const_expr(C is not None):
+            # Combine's generation, published by the owner block ahead of the gate.
+            c_epoch = _buffer_load(
+                _make_buffer_from_addr(c_ctr, fx.Int32), fx.Int32(1), fx.Int32,
+                cache_modifier=_SC0_CACHE,
+            )
+            if compact_owner:
+                # Arrival counters are never cleared -- clearing them is what wedged
+                # M1.5, since a peer racing into the next iteration starts
+                # incrementing before the consumer has swept -- so the wait target
+                # rises by ``topk`` per combine launch instead. Tokens outside this
+                # launch's ``[0, cur_tok)`` window receive no arrivals and would fall
+                # a generation behind, wedging a later, larger batch on a token that
+                # sat out. Pad them to the current target here. Nothing in *this*
+                # launch reads a token >= cur_tok, so this is only ordered against
+                # future launches and stays off the startup critical path.
+                _c_rdy_rsrc = _make_buffer_from_addr(c_tok_ready, fx.Int32)
+                _c_pad = fx.Int32(fz_k) * c_epoch
+                for _c_t in range(tid, fz_mtpr, TOTAL_THREADS):
+                    if _c_t >= i32_cur_tok:
+                        _buffer_store(_c_rdy_rsrc, _c_t, _c_pad, fx.Int32)
 
         if const_expr(S2 is not None):
             # Clear the per-m-tile GEMM1 completion counters before PLAN_READY is
@@ -834,11 +910,62 @@ def compile_mega_moe_stage1(
                             arg_eids=s2_eids, arg_cumsum=s2_cumsum, arg_max_expert_tiles=s2_metiles,
                             arg_stids=s2_stids, arg_sweights=s2_sweights, arg_trb=s2_trb,
                             arg_p2p_comb_inp=s2_p2p, i32_max_m_blocks=i32_s2_maxmb,
+                            arg_p2p_tok_ready=c_p2p_ready, arg_mtile_ctr=c_mtile_ctr,
                             i32_inter=fx.Int32(S2["inter"]), i32_hidden=fx.Int32(S2["hidden"]),
                             i32_kpad=fx.Int32(0), i32_npad=fx.Int32(0),
                         lds_slab=_s2_slab, lds_byte_off=_half * fx.Int32(S2["slab"]),
                     )
                 consumer_active = kind != fx.Int32(0)
+
+            if const_expr(C is not None):
+                # ---- combine role (third queue) ------------------------------
+                # Only reachable once both local queues are drained, which is the
+                # whole deadlock argument: a block parked on a token's arrival count
+                # is never also sitting on an unexecuted GEMM tile that some peer is
+                # waiting for, so every rank's GEMM2 keeps retiring and every
+                # arrival count eventually lands.
+                #
+                # The counters are never cleared. Clearing them is what wedged the
+                # M1.5 experiment -- a peer racing into the next iteration can start
+                # incrementing before the consumer has swept. Instead the target
+                # rises by ``topk`` per launch (``gate_epoch`` is 1-based), and the
+                # single-buffered payload stays safe because dispatch's own
+                # cross-rank epoch gate already blocks iteration i+1's P2P writes
+                # until every rank has entered i+1, i.e. finished combine for i.
+                def _c_maybe_load(rsrc, offset, vld_flag, **kwargs):
+                    raw = _raw_buffer_load(rsrc, offset, **kwargs)
+                    return vld_flag.select(raw, 0)
+
+                _c_consts, _c_emit = make_combine_reduce_emitter(
+                    C["spec"], rank=rank, npes=fuse_npes, experts_per_token=fuse_topk,
+                    max_tok_per_rank=fuse_mtpr, zero_copy=False, skip_stage1=True,
+                    blockwise_fp8_transport=C["blockwise"], lane=tid % fx.Int32(64),
+                    addr_shmem_tok=c_inp, addr_out_shmem_tok=c_out,
+                    rsrc_tok_map=None, lds_p2p_bases=None, maybe_load=_c_maybe_load,
+                    cur_rank_num_token=i32_cur_tok,
+                    nominal_warp_num=fx.Int32(launch_grid_x * NUM_WAVES),
+                    tok_ready_addr=c_tok_ready, tok_ready_expected=fuse_topk,
+                    tok_ready_epoch=c_epoch,
+                )
+                _c_total = _c_consts["s3_total_work"]
+                _c_wave = fx.rocdl.readfirstlane(T.i32, tid // fx.Int32(64))
+                # One claim feeds the whole block: wave w takes item base+w. Stage 3
+                # items are per-warp, so a block-granular claim keeps the atomic rate
+                # at 1/NUM_WAVES of the item rate without leaving waves idle.
+                comb_active = fx.Int32(1) == fx.Int32(1)
+                while comb_active:
+                    fx.barrier()
+                    if tid == fx.Int32(0):
+                        _c_claim = fx.Int32(comm_ops.atomic_add_agent(c_ctr, fx.Int32(1)))
+                        fx.ptr_store(
+                            Vec.from_elements([_c_claim], fx.Int32), work_scratch
+                        )
+                    fx.barrier()
+                    _c_base = Vec(work_scratch_view.load())[0] * fx.Int32(NUM_WAVES)
+                    _c_item = _c_base + _c_wave
+                    if _c_item < _c_total:
+                        _c_emit(_c_item)
+                    comb_active = _c_base < _c_total
 
     @flyc.jit
     def launch(
@@ -850,13 +977,16 @@ def compile_mega_moe_stage1(
         s2_aq: fx.Int64, s2_ascale: fx.Int64, s2_bq: fx.Int64, s2_bscale: fx.Int64,
         s2_eids: fx.Int64, s2_cumsum: fx.Int64, s2_metiles: fx.Int64, s2_stids: fx.Int64,
         s2_sweights: fx.Int64, s2_trb: fx.Int64, s2_p2p: fx.Int64, s2_ctr: fx.Int64,
-        i32_s2_maxmb: fx.Int32, stream: fx.Stream,
+        i32_s2_maxmb: fx.Int32,
+        c_inp: fx.Int64, c_out: fx.Int64, c_tok_ready: fx.Int64, c_ctr: fx.Int64,
+        c_p2p_ready: fx.Int64, c_mtile_ctr: fx.Int64, stream: fx.Stream,
     ):
         kernel(
             out, x, w, scale_x, scale_w, sorted_token_ids, expert_ids, num_valid_ids, out_scale, tokens,
             addr_disp, i32_cur_tok, addr_in_tok, addr_in_idx, addr_in_wts, addr_in_sc, addr_parity, addr_expected,
             s2_aq, s2_ascale, s2_bq, s2_bscale, s2_eids, s2_cumsum, s2_metiles, s2_stids,
             s2_sweights, s2_trb, s2_p2p, s2_ctr, i32_s2_maxmb,
+            c_inp, c_out, c_tok_ready, c_ctr, c_p2p_ready, c_mtile_ctr,
             value_attrs={
                 "rocdl.waves_per_eu": waves_per_eu_hint,
                 "rocdl.flat_work_group_size": f"{TOTAL_THREADS},{TOTAL_THREADS}",
@@ -876,7 +1006,8 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
     b_nt=-1, work_shards=None, external_grouping=None, external_counting=None,
     payload_chunk_rows=0, payload_tile_ready=False, swiglu_limit=0.0,
     fused_stage2=None, fused_g2_pref=0, fused_g2_chunk=4, fused_s2_nw8=False,
-    fused_g2_skew=(5, 4), fused_diag_nopub=False, fused_args=None):
+    fused_g2_skew=(5, 4), fused_diag_nopub=False, fused_args=None,
+    fused_combine=None, fused_combine_args=None):
     launch = compile_mega_moe_stage1(
         model_dim=model_dim, inter_dim=inter_dim, rank=rank, experts_per_rank=experts_per_rank,
         fuse_npes=fuse_npes, fuse_topk=fuse_topk, fuse_cap=fuse_cap, fuse_mtpr=fuse_mtpr,
@@ -896,13 +1027,18 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
         ),
         fused_g2_pref=fused_g2_pref, fused_g2_chunk=fused_g2_chunk, fused_s2_nw8=fused_s2_nw8,
         fused_g2_skew=fused_g2_skew, fused_diag_nopub=fused_diag_nopub,
+        fused_combine=(
+            None if fused_combine is None else tuple(sorted(dict(fused_combine).items()))
+        ),
     )
     # 12 Stage2 pointers + ``max_m_blocks``; zeros on the unfused path, where the
     # kernel never dereferences them.
     fa = tuple(fused_args) if fused_args else (fx.Int64(0),) * 12 + (fx.Int32(0),)
+    # 6 combine pointers; zeros on the unfused path, where they are never read.
+    ca = tuple(fused_combine_args) if fused_combine_args else (fx.Int64(0),) * 6
     _run_compiled(
         launch, out, x, w, scale_x, scale_w, sorted_token_ids, expert_ids, num_valid_ids, out_scale,
         tokens, addr_disp, i32_cur_tok, addr_in_tok, addr_in_idx, addr_in_wts, addr_in_sc,
-        addr_parity, addr_expected, *fa, stream,
+        addr_parity, addr_expected, *fa, *ca, stream,
     )
 # fmt: on
