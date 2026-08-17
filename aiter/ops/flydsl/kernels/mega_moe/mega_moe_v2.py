@@ -95,6 +95,25 @@ class MegaMoEV2:
             op.tile_row_base = torch.zeros(metadata_blocks, dtype=torch.int32, device=self.dev)
         self._s1_nvm = op.num_valid_max
         self._s1_cap = op.ll_cap
+        # M3: destination for the in-kernel quantization ingress. The standalone
+        # ``per_1x32_mx_quant`` allocates fresh output tensors per call; the fused
+        # path needs a stable address it can bake into the launch, so it writes
+        # here instead. Rank-local and reused every launch -- safe because the
+        # launches are stream-ordered, so the previous launch's readers have
+        # retired before this one's ingress starts.
+        # Zeroed rather than empty: rows in ``[cur_tok, mtpr)`` are never written
+        # by the ingress and the dispatch payload path can read up to a tile
+        # boundary past ``cur_tok``.
+        self._q_xq = torch.zeros(
+            (self.mtpr, self.model_dim), dtype=torch.float8_e4m3fn, device=self.dev
+        )
+        self._q_scale = torch.zeros(
+            (self.mtpr, self._s1_scale_dim), dtype=torch.uint8, device=self.dev
+        )
+        # 8 ingress done counters, one per 64-byte line (16 i32 apart), cleared by
+        # the ticket-0 block ahead of the epoch gate.
+        self._q_ctr = torch.zeros(8 * 16, dtype=torch.int32, device=self.dev)
+        self._fx_q_ctr = fx.Int64(self._q_ctr.data_ptr())
         self._s1_epoch_parity = torch.zeros(1, dtype=torch.int32, device=self.dev)
         self._s1_epoch_expected = torch.zeros(2, dtype=torch.int32, device=self.dev)
         self._s1_num_cu = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
@@ -296,7 +315,8 @@ class MegaMoEV2:
         return s2_spec, args, c_spec, c_args
 
     def _run_fused_stage1(self, x, wts, scales, topk_ids, stream=None, config: Stage1Config | None = None,
-                          fused_config: "MegaMoEConfig | None" = None, fuse_combine=False):
+                          fused_config: "MegaMoEConfig | None" = None, fuse_combine=False,
+                          quant_src=None):
         if stream is None:
             stream = fx.Stream(torch.cuda.current_stream())
         cur_tok = int(x.shape[0])
@@ -358,6 +378,15 @@ class MegaMoEV2:
                     int(os.environ.get("AITER_MEGAMOE_FUSE_G2_SKEW_DEN", "4")),
                 ),
             }
+            if quant_src is not None:
+                # M3: the bf16 rows are quantized by an ingress phase inside
+                # this same launch, writing into ``x``/``scales`` (the persistent
+                # ``_q_xq``/``_q_scale`` scratch) before the dispatch producers
+                # read them. This is the last launch to disappear.
+                _fused_kw["fused_quant"] = True
+                _fused_kw["fused_quant_args"] = (
+                    fx.Int64(quant_src.data_ptr()), self._fx_q_ctr,
+                )
         # fmt: off
         self._s1_mega(
             self._s1_out, self._s1_rx, self._s1_w1, self._s1_scale_i32, self._s1_w1_scale,
@@ -387,9 +416,40 @@ class MegaMoEV2:
     def quantize(self, x_bf16):
         return per_1x32_mx_quant(x_bf16, quant_mode="fp8")
 
-    def _run_joint(self, x, scales, wts, topk_ids, run_tokens, stream, slice_output):
+    def _quant_scratch(self, run_tokens):
+        """Views the in-kernel ingress will fill this launch."""
+        return self._q_xq[:run_tokens], self._q_scale[:run_tokens]
+
+    def _run_joint(self, x, scales, wts, topk_ids, run_tokens, stream, slice_output,
+                   x_bf16=None):
         config = self._select_config(run_tokens)
-        if config.stage1.num_waves % 4 == 0 and os.environ.get("AITER_MEGAMOE_FUSE_ALL") == "1":
+        mega = (
+            config.stage1.num_waves % 4 == 0
+            and os.environ.get("AITER_MEGAMOE_FUSE_ALL") == "1"
+        )
+        # M3: with the megakernel active, ``AITER_MEGAMOE_FUSE_QUANT=1`` makes
+        # quantization an ingress phase inside the megakernel -- statically
+        # partitioned over the resident blocks that hold no startup role, and gated
+        # on by the dispatch producers before they read the payload -- instead of its
+        # own launch. That is exactly one operator launch per EP rank.
+        #
+        # It is off by default because it does not clear the "no slower than
+        # MegaMoEV2" gate. It is correct and deadlock-free (relL2 identical on both
+        # paths), but folding the pass in costs +0.15% to +1.2% of rank-max e2e
+        # depending on route: the producers cannot start until the *last* of ~200
+        # grid-strided blocks has finished its share, where a standalone launch gets
+        # a hardware-managed, load-balanced end-of-kernel join. The tell is the
+        # variance -- over 3 reps at 8192 tokens the separate-launch arm spans
+        # 1.7 us and the fused arm 25 us. See the handoff for the full table and the
+        # placements that were tried.
+        quant_src = None
+        if x_bf16 is not None:
+            if mega and os.environ.get("AITER_MEGAMOE_FUSE_QUANT", "0") == "1":
+                quant_src = x_bf16
+                x, scales = self._quant_scratch(run_tokens)
+            else:
+                x, scales = self.quantize(x_bf16)
+        if mega:
             # Megakernel: Stage1 and Stage2 in one launch. Stage2's tiles are drawn
             # from a second queue inside Stage1's own persistent work loop, gated on
             # per-m-tile GEMM1 completion, so GEMM2 (and its P2P traffic) overlaps
@@ -405,7 +465,7 @@ class MegaMoEV2:
             fuse_comb = os.environ.get("AITER_MEGAMOE_FUSE_COMBINE", "1") == "1"
             self._run_fused_stage1(
                 x, wts, scales, topk_ids, stream=stream, config=config.stage1,
-                fused_config=config, fuse_combine=fuse_comb,
+                fused_config=config, fuse_combine=fuse_comb, quant_src=quant_src,
             )
             if fuse_comb:
                 ret = None
@@ -452,8 +512,9 @@ class MegaMoEV2:
             raise ValueError("wts must be contiguous float32")
         if topk_ids.dtype != torch.int32 or not topk_ids.is_contiguous():
             raise ValueError("topk_ids must be contiguous int32")
-        x_q, scales = self.quantize(x_bf16)
-        return self._run_joint(x_q, scales, wts, topk_ids, run_tokens, stream, slice_output)
+        return self._run_joint(
+            None, None, wts, topk_ids, run_tokens, stream, slice_output, x_bf16=x_bf16
+        )
 
     def forward_prequant(self, x_q, scales, wts, topk_ids, *, stream=None, slice_output=True):
         run_tokens = int(x_q.shape[0])

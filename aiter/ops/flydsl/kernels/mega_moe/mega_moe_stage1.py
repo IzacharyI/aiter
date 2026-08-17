@@ -3,6 +3,7 @@
 """Fused stage1 with low-ID dispatch producers and oversubscribed FP8xFP4 grouped-GEMM1 consumers."""
 
 import functools
+import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -14,6 +15,7 @@ from flydsl.runtime.device import get_rocm_arch
 
 from .. import communication_ops_utils as comm_ops
 from ..buffer_ops import buffer_load as _raw_buffer_load
+from ..buffer_ops import create_buffer_resource_from_addr as _make_raw_buffer_from_addr
 from ..flydsl_dispatch_combine_intranode_kernel import (
     _combine_transport_spec,
     make_combine_reduce_emitter,
@@ -29,6 +31,7 @@ from .dispatch import (
 )
 from .gemm1 import _LdsF32View, build_fused_gemm1
 from .gemm_util import _buffer_load, _buffer_store, _make_buffer, _make_buffer_from_addr
+from .quant import make_mx_quant_group_emitter
 
 _SC0_CACHE = 1
 _BUFFER_OFFSET_ABI_BYTES = 1 << 32
@@ -106,6 +109,7 @@ def compile_mega_moe_stage1(
     fused_g2_skew: tuple = (5, 4),
     fused_diag_nopub: bool = False,
     fused_combine=None,
+    fused_quant: bool = False,
 ):
     arch = str(get_rocm_arch() or "")
     if not arch.startswith("gfx95"):
@@ -263,6 +267,60 @@ def compile_mega_moe_stage1(
             "fused combine requires the nw8 (single-tile) GEMM2 geometry"
         )
 
+    # ---- quantization ingress (M3) -------------------------------------------
+    # The last remaining launch. ``per_1x32_mx_quant`` is only ~0.9 us, so this is
+    # for launch/DAG completeness, not for its own time: after this there is
+    # exactly one operator launch per EP rank.
+    #
+    # It is deliberately *not* a role on the 32 dispatch producer blocks. At 8192
+    # tokens the pass moves ~177 MB, which is ~35 us spread over all 256 CUs but
+    # ~280 us if confined to the producers -- i.e. that placement would cost more
+    # than the standalone launch it replaces. So the whole first CU-full of blocks
+    # does it, and only the producers gate on the result.
+    Q = None
+    if fused_quant:
+        assert fuse_scale_dim == model_dim // 32, (
+            "fused quant assumes 1x32 groups over the full hidden dim"
+        )
+        Q = {
+            "emit": make_mx_quant_group_emitter(
+                model_dim, "fp8", out_cache_modifier=_G1_OUT_WT
+            ),
+            "scale_n": model_dim // 32,
+            # Participating tickets. Grid-strided static partition, no claim queue:
+            # a work-stealing queue was measured at ~89 ns per claimed chunk of
+            # end-to-end cost (+0.020 ms at 512 tokens, +0.30 ms at 8192, scaling
+            # exactly with the chunk count), because every block's next claim
+            # atomic sits on its own critical path. A static split has no claim
+            # atomic at all.
+            #
+            # Safe against the obvious deadlock -- "a group is assigned to a block
+            # that is not resident, while the producers waiting for it occupy the
+            # CUs" -- because tickets are taken at kernel entry, before any wait,
+            # and no block can retire before the ingress completes (everything
+            # downstream needs the payload). So the lowest tickets belong to blocks
+            # that are all resident at that moment, and 1 WG/CU is always
+            # schedulable.
+            #
+            # Participants are the tickets in ``[QBASE, QBASE+QR)``, i.e. the blocks
+            # that hold neither the owner role nor a dispatch-producer role -- see
+            # the ingress body for why those two are excluded. Stage1 runs at
+            # 1 WG/CU, so exactly tickets ``0..num_cu-1`` are resident, and the last
+            # participant must stay inside that window: a share landing on ticket
+            # ``num_cu`` is not scheduled until some resident block retires, and none
+            # can, because the producers waiting on that share hold the payload every
+            # other block needs. That off-by-one was a hard hang at native bs=512,
+            # all 8 GPUs pinned at 100%.
+            # ``AITER_MEGAMOE_QUANT_R`` overrides the count; it exists because
+            # bisecting this number is how the owner/producer cycle was found.
+            "BASE": dispatch_blocks + 1,
+            "R": int(os.environ.get("AITER_MEGAMOE_QUANT_R", "0"))
+            or min(int(num_cu), launch_grid_x) - dispatch_blocks - 1,
+        }
+        # Done counters are 8-way sharded on 64-byte lines so the one atomic each
+        # participant does is not a single contended line.
+        assert Q["R"] >= 8, "ingress needs at least 8 participating blocks"
+
     @fx.struct
     class SharedStorage:
         pool: fx.Array[fx.Int8, lds_pool_bytes, 16]
@@ -282,6 +340,9 @@ def compile_mega_moe_stage1(
         + ("" if S2 is None else f"_g2h{S2['halves']}m{S2['BM']}n{S2['BN']}p{int(fused_g2_pref)}c{G2_CHUNK}"
            f"s{fused_g2_skew[0]}_{fused_g2_skew[1]}{'_nopub' if fused_diag_nopub else ''}")
         + ("_fcomb" if fused_combine is not None else "")
+        # ``R`` is in the name so the env override used to bisect it does not collide
+        # in the JIT cache.
+        + ("" if not fused_quant else f"_fq{Q['R']}")
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[TOTAL_THREADS, 1, 1])
@@ -297,6 +358,7 @@ def compile_mega_moe_stage1(
         i32_s2_maxmb: fx.Int32,
         c_inp: fx.Int64, c_out: fx.Int64, c_tok_ready: fx.Int64, c_ctr: fx.Int64,
         c_p2p_ready: fx.Int64, c_mtile_ctr: fx.Int64,
+        q_x: fx.Int64, q_ctr: fx.Int64,
     ):
         tid = fx.thread_idx.x
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
@@ -393,6 +455,18 @@ def compile_mega_moe_stage1(
                         _buffer_load(_c_rsrc, fx.Int32(1), fx.Int32) + fx.Int32(1),
                         fx.Int32,
                     )
+                if const_expr(Q is not None):
+                    # The 8 sharded ingress done counters, one per 64-byte line.
+                    # Rank-local, so unlike combine's arrival counters they can
+                    # simply be cleared: no other block on this rank has passed the
+                    # epoch gate this block is about to publish, and no peer ever
+                    # touches them. System-scope store to match the system-scope
+                    # atomics that increment them.
+                    for _q_s in range_constexpr(8):
+                        comm_ops.store_i32_system(
+                            q_ctr + fx.Int64(_q_s * 64), fx.Int32(0), fx.Int32(0)
+                        )
+                    comm_ops.fence_system_release()
                 if const_expr(external_grouping or direct_fixed_slot):
                     group_done_rsrc = _make_buffer_from_addr(a_group_done, fx.Int32)
                     for destination in range_constexpr(fz_npes if direct_fixed_slot else 1):
@@ -412,6 +486,83 @@ def compile_mega_moe_stage1(
                 mori_shmem.int32_wait_until_equals(gate_addr, gate_epoch)
                 comm_ops.fence_agent_acquire()
             fx.barrier()
+
+        if const_expr(Q is not None):
+            # ---- quantization ingress (M3) --------------------------------
+            # First thing after the epoch gate, ahead of all other block work, and on
+            # the tickets in ``[QBASE, QBASE+QR)`` -- i.e. every resident block that
+            # is neither the owner (ticket 0) nor a dispatch producer
+            # (tickets ``1..dispatch_blocks``). Shard index is ``ticket - QBASE``.
+            #
+            # Every part of that is measured, not stylistic:
+            #
+            # * It cannot sit *after* the owner's bookkeeping, next to the producers
+            #   that gate on it. On the compact path the owner's
+            #   ``emit_dispatch_plan`` waits for the producers' grouping, so an owner
+            #   that still owed an ingress share closes the cycle
+            #   owner -> producers -> owner. That was a hard hang at 512 tokens for
+            #   every participant count tried (8, 33, 256), while a target of 1 --
+            #   which the producers clear before the owner ever reaches the plan --
+            #   always passed.
+            # * The owner and the producers must not participate at all. They are the
+            #   two roles on the startup critical path (the owner emits the plan, and
+            #   the plan waits on the producers), so a share given to either is pure
+            #   added latency rather than the ~1.4 us of bandwidth it is worth.
+            #   Rank-max cost of the fused ingress vs. the separate quant launch,
+            #   512-token uniform: all tickets +12.3 us, owner excluded +8.4 us,
+            #   owner and producers excluded -- see the handoff for the final table.
+            #   The excluded blocks still gate on the counter; they just do not feed
+            #   it. Everyone else has nothing to do until the payload exists, so
+            #   their share runs entirely inside the plan-emission window.
+            #
+            # This is the last launch to disappear: after it, ``MegaMoEV2.forward``
+            # issues exactly one kernel per EP rank.
+            #
+            # Static grid-strided split, no claim queue -- see the ``Q`` spec above
+            # for why that is both deadlock-free and enough parallelism (512 threads
+            # per participating block).
+            #
+            # The loop is a plain grid stride. Unrolling it to deepen the per-thread
+            # load queue was tried and rejected: the megakernel is pinned at 1 WG/CU
+            # by its LDS, so a participating CU runs 8 waves where the standalone
+            # 64-thread launcher runs many more, and four independent groups per
+            # iteration should have restored the outstanding-load count. At 8192
+            # tokens, 100 iters, 3 reps it did not -- rank-max median 4.4535 ms at
+            # U=4 vs 4.4476 ms at U=1. The residual is not latency-bound; see the
+            # handoff for what it is.
+            _q_total = i32_cur_tok * fx.Int32(Q["scale_n"])
+            _q_slot = ticket - fx.Int32(Q["BASE"])
+            if (_q_slot >= fx.Int32(0)) & (_q_slot < fx.Int32(Q["R"])):
+                _q_in_rsrc = _make_raw_buffer_from_addr(q_x)
+                _q_out_rsrc = _make_raw_buffer_from_addr(addr_in_tok)
+                _q_sc_rsrc = _make_raw_buffer_from_addr(addr_in_sc)
+                for _q_g in range(
+                    _q_slot * fx.Int32(TOTAL_THREADS) + tid,
+                    _q_total,
+                    fx.Int32(Q["R"] * TOTAL_THREADS),
+                ):
+                    Q["emit"](_q_g, _q_in_rsrc, _q_out_rsrc, _q_sc_rsrc)
+                # One atomic per participating block, 8-way sharded by ticket.
+                # System scope, not agent: the consumer polls this line with
+                # ``int32_wait_until_greater_than``, i.e. a plain load, and on an
+                # 8-XCD part a plain load only sees its own XCD's L2. An agent-scope
+                # add lands in the adder's L2, so a waiter on another XCD never sees
+                # it -- measured as a hard hang whenever the target exceeded the
+                # per-XCD share. This is the same rule ``g2_ctr`` follows.
+                #
+                # ``s_waitcnt(0)`` and the block barrier are the whole release: the
+                # payload and scale stores above are write-through (``sc0 sc1``, see
+                # the ``Q`` spec), so once they have retired they are already visible
+                # to the other XCDs and no ``fence_system_release`` -- i.e. no
+                # ``buffer_wbl2`` per participating block -- is needed.
+                fx.rocdl.s_waitcnt(0)
+                fx.barrier()
+                if tid == fx.Int32(0):
+                    comm_ops.atomic_add_system(
+                        q_ctr + fx.Int64(_q_slot & fx.Int32(7)) * fx.Int64(64),
+                        fx.Int32(1),
+                    )
+
 
         payload_parity = _buffer_load(parity_rsrc, fx.Int32(0), fx.Int32, cache_modifier=_SC0_CACHE)
         payload_expected = _buffer_load(expected_rsrc, payload_parity, fx.Int32, cache_modifier=_SC0_CACHE)
@@ -472,6 +623,20 @@ def compile_mega_moe_stage1(
                 )
 
         if compact_producer:
+            if const_expr(Q is not None):
+                # The only wait in the ingress. Both payload emitters below read
+                # ``addr_in_tok``/``addr_in_sc``, so it covers the fixed-slot and
+                # compact paths alike. ``wait_until_greater_than`` is a relaxed
+                # load, hence the explicit acquire to invalidate L1.
+                if tid < fx.Int32(8):
+                    _q_tgt = fx.Int32(Q["R"] // 8) + (
+                        tid < fx.Int32(Q["R"] % 8)
+                    ).select(fx.Int32(1), fx.Int32(0))
+                    mori_shmem.int32_wait_until_greater_than(
+                        q_ctr + fx.Int64(tid) * fx.Int64(64), _q_tgt - fx.Int32(1)
+                    )
+                    comm_ops.fence_system_acquire()
+                fx.barrier()
             if const_expr(direct_fixed_slot):
                 emit_direct_fixed_slot_payload(
                     num_waves=NUM_WAVES, fz_npes=fz_npes, fz_epr=fz_epr, fz_k=fz_k, fz_cap=fz_cap,
@@ -979,14 +1144,15 @@ def compile_mega_moe_stage1(
         s2_sweights: fx.Int64, s2_trb: fx.Int64, s2_p2p: fx.Int64, s2_ctr: fx.Int64,
         i32_s2_maxmb: fx.Int32,
         c_inp: fx.Int64, c_out: fx.Int64, c_tok_ready: fx.Int64, c_ctr: fx.Int64,
-        c_p2p_ready: fx.Int64, c_mtile_ctr: fx.Int64, stream: fx.Stream,
+        c_p2p_ready: fx.Int64, c_mtile_ctr: fx.Int64,
+        q_x: fx.Int64, q_ctr: fx.Int64, stream: fx.Stream,
     ):
         kernel(
             out, x, w, scale_x, scale_w, sorted_token_ids, expert_ids, num_valid_ids, out_scale, tokens,
             addr_disp, i32_cur_tok, addr_in_tok, addr_in_idx, addr_in_wts, addr_in_sc, addr_parity, addr_expected,
             s2_aq, s2_ascale, s2_bq, s2_bscale, s2_eids, s2_cumsum, s2_metiles, s2_stids,
             s2_sweights, s2_trb, s2_p2p, s2_ctr, i32_s2_maxmb,
-            c_inp, c_out, c_tok_ready, c_ctr, c_p2p_ready, c_mtile_ctr,
+            c_inp, c_out, c_tok_ready, c_ctr, c_p2p_ready, c_mtile_ctr, q_x, q_ctr,
             value_attrs={
                 "rocdl.waves_per_eu": waves_per_eu_hint,
                 "rocdl.flat_work_group_size": f"{TOTAL_THREADS},{TOTAL_THREADS}",
@@ -1007,7 +1173,8 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
     payload_chunk_rows=0, payload_tile_ready=False, swiglu_limit=0.0,
     fused_stage2=None, fused_g2_pref=0, fused_g2_chunk=4, fused_s2_nw8=False,
     fused_g2_skew=(5, 4), fused_diag_nopub=False, fused_args=None,
-    fused_combine=None, fused_combine_args=None):
+    fused_combine=None, fused_combine_args=None,
+    fused_quant=False, fused_quant_args=None):
     launch = compile_mega_moe_stage1(
         model_dim=model_dim, inter_dim=inter_dim, rank=rank, experts_per_rank=experts_per_rank,
         fuse_npes=fuse_npes, fuse_topk=fuse_topk, fuse_cap=fuse_cap, fuse_mtpr=fuse_mtpr,
@@ -1030,15 +1197,18 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
         fused_combine=(
             None if fused_combine is None else tuple(sorted(dict(fused_combine).items()))
         ),
+        fused_quant=bool(fused_quant),
     )
     # 12 Stage2 pointers + ``max_m_blocks``; zeros on the unfused path, where the
     # kernel never dereferences them.
     fa = tuple(fused_args) if fused_args else (fx.Int64(0),) * 12 + (fx.Int32(0),)
     # 6 combine pointers; zeros on the unfused path, where they are never read.
     ca = tuple(fused_combine_args) if fused_combine_args else (fx.Int64(0),) * 6
+    # (bf16 source, ingress counter pair); zeros when quant stays a separate launch.
+    qa = tuple(fused_quant_args) if fused_quant_args else (fx.Int64(0),) * 2
     _run_compiled(
         launch, out, x, w, scale_x, scale_w, sorted_token_ids, expert_ids, num_valid_ids, out_scale,
         tokens, addr_disp, i32_cur_tok, addr_in_tok, addr_in_idx, addr_in_wts, addr_in_sc,
-        addr_parity, addr_expected, *fa, *ca, stream,
+        addr_parity, addr_expected, *fa, *ca, *qa, stream,
     )
 # fmt: on
