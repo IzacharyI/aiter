@@ -552,8 +552,15 @@ class SiluQuantEpilogue:
 
     # fmt: off
     def __init__(self, *, out_rsrc, out_scale_rsrc, sorted_rsrc, tokens, inter_dim, m_repeat, num_acc_n,
-        sort_block_m, tile_n, num_waves, lds_out, swiglu_limit=0.0, always_valid=False, out_tensor=None):
+        sort_block_m, tile_n, num_waves, lds_out, swiglu_limit=0.0, always_valid=False, out_tensor=None,
+        out_cache_modifier=0):
     # fmt: on
+        # ``out_cache_modifier`` raises the activation/scale stores to write-through
+        # (sc0 sc1) for the fused megakernel: a GEMM2 tile may consume these rows from
+        # a different XCD, and on this 8-XCD part the alternative -- an agent-scope
+        # release -- lowers to a full ``buffer_wbl2`` per GEMM1 tile. Written through,
+        # ``s_waitcnt vmcnt(0)`` before the completion atomic is sufficient.
+        self._out_cache_modifier = int(out_cache_modifier)
         self._out_rsrc = out_rsrc
         self._out_scale_rsrc = out_scale_rsrc
         self._sorted_rsrc = sorted_rsrc
@@ -686,7 +693,8 @@ class SiluQuantEpilogue:
                 short_raw = fx.Int32(packed).to(fx.Int16)
                 out_byte = out_row_base + gcol
                 out_byte = valid.select(out_byte, fx.Int32(0x40000000))
-                _buffer_store(out_rsrc, out_byte // fx.Int32(2), short_raw, fx.Int16)
+                _buffer_store(out_rsrc, out_byte // fx.Int32(2), short_raw, fx.Int16,
+                              cache_modifier=self._out_cache_modifier)
 
                 col_s = gcol >> fx.Int32(5)
                 is_writer = (gcol & fx.Int32(31)) == fx.Int32(0)
@@ -699,5 +707,6 @@ class SiluQuantEpilogue:
                 byte_off = d0 * n32 + d3 * fx.Int32(256) + d5 * fx.Int32(64) + d2 * fx.Int32(4) + d4 * fx.Int32(2) + d1
                 byte_off = is_writer.select(byte_off, fx.Int32(0x40000000))
                 e8m0_i8 = e8m0_v.to(fx.Int8)
-                _buffer_store(self._out_scale_rsrc, byte_off, e8m0_i8, fx.Int8)
+                _buffer_store(self._out_scale_rsrc, byte_off, e8m0_i8, fx.Int8,
+                              cache_modifier=self._out_cache_modifier)
         wait_lds_barrier()

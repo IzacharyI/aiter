@@ -271,6 +271,7 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
     model_dim, inter_dim, sort_block_m, tile_n, num_waves, n_per_wave, wave_id,
     m_repeat, num_acc_n, a_k_step_bytes, total_threads, k_iters, a_lds_i32, n_tiles,
     expert_offset, b_cache_modifier, swizzle_a, pipe_weights, mfma_amajor, async_a_copy,
+    out_cache_modifier=0,
     use_tile_resource, swiglu_limit=0.0):
     # fmt: on
     """Build the GEMM1 atoms and return its expert resolver and tile runner."""
@@ -303,7 +304,8 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
     )
     mfma = MfmaScaleGU(m_repeat=m_repeat, num_acc_n=num_acc_n)
     # fmt: off
-    epi = SiluQuantEpilogue(out_rsrc=out_rsrc, out_scale_rsrc=os_rsrc, sorted_rsrc=trb_rsrc, tokens=0,
+    epi = SiluQuantEpilogue(out_cache_modifier=out_cache_modifier,
+        out_rsrc=out_rsrc, out_scale_rsrc=os_rsrc, sorted_rsrc=trb_rsrc, tokens=0,
         inter_dim=inter_dim, m_repeat=m_repeat, num_acc_n=num_acc_n, sort_block_m=sort_block_m, tile_n=tile_n,
         num_waves=num_waves, lds_out=c_tile, swiglu_limit=swiglu_limit, always_valid=True,
         out_tensor=out_tensor if use_tile_resource else None)

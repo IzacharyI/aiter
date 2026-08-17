@@ -63,7 +63,7 @@ def _fp8_scale_for_leader(is_leader, local_max):
 def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM, BN, npes, topk,
     log2_max_tok, mask_max_tok, recv_cap, comb_inp_nbytes, lds_packed_off, lds_weight_off,
     lds_peer_off, g2_bf16_lds=False, p2p_quant_type="none", analysis_no_p2p_payload=False,
-    p2p_write_through=False):
+    p2p_write_through=False, NW=4):
 # fmt: on
     """CShuffle one GEMM2 tile into weighted BF16 rows and scatter them to peers.
 
@@ -79,8 +79,8 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
     """
     p2p_cache_mod = _P2P_CACHE_WT if p2p_write_through else _P2P_CACHE_NT
     kMChunks = BM // 16
-    numAccN = (BN // 4) // 16
-    wave_n = BN // 4
+    wave_n = BN // NW
+    numAccN = wave_n // 16
     lane_div_16 = lane // 16
     lane_mod_16 = lane % 16
     lds_base_fptr = lds_typed_ptr(lds_acc_base, T.f32)
@@ -104,7 +104,7 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
             w_row = [
                 fx.ptr_load(
                     lds_typed_ptr(
-                        fx.Int32(lds_weight_off) + (row_base + v) * fx.Int32(4),
+                        lds_acc_base + fx.Int32(lds_weight_off) + (row_base + v) * fx.Int32(4),
                         T.f32,
                         align=4,
                     )
@@ -123,15 +123,15 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
 
     fx.barrier()
 
-    for row_iter in range_constexpr(BM // 4):
-        row = wave + fx.Int32(row_iter * 4)
+    for row_iter in range_constexpr(BM // NW):
+        row = wave + fx.Int32(row_iter * NW)
         row_byte_off = row * fx.Int32(4)
         p = fx.ptr_load(
-            lds_typed_ptr(fx.Int32(lds_packed_off) + row_byte_off, T.i32, align=4)
+            lds_typed_ptr(lds_acc_base + fx.Int32(lds_packed_off) + row_byte_off, T.i32, align=4)
         )
         if const_expr(not g2_bf16_lds):
             weight = fx.ptr_load(
-                lds_typed_ptr(fx.Int32(lds_weight_off) + row_byte_off, T.f32, align=4)
+                lds_typed_ptr(lds_acc_base + fx.Int32(lds_weight_off) + row_byte_off, T.f32, align=4)
             )
         p = rocdl.readfirstlane(T.i32, p.ir_value())
         if const_expr(not g2_bf16_lds):
@@ -144,7 +144,7 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
         dest_pe_safe = valid.select(dest_pe, fx.Int32(0))
         peer_base = fx.ptr_load(
             lds_typed_ptr(
-                fx.Int32(lds_peer_off) + dest_pe_safe * fx.Int32(8),
+                lds_acc_base + fx.Int32(lds_peer_off) + dest_pe_safe * fx.Int32(8),
                 T.i64,
                 align=8,
             )
@@ -302,7 +302,7 @@ def _stage2_lds_bytes(BM, BN, BK, a_dtype, aStages, g2_bf16_lds=False):
 
 
 # fmt: off
-def make_stage2_body_emitter(*, BK, BM, BN, INTER_MAX, KH_TILE_A, N_OUT, SBM, SharedStorage, _comb_inp_nbytes, _expert_offset, _recv_cap, aStages, a_dtype, analysis_no_p2p_payload, cu_num, g2_ascale_pf, g2_bf16_lds, g2_bhoist, g2_group_num, g2_m01, g2_spart, has_pad, is_f8, lds_packed_off, lds_peer_off, lds_weight_off, log2_max_tok, mask_max_tok, npes, p2p_quant_type, persist, persist_strided, skew_cu, topk, use_nt, p2p_write_through=False, lds_ready_off=None, publish_tok_ready=False):
+def make_stage2_body_emitter(*, BK, BM, BN, INTER_MAX, KH_TILE_A, N_OUT, SBM, SharedStorage, _comb_inp_nbytes, _expert_offset, _recv_cap, aStages, a_dtype, analysis_no_p2p_payload, cu_num, g2_ascale_pf, g2_bf16_lds, g2_bhoist, g2_group_num, g2_m01, g2_spart, has_pad, is_f8, lds_packed_off, lds_peer_off, lds_weight_off, log2_max_tok, mask_max_tok, npes, p2p_quant_type, persist, persist_strided, skew_cu, topk, use_nt, p2p_write_through=False, lds_ready_off=None, publish_tok_ready=False, NW=4):
 # fmt: on
     """Build the Stage2 GEMM2 + P2P-scatter tile-loop emitter for one block.
 
@@ -314,7 +314,7 @@ def make_stage2_body_emitter(*, BK, BM, BN, INTER_MAX, KH_TILE_A, N_OUT, SBM, Sh
     block index *within the Stage2 role*, numbered from 0.
     """
     # fmt: off
-    def emit_stage2_body(*, tx_i32, bx_i32, lane, wave, arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_cumsum, arg_max_expert_tiles, arg_stids, arg_sweights, arg_trb, arg_p2p_comb_inp, i32_max_m_blocks, i32_inter, i32_hidden, i32_kpad, i32_npad, lds_slab=None, arg_p2p_tok_ready=None, arg_mtile_ctr=None):
+    def emit_stage2_body(*, tx_i32, bx_i32, lane, wave, arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_cumsum, arg_max_expert_tiles, arg_stids, arg_sweights, arg_trb, arg_p2p_comb_inp, i32_max_m_blocks, i32_inter, i32_hidden, i32_kpad, i32_npad, lds_slab=None, arg_p2p_tok_ready=None, arg_mtile_ctr=None, lds_byte_off=None):
     # fmt: on
         # FlyDSL permits one SharedAllocator per kernel, so the fused GEMM2+combine
         # kernel allocates a single slab for both roles and passes Stage2's field in
@@ -324,7 +324,14 @@ def make_stage2_body_emitter(*, BK, BM, BN, INTER_MAX, KH_TILE_A, N_OUT, SBM, Sh
             if lds_slab is None
             else lds_slab
         )
+        # Every LDS reference in this body (and in ``gemm2_compute_v2`` /
+        # ``p2p_scatter_epilog``) is expressed relative to ``_lds_base_i32``, so a
+        # caller can place the Stage2 slab anywhere in the block's LDS. That is what
+        # lets one 512-thread block run two independent 4-wave Stage2 half-blocks:
+        # each half passes its own ``lds_byte_off``.
         _lds_base_i32 = fx.Int32(fx.ptrtoint(_slab.buf.ptr))
+        if lds_byte_off is not None:
+            _lds_base_i32 = _lds_base_i32 + lds_byte_off
 
         @flyc.jit
         def _emit_stage2_body():
@@ -344,7 +351,7 @@ def make_stage2_body_emitter(*, BK, BM, BN, INTER_MAX, KH_TILE_A, N_OUT, SBM, Sh
                 fx.ptr_store(
                     peer_base,
                     lds_typed_ptr(
-                        fx.Int32(lds_peer_off) + tx_i32 * fx.Int32(8),
+                        _lds_base_i32 + fx.Int32(lds_peer_off) + tx_i32 * fx.Int32(8),
                         T.i64,
                         align=8,
                     ),
@@ -358,7 +365,7 @@ def make_stage2_body_emitter(*, BK, BM, BN, INTER_MAX, KH_TILE_A, N_OUT, SBM, Sh
                     fx.ptr_store(
                         ready_base,
                         lds_typed_ptr(
-                            fx.Int32(lds_ready_off) + tx_i32 * fx.Int32(8),
+                            _lds_base_i32 + fx.Int32(lds_ready_off) + tx_i32 * fx.Int32(8),
                             T.i64,
                             align=8,
                         ),
@@ -379,7 +386,7 @@ def make_stage2_body_emitter(*, BK, BM, BN, INTER_MAX, KH_TILE_A, N_OUT, SBM, Sh
                 fence_release(fx.rocdl.SyncScope.WorkgroupOneAs)
                 fx.barrier()
                 _bcast = lds_typed_ptr(
-                    fx.Int32(lds_ready_off) + fx.Int32(npes * 8), T.i32, align=4
+                    lds_base_i32 + fx.Int32(lds_ready_off) + fx.Int32(npes * 8), T.i32, align=4
                 )
                 if tx_i32 == fx.Int32(0):
                     prev = atomic_add_agent(
@@ -403,7 +410,7 @@ def make_stage2_body_emitter(*, BK, BM, BN, INTER_MAX, KH_TILE_A, N_OUT, SBM, Sh
                     if tx_i32 < fx.Int32(BM):
                         pk_meta = fx.ptr_load(
                             lds_typed_ptr(
-                                fx.Int32(lds_packed_off) + tx_i32 * fx.Int32(4),
+                                lds_base_i32 + fx.Int32(lds_packed_off) + tx_i32 * fx.Int32(4),
                                 T.i32,
                                 align=4,
                             )
@@ -433,7 +440,7 @@ def make_stage2_body_emitter(*, BK, BM, BN, INTER_MAX, KH_TILE_A, N_OUT, SBM, Sh
             def issue_all_a_loads(m_row0):
                 for slot in range_constexpr(kStages):
                     issue_a_load_lds_dt(arg_aq, lds_base_i32, slot, slot, m_row0, wave, lane,
-                        is_f8, KH_TILE_A, k_bytes, BM=BM)
+                        is_f8, KH_TILE_A, k_bytes, BM=BM, NW=NW)
 
             def run_unit(unit_bx, m_block_idx):
                 # Map each Stage2 BM sub-tile to its Stage1 SBM metadata row.
@@ -455,7 +462,7 @@ def make_stage2_body_emitter(*, BK, BM, BN, INTER_MAX, KH_TILE_A, N_OUT, SBM, Sh
                     fx.ptr_store(
                         packed,
                         lds_typed_ptr(
-                            fx.Int32(lds_packed_off) + tx_i32 * fx.Int32(4),
+                            lds_base_i32 + fx.Int32(lds_packed_off) + tx_i32 * fx.Int32(4),
                             T.i32,
                             align=4,
                         ),
@@ -463,7 +470,7 @@ def make_stage2_body_emitter(*, BK, BM, BN, INTER_MAX, KH_TILE_A, N_OUT, SBM, Sh
                     fx.ptr_store(
                         weight,
                         lds_typed_ptr(
-                            fx.Int32(lds_weight_off) + tx_i32 * fx.Int32(4),
+                            lds_base_i32 + fx.Int32(lds_weight_off) + tx_i32 * fx.Int32(4),
                             T.f32,
                             align=4,
                         ),
@@ -471,7 +478,7 @@ def make_stage2_body_emitter(*, BK, BM, BN, INTER_MAX, KH_TILE_A, N_OUT, SBM, Sh
                 # fmt: off
                 accm_vecs, m_row, n_block_idx, _n_out_rt = gemm2_compute_v2(lds_base_i32, arg_ascale, arg_bq,
                     arg_bscale, arg_eids, arg_aq, i32_max_m_blocks, unit_bx, lane, wave, i32_inter, i32_hidden,
-                    i32_kpad, i32_npad, BM=BM, BN=BN, BK=BK, use_nt=use_nt, INTER_MAX=INTER_MAX, aStages=aStages,
+                    i32_kpad, i32_npad, BM=BM, BN=BN, BK=BK, NW=NW, use_nt=use_nt, INTER_MAX=INTER_MAX, aStages=aStages,
                     a_dtype=a_dtype, has_pad=has_pad, SBM=SBM, g2_bhoist=g2_bhoist, g2_ascale_pf=g2_ascale_pf,
                     expert_offset=_expert_offset)
                 p2p_scatter_epilog(lds_base_i32, accm_vecs, n_block_idx, wave, lane, N_OUT=N_OUT,
@@ -481,7 +488,7 @@ def make_stage2_body_emitter(*, BK, BM, BN, INTER_MAX, KH_TILE_A, N_OUT, SBM, Sh
                     lds_weight_off=lds_weight_off, lds_peer_off=lds_peer_off, g2_bf16_lds=g2_bf16_lds,
                     p2p_quant_type=p2p_quant_type,
                     analysis_no_p2p_payload=analysis_no_p2p_payload,
-                    p2p_write_through=p2p_write_through)
+                    p2p_write_through=p2p_write_through, NW=NW)
                 # fmt: on
                 if const_expr(publish_tok_ready):
                     _publish_tok_ready(m_block_idx, num_n_blocks)
@@ -577,7 +584,7 @@ def derive_stage2_emit_constants(*, model_dim: int, inter_dim: int, experts: int
     persist: bool = False, cu_num: int = 0, has_pad: bool = False, g2_bhoist=None, g2_ascale_pf=None,
     g2_spart=None, persist_strided: bool = False, g2_bf16_lds: bool = False, p2p_quant_type: str = "none",
     fixed_slot_dispatch: bool = False, skew_cu: int = 0, analysis_no_p2p_payload: bool = False,
-    p2p_write_through: bool | None = None, publish_tok_ready: bool = False):
+    p2p_write_through: bool | None = None, publish_tok_ready: bool = False, NW: int = 4):
 # fmt: on
     """Validate a Stage2 configuration and derive the tile loop's compile-time constants.
 
@@ -606,6 +613,13 @@ def derive_stage2_emit_constants(*, model_dim: int, inter_dim: int, experts: int
         raise AssertionError(f"persist=True requires cu_num>0, got {cu_num}")
     if skew_cu and (not persist or not 0 < skew_cu < cu_num):
         raise AssertionError(f"skew_cu={skew_cu} requires persist=True and 0<skew_cu<cu_num={cu_num}")
+    if NW not in (4, 8):
+        raise AssertionError(f"stage2 NW must be 4 or 8, got {NW}")
+    # NW=8 is the native 8-wave tile the megakernel uses instead of two lockstep
+    # 4-wave half-blocks. Keeping ``BN // NW == 64`` keeps the per-wave MFMA shape --
+    # and therefore the accumulator VGPR count -- identical to the 4-wave tile.
+    if BN % NW or (BN // NW) % 16 or BM % NW:
+        raise AssertionError(f"stage2 NW={NW} incompatible with BM={BM} BN={BN}")
     log2_max_tok = max_tok.bit_length() - 1
     mask_max_tok = max_tok - 1
     N_OUT = model_dim
@@ -653,12 +667,14 @@ def derive_stage2_emit_constants(*, model_dim: int, inter_dim: int, experts: int
         f"_np{int(analysis_no_p2p_payload)}"
         f"{'_wt' if p2p_write_through else ''}"
         f"{'_tokrdy' if publish_tok_ready else ''}"
+        f"{'_nw8' if NW == 8 else ''}"
     )
 
     consts = {
         "BK": BK,
         "BM": BM,
         "BN": BN,
+        "NW": NW,
         "INTER_MAX": INTER_MAX,
         "KH_TILE_A": KH_TILE_A,
         "N_OUT": N_OUT,
@@ -705,7 +721,8 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
     SBM: int | None = None,
     persist: bool = False, cu_num: int = 0, has_pad: bool = False, g2_bhoist=None, g2_ascale_pf=None,
     g2_spart=None, persist_strided: bool = False, g2_bf16_lds: bool = False, p2p_quant_type: str = "none",
-    fixed_slot_dispatch: bool = False, skew_cu: int = 0, analysis_no_p2p_payload: bool = False):
+    fixed_slot_dispatch: bool = False, skew_cu: int = 0, analysis_no_p2p_payload: bool = False,
+    halves: int = 1):
 # fmt: on
     """Compile fused GEMM2 and weighted cross-rank P2P scatter."""
     consts, kernel_name = derive_stage2_emit_constants(
@@ -719,22 +736,62 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
         skew_cu=skew_cu, analysis_no_p2p_payload=analysis_no_p2p_payload,
     )
     BN = consts["BN"]
+    # ``halves`` runs H independent 4-wave Stage2 half-blocks inside one
+    # (256*H)-thread workgroup. It exists so the fully fused kernel -- whose block
+    # size is dictated by Stage1's 8-wave shape at the large buckets -- can host the
+    # Stage2 tile loop without re-deriving its 4-wave MFMA/scatter geometry.
+    #
+    # Lockstep is what makes it safe: half h takes virtual block ``bx*H + h``, and
+    # because ``num_n_blocks`` is a multiple of H, all H halves land on the *same*
+    # ``m_slot`` and differ only in ``n_block``. Every loop trip count and every
+    # branch in the tile loop is a function of ``m_slot`` alone, so all halves execute
+    # an identical sequence of ``s_barrier``s -- a block-wide barrier is then merely a
+    # superset sync, never a mismatch. Nothing else is shared: each half gets its own
+    # ``lds_byte_off`` slab.
+    halves = int(halves)
+    assert halves >= 1 and (consts["N_OUT"] // BN) % halves == 0, (
+        f"stage2 halves={halves} must divide num_n_blocks={consts['N_OUT'] // BN}"
+    )
     emit_stage2_body = make_stage2_body_emitter(**consts)
+    _one_slab_bytes = consts["lds_ready_off"] + (
+        consts["npes"] * 8 + 16 if consts["publish_tok_ready"] else 0
+    )
+    if halves > 1:
+        kernel_name = f"{kernel_name}_h{halves}"
+
+        @fx.struct
+        class HalvedStorage:
+            buf: fx.Array[Int8, _one_slab_bytes * halves, 16]
+
+        slab_ty = HalvedStorage
+    else:
+        slab_ty = consts["SharedStorage"]
+    BLOCK_THREADS = 256 * halves
 
     # fmt: off
-    @flyc.kernel(name=kernel_name, known_block_size=[256, 1, 1])
+    @flyc.kernel(name=kernel_name, known_block_size=[BLOCK_THREADS, 1, 1])
     def kernel_epilog_v2(arg_aq: fx.Int64, arg_ascale: fx.Int64, arg_bq: fx.Int64, arg_bscale: fx.Int64,
         arg_eids: fx.Int64, arg_cumsum: fx.Int64, arg_max_expert_tiles: fx.Int64, arg_stids: fx.Int64,
         arg_sweights: fx.Int64, arg_trb: fx.Int64, arg_p2p_comb_inp: fx.Int64, i32_max_m_blocks: fx.Int32,
         i32_inter: fx.Int32, i32_hidden: fx.Int32, i32_kpad: fx.Int32, i32_npad: fx.Int32):
     # fmt: on
-        tx_i32 = fx.thread_idx.x
-        bx_i32 = fx.block_idx.x
+        _slab = fx.SharedAllocator().allocate(slab_ty).peek()
+        _tx_full = fx.thread_idx.x
+        if const_expr(halves > 1):
+            half = rocdl.readfirstlane(T.i32, _tx_full // fx.Int32(256))
+            tx_i32 = _tx_full % fx.Int32(256)
+            bx_i32 = fx.block_idx.x * fx.Int32(halves) + half
+            lds_off = half * fx.Int32(_one_slab_bytes)
+        else:
+            tx_i32 = _tx_full
+            bx_i32 = fx.block_idx.x
+            lds_off = fx.Int32(0)
         lane = tx_i32 % fx.Int32(64)
         wave = rocdl.readfirstlane(T.i32, tx_i32 // fx.Int32(64))
 
         emit_stage2_body(
             tx_i32=tx_i32, bx_i32=bx_i32, lane=lane, wave=wave,
+            lds_slab=_slab, lds_byte_off=lds_off,
             arg_aq=arg_aq, arg_ascale=arg_ascale, arg_bq=arg_bq, arg_bscale=arg_bscale,
             arg_eids=arg_eids, arg_cumsum=arg_cumsum, arg_max_expert_tiles=arg_max_expert_tiles, arg_stids=arg_stids,
             arg_sweights=arg_sweights, arg_trb=arg_trb, arg_p2p_comb_inp=arg_p2p_comb_inp, i32_max_m_blocks=i32_max_m_blocks,
@@ -755,7 +812,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
             arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_cumsum, arg_max_expert_tiles,
             arg_stids, arg_sweights, arg_trb, arg_p2p_comb_inp, i32_max_m_blocks, i32_inter,
             i32_hidden, i32_kpad, i32_npad,
-        ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
+        ).launch(grid=(grid_x // fx.Int32(halves), 1, 1), block=(BLOCK_THREADS, 1, 1), stream=stream)
 
     return launch
 
@@ -792,6 +849,7 @@ def run_mega_moe_stage2(arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_cu
         g2_spart=g2_spart, persist_strided=persist_strided, g2_bf16_lds=g2_bf16_lds,
         p2p_quant_type=p2p_quant_type, fixed_slot_dispatch=fixed_slot_dispatch, skew_cu=skew_cu,
         analysis_no_p2p_payload=analysis_no_p2p_payload,
+        halves=int(os.environ.get("AITER_MEGAMOE_S2_HALVES", "1")),
     )
     max_m_blocks = (row_capacity + BM - 1) // BM
     grid_blocks = launch_cu_num if persist else max_m_blocks

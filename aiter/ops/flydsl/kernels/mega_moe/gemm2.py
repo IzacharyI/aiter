@@ -111,12 +111,13 @@ def issue_a_load_lds_dt(
     KH_TILE_A,
     K_BYTES,
     BM=32,
+    NW=4,
 ):
     """Load one A tile through a tile-local descriptor so allocations may span the 4 GiB buffer ABI."""
     lanes_per_row = KH_TILE_A // 16  # 8 (fp4) / 16 (fp8)
     rows_per_call = 64 // lanes_per_row  # 8 (fp4) / 4 (fp8)
     a_lane_row = lane // lanes_per_row
-    rows_per_wave = BM // 4  # rows each wave loads (BM32: 8, BM64: 16)
+    rows_per_wave = BM // NW  # rows each wave loads (BM32/NW4: 8, BM64/NW4: 16)
     # BM16 fp4: partial-wave round-robin (waves 2,3 re-load, harmless); BM>=32 byte-identical per-wave blocks.
     partial_wave_gather = rows_per_wave < rows_per_call
     if const_expr(partial_wave_gather):
@@ -175,6 +176,7 @@ def gemm2_compute_v2(
     BM,
     BN=256,
     BK=256,
+    NW=4,
     use_nt,
     INTER_MAX,
     aStages,
@@ -192,7 +194,8 @@ def gemm2_compute_v2(
     kMChunks = BM // 16  # 16-row MFMA row-groups
     kHalves = BK // 128  # 16x16x128 MFMA K-steps per K-tile
     tilesPerScaleChunk = 256 // BK  # K-tiles sharing one 256-K E8M0 word
-    numAccN = (BN // 4) // 16  # 16-column MFMA subblocks per wave
+    wave_n = BN // NW  # N columns owned by one wave
+    numAccN = wave_n // 16  # 16-column MFMA subblocks per wave
     nPairs = max(1, numAccN // 2)  # one B-scale per two 16-column subblocks
     # BM16: single 16-row block owning a 32-row scale chunk (chunk==m_block_idx, rg0-only).
     is_bm16 = BM < 32
@@ -356,12 +359,12 @@ def gemm2_compute_v2(
     bq_base_dw = [
         rocdl.readfirstlane(
             T.i32,
-            (e * N_OUT_rt + n_block_idx * BN + wave * (BN // 4) + j * 16) * KH4,
+            (e * N_OUT_rt + n_block_idx * BN + wave * wave_n + j * 16) * KH4,
         )
         for j in range_constexpr(numAccN)
     ]
 
-    mni_base = n_block_idx * (BN // 16 // 2) + wave * (BN // 64 // 2)
+    mni_base = n_block_idx * (BN // 16 // 2) + wave * (wave_n // 32)
     bscale_views = [
         scale_view(
             arg_bscale,
@@ -388,7 +391,7 @@ def gemm2_compute_v2(
                 )
                 load_mask = None
                 if const_expr(has_pad):
-                    col = n_block_idx * BN + wave * (BN // 4) + j * 16
+                    col = n_block_idx * BN + wave * wave_n + j * 16
                     load_mask = (col < N_real) & (
                         kt_rt * fx.Int32(kHalves) + fx.Int32(half) < halves_real
                     )

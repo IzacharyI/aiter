@@ -220,6 +220,30 @@ class MegaMoEV2:
             model_dim=self.model_dim,
             inter_dim=self.inter_dim,
         )
+        # Stage1 tile-geometry override. Full fusion needs Stage1 and Stage2 to agree
+        # on a block size (Stage2's kernel is fixed at 256 threads, Stage1 at >=2048
+        # tokens picks 8 waves = 512), so the fused path has to run Stage1 at some
+        # 4-wave shape. These knobs are how that shape gets chosen by measurement
+        # rather than by assertion; ``block_m`` follows because Stage2's block_m must
+        # divide ``sort_block_m``.
+        s1_over = {
+            k: int(v)
+            for k, v in (
+                ("sort_block_m", os.environ.get("AITER_MEGAMOE_S1_SBM")),
+                ("tile_n", os.environ.get("AITER_MEGAMOE_S1_TILEN")),
+                ("num_waves", os.environ.get("AITER_MEGAMOE_S1_WAVES")),
+            )
+            if v
+        }
+        if s1_over:
+            stage1 = replace(config.stage1, **s1_over)
+            stage2 = config.stage2
+            if stage1.sort_block_m % stage2.block_m:
+                stage2 = replace(stage2, block_m=stage1.sort_block_m)
+            config = replace(config, stage1=stage1, stage2=stage2)
+        s2_bm = os.environ.get("AITER_MEGAMOE_S2_BM")
+        if s2_bm:
+            config = replace(config, stage2=replace(config.stage2, block_m=int(s2_bm)))
         # A/B knob for the opt-in single-grid Stage2+combine path. No route table
         # entry sets fuse_combine yet; this is how the fused kernel gets measured.
         if os.environ.get("AITER_MEGAMOE_FUSE_S2C") == "1" and config.stage2.persist:
@@ -229,7 +253,35 @@ class MegaMoEV2:
         self._active_config = config
         return config
 
-    def _run_fused_stage1(self, x, wts, scales, topk_ids, stream=None, config: Stage1Config | None = None):
+    def _fused_all_kwargs(self, config: MegaMoEConfig):
+        """Stage2 compile spec + kernel arguments for the fused megakernel path."""
+        op = self._s1_op
+        comb_op = self.comb_op
+        stage2 = config.stage2
+        invariants = dict(self._g2_invariants_by_quant[config.p2p_quant])
+        invariants.pop("cu_num")
+        s2_spec = dict(
+            invariants, BM=stage2.block_m, BN=stage2.block_n, BK=stage2.block_k,
+            use_nt=stage2.use_nt, g2_bhoist=stage2.b_hoist,
+            g2_ascale_pf=stage2.ascale_prefetch, g2_bf16_lds=stage2.bf16_lds,
+            analysis_no_p2p_payload=stage2.analysis_no_p2p_payload,
+            SBM=config.stage1.sort_block_m, cu_num=0,
+        )
+        max_m_blocks = (self._s1_nvm + stage2.block_m - 1) // stage2.block_m
+        args = (
+            fx.Int64(self._s1_out.view(-1).data_ptr()), fx.Int64(self._s1_osd.data_ptr()),
+            fx.Int64(self.w2.data_ptr()), fx.Int64(self.w2_scale.data_ptr()),
+            fx.Int64(op.sorted_expert_ids.data_ptr()), fx.Int64(op.num_valid.data_ptr()),
+            fx.Int64(self._s1_dispatch_workspace["max_expert_tiles"].data_ptr()),
+            fx.Int64(op.srcmap_em.data_ptr()), fx.Int64(op.wts_em.data_ptr()),
+            fx.Int64(op.tile_row_base.data_ptr()), comb_op._fx_p2p_comb_inp,
+            self._fx_fused_mtile_ctr, fx.Int32(max_m_blocks),
+        )
+        self._g2_active_block_m = stage2.block_m
+        return s2_spec, args
+
+    def _run_fused_stage1(self, x, wts, scales, topk_ids, stream=None, config: Stage1Config | None = None,
+                          fused_config: "MegaMoEConfig | None" = None):
         if stream is None:
             stream = fx.Stream(torch.cuda.current_stream())
         cur_tok = int(x.shape[0])
@@ -252,6 +304,42 @@ class MegaMoEV2:
         if config is None:
             config = self._select_config(cur_tok).stage1
         op = self._s1_op
+        _fused_kw = {}
+        _s2_nw8 = os.environ.get("AITER_MEGAMOE_FUSE_S2_NW8", "1") == "1"
+        if fused_config is not None:
+            _s2_spec, _s2_args = self._fused_all_kwargs(fused_config)
+            _fused_kw = {
+                "fused_stage2": _s2_spec, "fused_args": _s2_args,
+                # nw8 (native 8-wave GEMM2 tile) is the default: it removes the
+                # halves=2 lockstep and is worth -0.48 ms. It halves the GEMM2 unit
+                # count, so it wants a larger pref stride than the halves=2 path did
+                # (tuned: 6/16 -> 5.464 vs 5.531 scattered; 2/16 -> 5.689).
+                "fused_s2_nw8": _s2_nw8,
+                "fused_g2_pref": int(
+                    os.environ.get("AITER_MEGAMOE_FUSE_G2_PREF", "6" if _s2_nw8 else "2")
+                ),
+                # The chunk amortizes the claim atomic, but it is only affordable
+                # when there are far more GEMM2 pairs than blocks. At 512 tokens
+                # there are ~2.7k pairs for a ~2048-block grid, so handing out 16 at
+                # a time leaves ~168 blocks doing 16 tiles each while the rest idle.
+                # Measured chunk 1 vs 16: 512 uniform 0.6826/0.8599, 512 skew
+                # 0.7706/0.8523, 2048 uniform 1.5536/1.8464, but 8192 skew reverses
+                # to 5.4863/6.5808 once the preemption path is live. Keyed on the
+                # bucket, not on the device skew predicate: that predicate is
+                # size-blind (tile-ceiling padding makes it fire on 512-uniform too).
+                "fused_g2_chunk": int(
+                    os.environ.get(
+                        "AITER_MEGAMOE_FUSE_G2_CHUNK", "16" if cur_tok >= 4096 else "1"
+                    )
+                ),
+                # num/den of the "this rank is hot" test: enable opportunistic GEMM2
+                # only when received rows exceed num/den of the balanced expectation.
+                "fused_diag_nopub": os.environ.get("AITER_MEGAMOE_FUSE_DIAG_NOPUB", "0") == "1",
+                "fused_g2_skew": (
+                    int(os.environ.get("AITER_MEGAMOE_FUSE_G2_SKEW_NUM", "5")),
+                    int(os.environ.get("AITER_MEGAMOE_FUSE_G2_SKEW_DEN", "4")),
+                ),
+            }
         # fmt: off
         self._s1_mega(
             self._s1_out, self._s1_rx, self._s1_w1, self._s1_scale_i32, self._s1_w1_scale,
@@ -272,7 +360,8 @@ class MegaMoEV2:
             work_shards=config.work_shards, external_grouping=config.external_grouping,
             external_counting=config.external_counting, payload_chunk_rows=config.payload_chunk_rows,
             payload_tile_ready=config.payload_tile_ready,
-            swiglu_limit=self.swiglu_limit)
+            swiglu_limit=self.swiglu_limit,
+            **_fused_kw)
         # fmt: on
         self._s1_active_tile_m = config.sort_block_m
         return self._s1_active_tile_m
@@ -282,6 +371,32 @@ class MegaMoEV2:
 
     def _run_joint(self, x, scales, wts, topk_ids, run_tokens, stream, slice_output):
         config = self._select_config(run_tokens)
+        if config.stage1.num_waves % 4 == 0 and os.environ.get("AITER_MEGAMOE_FUSE_ALL") == "1":
+            # Megakernel: Stage1 and Stage2 in one launch. Stage2's tiles are drawn
+            # from a second queue inside Stage1's own persistent work loop, gated on
+            # per-m-tile GEMM1 completion, so GEMM2 (and its P2P traffic) overlaps
+            # the tail of GEMM1 instead of waiting for a kernel boundary.
+            self._run_fused_stage1(
+                x, wts, scales, topk_ids, stream=stream, config=config.stage1,
+                fused_config=config,
+            )
+            # ``combine_no_stage1`` returns the same ``(out_tok, ...)`` shape as the
+            # scattered path, so unwrap it exactly like ``_run_stage2`` does.
+            ret = self.comb_op.combine_no_stage1(
+                self._g2_combine_placeholder, None, None, cur_tok=run_tokens,
+                enable_weights=False, stage2_p2p_quant=config.p2p_quant,
+            )
+            out_tok = ret[0] if isinstance(ret, (tuple, list)) else ret
+            if out_tok is None:
+                cfg = self.comb_cfg
+                out_tok = (
+                    self.comb_op.shmem_comb_out_tok.view(torch.int8)[
+                        : self.mtpr * cfg.combine_token_bytes
+                    ]
+                    .view(cfg.combine_dtype)
+                    .view(self.mtpr, cfg.combine_token_view_dim)
+                )
+            return out_tok[:run_tokens] if slice_output else out_tok
         self._run_fused_stage1(x, wts, scales, topk_ids, stream=stream, config=config.stage1)
         return self._run_stage2(run_tokens, stream, slice_output, config)
 
