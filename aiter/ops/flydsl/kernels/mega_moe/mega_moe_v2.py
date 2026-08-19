@@ -34,6 +34,8 @@ def _group_done_slots(world_size: int) -> int:
 class MegaMoEV2:
     """Fused dispatch, GEMM1, GEMM2, and combine with one in-flight launch per instance."""
 
+    _path_announced = False
+
     # fmt: off
     def __init__(self, *, rank: int, world_size: int, model_dim: int, inter_dim: int, experts: int, topk: int,
         quant: str, w1: torch.Tensor, w1_scale: torch.Tensor, w2: torch.Tensor, w2_scale: torch.Tensor,
@@ -427,6 +429,19 @@ class MegaMoEV2:
             config.stage1.num_waves % 4 == 0
             and os.environ.get("AITER_MEGAMOE_FUSE_ALL") == "1"
         )
+        # Announce the path ONCE per process. Both conjuncts fail silently -- the env var must be
+        # exactly "1", and num_waves%4 depends on the selected config -- so a benchmark that meant
+        # to measure the megakernel can measure the scattered path and look merely "unimproved".
+        # That already happened once (2026-08-19 closeout); the marker exists so a harness can
+        # grep for it and refuse to report numbers from the wrong path.
+        if not MegaMoEV2._path_announced:
+            MegaMoEV2._path_announced = True
+            print(
+                f"[megamoe] path={'MEGA' if mega else 'SCATTERED'} "
+                f"fuse_all={os.environ.get('AITER_MEGAMOE_FUSE_ALL')!r} "
+                f"num_waves={config.stage1.num_waves}",
+                flush=True,
+            )
         # M3: with the megakernel active, ``AITER_MEGAMOE_FUSE_QUANT=1`` makes
         # quantization an ingress phase inside the megakernel -- statically
         # partitioned over the resident blocks that hold no startup role, and gated
