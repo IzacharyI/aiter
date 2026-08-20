@@ -308,11 +308,14 @@ class MegaMoEV2:
             "data_type": cfg.combine_dtype,
             "blockwise_fp8_transport": config.p2p_quant == "fp8_blockwise_1x32",
             "max_recv": comb_op._effective_max_recv,
+            # Analysis only: compiles a distinct kernel variant (``_cwt``), so a timed
+            # run must leave this off. Default OFF for exactly that reason.
+            "wait_stats": os.environ.get("AITER_MEGAMOE_COMBINE_WAIT_STATS") == "1",
         }
         c_args = (
             comb_op._fx_comb_inp, comb_op._fx_comb_out, comb_op._fx_tok_ready,
             self._fx_fused_comb_ctr, comb_op._fx_p2p_tok_ready,
-            self._fx_fused_comb_mtile_ctr,
+            self._fx_fused_comb_mtile_ctr, self._fx_fused_comb_wait_stats,
         )
         return s2_spec, args, c_spec, c_args
 
@@ -600,7 +603,51 @@ class MegaMoEV2:
             max(1, self._s1_nvm), dtype=torch.int32, device=dev
         )
         self._fx_fused_comb_mtile_ctr = fx.Int64(self._fused_comb_mtile_ctr.data_ptr())
+        # Analysis-only combine wait timer (AITER_MEGAMOE_COMBINE_WAIT_STATS=1). One
+        # 16B slot per WAVE: [0]=summed s_memrealtime ticks spent parked on a token's
+        # arrival count, [1]=number of such waits. Per-wave, not per-block, because a
+        # block's waves wait concurrently and summing them reports parallel time as if
+        # it were serial. Sized by the launch_grid_x ceiling (mega_moe_stage1.py:139)
+        # times the reserved wave stride, rather than the actual grid: the grid is a
+        # per-call planner result and 1 MB is not worth threading it through.
+        from .mega_moe_stage1 import _WAIT_STATS_WAVE_STRIDE
+        self._fused_comb_wait_stats = torch.zeros(
+            (int(cu_num) * 33 + 2) * _WAIT_STATS_WAVE_STRIDE, 2,
+            dtype=torch.int64, device=dev,
+        )
+        self._fx_fused_comb_wait_stats = fx.Int64(self._fused_comb_wait_stats.data_ptr())
         self._g2_cu_num = int(cu_num)
+
+    # 100 MHz constant-rate counter on gfx9 (communication_ops_utils.py:121).
+    _MEMREALTIME_HZ = 100e6
+
+    def combine_wait_stats_reset(self):
+        """Zero the fused-combine wait accumulator. Call before a timed window."""
+        self._fused_comb_wait_stats.zero_()
+
+    def combine_wait_stats_read(self):
+        """Exposed combine wait per block, in microseconds.
+
+        Returns ``(per_wait_mean_us, per_wave_total_us, total_waits)``. Waves that
+        never took the combine role contribute no waits and are dropped -- averaging
+        them in would report the instrument's coverage, not the wait.
+
+        BOTH statistics are needed and they answer different questions. The mean is
+        "how long does one token's arrival cost"; the TOTAL is a wave's whole exposed
+        wait for the launch, and only the total is comparable to the pre-fusion
+        all-rank-barrier timer, which also measured a per-launch total. Reporting only
+        the mean (as the first cut of this instrument did) makes the fused path look
+        worse purely because it waits many small times instead of once for a long time.
+        """
+        st = self._fused_comb_wait_stats.cpu()
+        ticks, cnt = st[:, 0], st[:, 1]
+        live = cnt > 0
+        if not bool(live.any()):
+            return [], [], 0
+        to_us = 1e6 / self._MEMREALTIME_HZ
+        total_us = ticks[live].double() * to_us
+        mean_us = total_us / cnt[live].double()
+        return mean_us.tolist(), total_us.tolist(), int(cnt.sum())
 
     def _run_fused_s2c(self, run_tokens, config: MegaMoEConfig, s_fx):
         """Opt-in single-grid Stage2+combine (mega_moe_fused_s2c)."""

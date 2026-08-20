@@ -31,6 +31,7 @@ from aiter.ops.flydsl.kernels.buffer_ops import (
 )
 
 from .communication_ops_utils import (
+    atomic_add_agent,
     atomic_add_global_at,
     fence_system_acquire,
     load_i64_global,
@@ -40,7 +41,7 @@ from .communication_ops_utils import (
 )
 
 # Bump when generated kernel shape changes.
-_DISPATCH_COMBINE_JIT_SCHEMA_VERSION = "v11-analysis-combine-wait-timer"
+_DISPATCH_COMBINE_JIT_SCHEMA_VERSION = "v12-fused-tok-ready-wait-timer"
 
 # Stage-3 switches from narrow step=64 to wide step=128/256 above this threshold.
 _S3_WIDE_PATH_THRESHOLD_I32 = 895
@@ -647,7 +648,7 @@ def make_combine_reduce_emitter(spec, *, rank, npes, experts_per_token,
     max_tok_per_rank, zero_copy, skip_stage1, blockwise_fp8_transport, lane,
     addr_shmem_tok, addr_out_shmem_tok, rsrc_tok_map, lds_p2p_bases, maybe_load,
     cur_rank_num_token, nominal_warp_num, tok_ready_addr=None, tok_ready_expected=0,
-    tok_ready_epoch=None):
+    tok_ready_epoch=None, wait_stats_addr=None):
 # fmt: on
     """Build combine's Stage-3 reduction as a *per-work-item* emitter.
 
@@ -661,6 +662,17 @@ def make_combine_reduce_emitter(spec, *, rank, npes, experts_per_token,
     ``nominal_warp_num`` only sets the partition granularity (how many warps split one
     token); it need not equal the number of warps that actually show up. Returns
     ``(consts, emit_item)``.
+
+    ``wait_stats_addr`` turns on the per-token wait timer. It is the caller's OWN
+    16-byte slot (caller does the per-block striding, since only it knows its block
+    ordinal), accumulating ``[total ticks, wait count]``. It exists
+    because the fused path deleted the only instrumented wait in this operator. The
+    standalone kernel's timer lives in ``emit_combine_barrier_and_reduce`` around the
+    all-rank barrier, and the megakernel never runs that barrier -- so with M2.5 the
+    analysis buffer reads a flat 0.0 that looks like "the wait vanished" and is really
+    "nothing was measured". This is the replacement, and it measures the thing that
+    actually replaced the barrier: the per-token arrival wait. Off unless the caller
+    passes an address, so the shipped path is unchanged.
     """
     n_i32 = spec.n_i32
     nbytes = spec.nbytes
@@ -729,7 +741,28 @@ def make_combine_reduce_emitter(spec, *, rank, npes, experts_per_token,
                         _tok_ready_target - fx.Int32(1),
                     )
 
-            _wait_tok_ready()
+            @flyc.jit
+            def _wait_tok_ready_timed(tok_id=tok_id):
+                if lane == fx.Int32(0):
+                    _w0 = read_memrealtime()
+                    mori_shmem.int32_wait_until_greater_than(
+                        tok_ready_addr + fx.Int64(tok_id) * fx.Int64(4),
+                        _tok_ready_target - fx.Int32(1),
+                    )
+                    _w1 = read_memrealtime()
+                    # Agent scope: the buffer is rank-local and only read by the host
+                    # after a sync. One atomic pair per work item, and total items is
+                    # ~= the grid's warp count (~1600), so the instrument cannot
+                    # meaningfully perturb what it measures. Per-BLOCK slots keep the
+                    # ~8 waves of one block off a single contended line; the caller
+                    # already strided ``wait_stats_addr`` to this block's own slot.
+                    atomic_add_agent(wait_stats_addr, _w1 - _w0)
+                    atomic_add_agent(wait_stats_addr + fx.Int64(8), fx.Int64(1))
+
+            if const_expr(wait_stats_addr is not None):
+                _wait_tok_ready_timed()
+            else:
+                _wait_tok_ready()
 
         expert_rsrcs = []
         expert_scale_rsrcs = []

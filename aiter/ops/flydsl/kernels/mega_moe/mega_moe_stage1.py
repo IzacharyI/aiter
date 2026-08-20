@@ -35,6 +35,11 @@ from .quant import make_mx_quant_group_emitter
 
 _SC0_CACHE = 1
 _BUFFER_OFFSET_ABI_BYTES = 1 << 32
+
+# Waves per block reserved in the analysis-only combine wait-stats buffer. Fixed rather
+# than derived from NUM_WAVES so the host can size the allocation without knowing the
+# selected config; NUM_WAVES is asserted against it below.
+_WAIT_STATS_WAVE_STRIDE = 8
 # gfx95x buffer cache bits: bit0=sc0, bit1=nt, bit4=sc1. ``sc0 sc1`` is a
 # system-scope (write-through) store; see ``SiluQuantEpilogue.out_cache_modifier``.
 _G1_OUT_WT = 1 | 16
@@ -260,7 +265,14 @@ def compile_mega_moe_stage1(
                 max_recv=c_cfg["max_recv"],
             ),
             "blockwise": c_cfg["blockwise_fp8_transport"],
+            # Analysis only. Compiles a second kernel variant, so it is keyed into the
+            # kernel name below and must never be on for a timed run.
+            "wait_stats": bool(c_cfg.get("wait_stats", False)),
         }
+        assert NUM_WAVES <= _WAIT_STATS_WAVE_STRIDE, (
+            f"wait-stats buffer reserves {_WAIT_STATS_WAVE_STRIDE} wave slots per "
+            f"block but this config runs {NUM_WAVES}"
+        )
         # ``_publish_tok_ready`` broadcasts through a single LDS word, so two lockstep
         # half-blocks would collide on it. nw8 is the tuned geometry anyway.
         assert S2 is not None and S2["halves"] == 1, (
@@ -340,6 +352,7 @@ def compile_mega_moe_stage1(
         + ("" if S2 is None else f"_g2h{S2['halves']}m{S2['BM']}n{S2['BN']}p{int(fused_g2_pref)}c{G2_CHUNK}"
            f"s{fused_g2_skew[0]}_{fused_g2_skew[1]}{'_nopub' if fused_diag_nopub else ''}")
         + ("_fcomb" if fused_combine is not None else "")
+        + ("_cwt" if (C is not None and C["wait_stats"]) else "")
         # ``R`` is in the name so the env override used to bisect it does not collide
         # in the JIT cache.
         + ("" if not fused_quant else f"_fq{Q['R']}")
@@ -357,7 +370,7 @@ def compile_mega_moe_stage1(
         s2_sweights: fx.Int64, s2_trb: fx.Int64, s2_p2p: fx.Int64, s2_ctr: fx.Int64,
         i32_s2_maxmb: fx.Int32,
         c_inp: fx.Int64, c_out: fx.Int64, c_tok_ready: fx.Int64, c_ctr: fx.Int64,
-        c_p2p_ready: fx.Int64, c_mtile_ctr: fx.Int64,
+        c_p2p_ready: fx.Int64, c_mtile_ctr: fx.Int64, c_wait_stats: fx.Int64,
         q_x: fx.Int64, q_ctr: fx.Int64,
     ):
         tid = fx.thread_idx.x
@@ -1111,6 +1124,25 @@ def compile_mega_moe_stage1(
                     nominal_warp_num=fx.Int32(launch_grid_x * NUM_WAVES),
                     tok_ready_addr=c_tok_ready, tok_ready_expected=fuse_topk,
                     tok_ready_epoch=c_epoch,
+                    # M2.5 deleted the all-rank barrier that carried this operator's
+                    # only wait timer, so the standalone instrument reads a flat 0 and
+                    # cannot prove the overlap. This times what replaced it.
+                    #
+                    # One slot per WAVE, not per block. A block's waves wait
+                    # concurrently, so summing them into one slot adds up parallel
+                    # time and yields a "wait" larger than the kernel itself -- the
+                    # first cut of this instrument did exactly that and reported
+                    # 8470 us of wait inside a 5.4 ms kernel. Per-wave totals are
+                    # wall-clock meaningful and are the right analogue of the
+                    # pre-fusion per-block barrier timer.
+                    wait_stats_addr=(
+                        c_wait_stats
+                        + (
+                            fx.Int64(ticket) * fx.Int64(_WAIT_STATS_WAVE_STRIDE)
+                            + fx.Int64(fx.rocdl.readfirstlane(T.i32, tid // fx.Int32(64)))
+                        ) * fx.Int64(16)
+                        if C["wait_stats"] else None
+                    ),
                 )
                 _c_total = _c_consts["s3_total_work"]
                 _c_wave = fx.rocdl.readfirstlane(T.i32, tid // fx.Int32(64))
@@ -1144,7 +1176,7 @@ def compile_mega_moe_stage1(
         s2_sweights: fx.Int64, s2_trb: fx.Int64, s2_p2p: fx.Int64, s2_ctr: fx.Int64,
         i32_s2_maxmb: fx.Int32,
         c_inp: fx.Int64, c_out: fx.Int64, c_tok_ready: fx.Int64, c_ctr: fx.Int64,
-        c_p2p_ready: fx.Int64, c_mtile_ctr: fx.Int64,
+        c_p2p_ready: fx.Int64, c_mtile_ctr: fx.Int64, c_wait_stats: fx.Int64,
         q_x: fx.Int64, q_ctr: fx.Int64, stream: fx.Stream,
     ):
         kernel(
@@ -1152,7 +1184,8 @@ def compile_mega_moe_stage1(
             addr_disp, i32_cur_tok, addr_in_tok, addr_in_idx, addr_in_wts, addr_in_sc, addr_parity, addr_expected,
             s2_aq, s2_ascale, s2_bq, s2_bscale, s2_eids, s2_cumsum, s2_metiles, s2_stids,
             s2_sweights, s2_trb, s2_p2p, s2_ctr, i32_s2_maxmb,
-            c_inp, c_out, c_tok_ready, c_ctr, c_p2p_ready, c_mtile_ctr, q_x, q_ctr,
+            c_inp, c_out, c_tok_ready, c_ctr, c_p2p_ready, c_mtile_ctr, c_wait_stats,
+            q_x, q_ctr,
             value_attrs={
                 "rocdl.waves_per_eu": waves_per_eu_hint,
                 "rocdl.flat_work_group_size": f"{TOTAL_THREADS},{TOTAL_THREADS}",
@@ -1202,8 +1235,9 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
     # 12 Stage2 pointers + ``max_m_blocks``; zeros on the unfused path, where the
     # kernel never dereferences them.
     fa = tuple(fused_args) if fused_args else (fx.Int64(0),) * 12 + (fx.Int32(0),)
-    # 6 combine pointers; zeros on the unfused path, where they are never read.
-    ca = tuple(fused_combine_args) if fused_combine_args else (fx.Int64(0),) * 6
+    # 7 combine pointers; zeros on the unfused path, where they are never read.
+    # The 7th is the analysis wait-stats buffer and is 0 unless the timer is compiled in.
+    ca = tuple(fused_combine_args) if fused_combine_args else (fx.Int64(0),) * 7
     # (bf16 source, ingress counter pair); zeros when quant stays a separate launch.
     qa = tuple(fused_quant_args) if fused_quant_args else (fx.Int64(0),) * 2
     _run_compiled(

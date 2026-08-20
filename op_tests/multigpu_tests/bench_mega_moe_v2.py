@@ -252,10 +252,21 @@ def _percentile(values, quantile):
     return ordered[lower] * (1.0 - fraction) + ordered[upper] * fraction
 
 
-def _collect_combine_wait(graph, combine_op, replays, rank, world):
+def _collect_combine_wait(graph, combine_op, replays, rank, world, mega=None):
+    # ``combine_op``'s timer brackets the all-rank barrier in the STANDALONE combine
+    # kernel. M2.5 folded combine into the megakernel and deleted that barrier, so on
+    # the fused path this timer is simply never reached and reads a flat 0 -- which
+    # looks like "the wait vanished" and actually means "nothing was measured". When
+    # ``mega`` carries the in-megakernel instrument (AITER_MEGAMOE_COMBINE_WAIT_STATS=1)
+    # we additionally collect what REPLACED the barrier: the per-token arrival wait.
+    fused_timer = mega is not None and getattr(
+        mega, "_fused_comb_wait_stats", None
+    ) is not None
     records = []
     for replay in range(replays):
         combine_op.reset_analysis_wait_timing()
+        if fused_timer:
+            mega.combine_wait_stats_reset()
         torch.cuda.synchronize()
         dist.barrier()
         graph.replay()
@@ -265,14 +276,17 @@ def _collect_combine_wait(graph, combine_op, replays, rank, world):
             int(value)
             for value in combine_op.get_analysis_wait_timing().cpu().tolist()
         ]
+        payload = {
+            "rank": rank,
+            "block_wait_realtime_ticks": ticks,
+        }
+        if fused_timer:
+            fused_mean, fused_total, fused_n = mega.combine_wait_stats_read()
+            payload["fused_wave_wait_us"] = fused_mean
+            payload["fused_wave_total_wait_us"] = fused_total
+            payload["fused_wait_count"] = fused_n
         gathered = [None] * world
-        dist.all_gather_object(
-            gathered,
-            {
-                "rank": rank,
-                "block_wait_realtime_ticks": ticks,
-            },
-        )
+        dist.all_gather_object(gathered, payload)
         if rank == 0:
             records.append({"replay": replay, "ranks": gathered})
     if rank != 0:
@@ -299,6 +313,45 @@ def _collect_combine_wait(graph, combine_op, replays, rank, world):
                 "max_us": max(values) * 0.01,
             }
         )
+    # Fused-path summary. Values are already per-block MEAN microseconds (the kernel
+    # accumulates ticks and a count per block), so these are a distribution over
+    # blocks, not over individual waits -- p95 here means "the 95th-percentile block",
+    # which is the right statistic for "who is the straggler", not for tail latency.
+    fused_summaries = []
+    for rank_id in range(world):
+        values = [
+            v
+            for record in records
+            for rank_record in record["ranks"]
+            if rank_record["rank"] == rank_id
+            for v in rank_record.get("fused_wave_wait_us", [])
+        ]
+        totals = [
+            v
+            for record in records
+            for rank_record in record["ranks"]
+            if rank_record["rank"] == rank_id
+            for v in rank_record.get("fused_wave_total_wait_us", [])
+        ]
+        if not values:
+            continue
+        fused_summaries.append(
+            {
+                "rank": rank_id,
+                "waves_sampled": len(values),
+                "mean_us": statistics.fmean(values),
+                "p50_us": _percentile(values, 0.50),
+                "p95_us": _percentile(values, 0.95),
+                "max_us": max(values),
+                # Per-block per-replay TOTAL. This, not the per-wait mean above, is
+                # what lines up against the pre-fusion all-rank-barrier timer.
+                "total_mean_us": statistics.fmean(totals),
+                "total_p50_us": _percentile(totals, 0.50),
+                "total_p95_us": _percentile(totals, 0.95),
+                "total_max_us": max(totals),
+            }
+        )
+
     return {
         "schema_version": "mega-moe-v2-combine-wait-timing-v1",
         "status": "complete_for_instrumented_combine_peer_wait_scope",
@@ -313,6 +366,28 @@ def _collect_combine_wait(graph, combine_op, replays, rank, world):
         "rank_summaries": rank_summaries,
         "rank_max_of_max_us": max(entry["max_us"] for entry in rank_summaries),
         "rank_max_of_p95_us": max(entry["p95_us"] for entry in rank_summaries),
+        # Empty unless AITER_MEGAMOE_COMBINE_WAIT_STATS=1. When the fused path runs and
+        # this is empty, the `rank_*_us` numbers above are 0 because the barrier they
+        # time no longer exists -- do NOT read that as an overlap win.
+        "fused_arrival_wait": {
+            "enabled": bool(fused_summaries),
+            "scope": (
+                "s_memrealtime around the per-token arrival wait inside the "
+                "megakernel's combine queue; per-wave, one 16B slot per wave"
+            ),
+            "rank_summaries": fused_summaries,
+            "rank_max_of_p95_us": (
+                max(e["p95_us"] for e in fused_summaries) if fused_summaries else None
+            ),
+            "rank_max_of_mean_us": (
+                max(e["mean_us"] for e in fused_summaries) if fused_summaries else None
+            ),
+            # The comparable-to-pre-fusion headline.
+            "rank_max_of_total_p95_us": (
+                max(e["total_p95_us"] for e in fused_summaries)
+                if fused_summaries else None
+            ),
+        },
         "records": records,
         "scope": (
             "one wave-level timer group per Combine block around the eight peer "
@@ -791,6 +866,7 @@ def main():
             args.combine_wait_replays,
             rank,
             world,
+            mega=mega,
         )
         if args.combine_wait_output
         else None
